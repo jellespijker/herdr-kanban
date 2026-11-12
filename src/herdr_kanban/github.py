@@ -592,9 +592,11 @@ class GitHubClient:
         field_name: str,
         desired_options: list[str],
         existing_options: dict[str, str],
+        *,
+        project_id: str = "",
     ) -> list[str]:
         """Ensure a ProjectV2 single-select field contains `desired_options`."""
-        if not field_id or not desired_options:
+        if not desired_options or (not field_id and not project_id):
             return []
         existing_lc = {k.lower() for k in existing_options}
         missing = [opt for opt in desired_options if opt.lower() not in existing_lc]
@@ -606,10 +608,43 @@ class GitHubClient:
             {
                 "name": name,
                 "color": palette[idx % len(palette)],
-                "description": f"Priority {name}",
+                "description": f"{field_name} {name}",
             }
             for idx, name in enumerate(merged_names)
         ]
+        create_mutation = """
+        mutation(
+          $projectId: ID!,
+          $name: String!,
+          $options: [ProjectV2SingleSelectFieldOptionInput!]!
+        ) {
+          createProjectV2Field(
+            input: {
+              projectId: $projectId
+              dataType: SINGLE_SELECT
+              name: $name
+              singleSelectOptions: $options
+            }
+          ) {
+            projectV2Field {
+              ... on ProjectV2SingleSelectField {
+                id
+                options { id name }
+              }
+            }
+          }
+        }
+        """
+        if not field_id and project_id:
+            self.graphql(
+                create_mutation,
+                {
+                    "projectId": project_id,
+                    "name": field_name,
+                    "options": options_input,
+                },
+            )
+            return missing
         mutation = """
         mutation($fieldId: ID!, $name: String!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
           updateProjectV2Field(
@@ -628,14 +663,32 @@ class GitHubClient:
           }
         }
         """
-        self.graphql(
-            mutation,
-            {
-                "fieldId": field_id,
-                "name": field_name,
-                "options": options_input,
-            },
-        )
+        try:
+            self.graphql(
+                mutation,
+                {
+                    "fieldId": field_id,
+                    "name": field_name,
+                    "options": options_input,
+                },
+            )
+        except GitHubError:
+            if not existing_options and project_id:
+                del_mut = (
+                    "mutation($fieldId: ID!) { "
+                    "deleteProjectV2Field(input: { fieldId: $fieldId }) { clientMutationId } }"
+                )
+                self.graphql(del_mut, {"fieldId": field_id})
+                self.graphql(
+                    create_mutation,
+                    {
+                        "projectId": project_id,
+                        "name": field_name,
+                        "options": options_input,
+                    },
+                )
+            else:
+                raise
         return missing
 
     def create_issue(

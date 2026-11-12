@@ -533,12 +533,13 @@ class KanbanEngine:
 
         schema, _ = self.refresh_board(ctx)
         added_priorities: list[str] = []
-        if ctx.board.priorities and schema.priority_field_id:
+        if ctx.board.priorities and (schema.priority_field_id or schema.project_id):
             added_priorities = self.github.ensure_single_select_options(
                 schema.priority_field_id,
                 ctx.board.priority_field,
                 ctx.board.priorities,
                 schema.priority_options_by_name,
+                project_id=schema.project_id,
             )
 
         return {
