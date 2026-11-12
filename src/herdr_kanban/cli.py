@@ -16,7 +16,7 @@ from .engine import (
     KanbanError,
 )
 from .git_ops import GitError
-from .github import GitHubError
+from .github import GitHubError, gh_binary
 from .model import COLUMN_TITLES, Column, strip_meta
 from .tui import BoardTUI
 
@@ -479,7 +479,7 @@ def cmd_doctor(args: argparse.Namespace, engine: KanbanEngine) -> int:
     git_bin = shutil.which("git")
     checks.append(("git", bool(git_bin), git_bin or "missing"))
 
-    gh_bin = shutil.which("gh")
+    gh_bin = gh_binary()
     checks.append(("gh", bool(gh_bin), gh_bin or "missing (`https://cli.github.com`)"))
     if gh_bin:
         auth_ok, auth_out = engine.github.auth_check()

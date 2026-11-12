@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .model import (
@@ -48,8 +50,25 @@ class ProjectSchema:
         return None
 
 
+def gh_binary() -> str | None:
+    found = shutil.which("gh")
+    if found:
+        return found
+    home = Path.home()
+    candidates = (
+        home / ".local" / "share" / "mise" / "shims" / "gh",
+        home / ".local" / "bin" / "gh",
+        Path("/opt/homebrew/bin/gh"),
+        Path("/usr/local/bin/gh"),
+    )
+    for candidate in candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def default_gh_runner(args: list[str], stdin_data: str | None = None) -> subprocess.CompletedProcess[str]:
-    exe = shutil.which("gh")
+    exe = gh_binary()
     if not exe:
         raise GitHubError("GitHub CLI (`gh`) not found in PATH")
     return subprocess.run(
