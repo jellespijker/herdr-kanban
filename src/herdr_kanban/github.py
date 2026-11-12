@@ -29,6 +29,24 @@ class GitHubError(RuntimeError):
     """Raised when `gh` fails or returns an unexpected response."""
 
 
+def _is_missing_project_scope_error(detail: str) -> bool:
+    lowered = detail.lower()
+    return ("read:project" in lowered or "'project'" in lowered) and (
+        "scope" in lowered or "insufficient_scopes" in lowered
+    )
+
+
+def has_project_scope(auth_status_output: str) -> bool:
+    """Return False only when `gh auth status` explicitly lists token scopes without `project`."""
+    for line in auth_status_output.splitlines():
+        if "token scopes:" in line.lower():
+            scopes_part = line.split(":", 1)[1].lower()
+            tokens = {tok.strip(" '\",") for tok in scopes_part.split(",")}
+            return "project" in tokens
+    return True
+
+
+
 @dataclass(slots=True)
 class ProjectSchema:
     project_id: str
@@ -241,6 +259,11 @@ class GitHubClient:
         proc = self._run(final_args, stdin_text)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip()
+            if _is_missing_project_scope_error(detail):
+                raise GitHubError(
+                    "GitHub token is missing Projects v2 permissions (`project` / `read:project`). "
+                    "Run: `gh auth refresh -s project,read:project`"
+                )
             raise GitHubError(f"gh {' '.join(args[:3])} failed: {detail}")
         text = proc.stdout.strip()
         if not text:
@@ -255,6 +278,11 @@ class GitHubClient:
         resp = self._gh_json(["api", "graphql"], payload=payload)
         if isinstance(resp, dict) and resp.get("errors"):
             messages = "; ".join(str(e.get("message", e)) for e in resp["errors"])
+            if _is_missing_project_scope_error(messages):
+                raise GitHubError(
+                    "GitHub token is missing Projects v2 permissions (`project` / `read:project`). "
+                    "Run: `gh auth refresh -s project,read:project`"
+                )
             raise GitHubError(f"GitHub GraphQL error: {messages}")
         return resp.get("data") or {} if isinstance(resp, dict) else {}
 

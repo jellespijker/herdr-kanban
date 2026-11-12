@@ -157,7 +157,7 @@ class KanbanEngine:
                 active_alias = ""
                 if cwd_claim and cwd_claim.repo_alias in board.repos:
                     active_alias = cwd_claim.repo_alias
-                elif main_root is not None:
+                elif main_root is not None and main_root.resolve() != umbrella_dir.resolve():
                     for alias, entry in board.repos.items():
                         if entry.resolved_path(umbrella_dir) == main_root.resolve():
                             active_alias = alias
@@ -393,6 +393,13 @@ class KanbanEngine:
         """Clone missing child repos and check out each repo's shared target branch."""
         results: list[dict[str, str]] = []
         base = ctx.umbrella_root or ctx.main_repo_root.parent
+        if ctx.is_multi_repo and (base / ".git").exists():
+            child_paths = [
+                e.path
+                for e in ctx.repos.values()
+                if e.resolved_path(base) != base.resolve() and not Path(e.path).is_absolute()
+            ]
+            self.git.ensure_gitignore_entries(base, child_paths)
         for entry in ctx.repos.values():
             dest = entry.resolved_path(base) if ctx.is_multi_repo else ctx.main_repo_root
             cloned = False

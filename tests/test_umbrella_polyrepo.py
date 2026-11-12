@@ -542,3 +542,92 @@ def test_tui_renders_multi_repo_prefixes_and_distinct_colliding_numbers(umbrella
         assert tui.prompt.repo_alias == "cloud"
     finally:
         tui.close_pipes()
+
+
+def test_meta_repo_init_with_repo_flags_and_gitignore_and_lfs_fallback(umbrella_env) -> None:
+    tmp_path, _umbrella, bare_remotes, _gh, _herdr_fake, engine = umbrella_env
+    from herdr_kanban.git_ops import GitClient
+    from herdr_kanban.github import GitHubClient, GitHubError, has_project_scope
+
+    # 1. Verify scope check helpers & concise missing-scope error
+    assert (
+        has_project_scope("  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'")
+        is False
+    )
+    assert (
+        has_project_scope("  - Token scopes: 'gist', 'project', 'read:org', 'repo'")
+        is True
+    )
+
+    def _missing_scope_runner(_args: list[str], _stdin: str | None) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["gh", "api", "graphql"],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "gh: Your token has not been granted the required scopes to execute this query. "
+                "The 'id' field requires one of the following scopes: ['read:project']"
+            ),
+        )
+
+    real_gh = GitHubClient(runner=_missing_scope_runner)
+    with pytest.raises(GitHubError, match="gh auth refresh -s project,read:project"):
+        real_gh.graphql("query { viewer { login } }", {})
+
+    # 2. Initialize a Git-backed meta-repository with `--repo` per-branch overrides
+    meta_repo = tmp_path / "acme-meta"
+    meta_repo.mkdir(parents=True)
+    _git(meta_repo, "init", "-b", "main")
+    _git(meta_repo, "config", "user.email", "dev@acme.test")
+    _git(meta_repo, "config", "user.name", "Acme Dev")
+    _git(meta_repo, "remote", "add", "origin", "https://github.com/acme/acme-meta.git")
+
+    parser = cli.build_parser()
+    init_args = parser.parse_args(
+        [
+            "init",
+            "--cwd",
+            str(meta_repo),
+            "--project-number",
+            "7",
+            "--branch",
+            "feat/telemetry-v2",
+            "--repo",
+            "firmware=acme/firmware:feat/telemetry-v2",
+            "--repo",
+            "cloud=acme/cloud:feat/cloud-v3",
+        ]
+    )
+    assert cli.cmd_init(init_args, engine) == 0
+
+    parsed_toml = tomllib.loads((meta_repo / ".herdr-kanban.toml").read_text(encoding="utf-8"))
+    assert parsed_toml["board"]["default_repo"] == "acme-meta"
+    assert parsed_toml["repos"]["acme-meta"]["path"] == "."
+    assert parsed_toml["repos"]["acme-meta"]["target_branch"] == "main"
+    assert parsed_toml["repos"]["firmware"]["target_branch"] == "feat/telemetry-v2"
+    assert parsed_toml["repos"]["cloud"]["target_branch"] == "feat/cloud-v3"
+
+    gitignore_text = (meta_repo / ".gitignore").read_text(encoding="utf-8")
+    assert "/firmware/" in gitignore_text
+    assert "/cloud/" in gitignore_text
+
+    # 3. Verify Git LFS smudge failure retries with skip-smudge flags
+    calls: list[list[str]] = []
+
+    def _lfs_flaky_runner(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if "checkout" in args and "-c" not in args:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=128,
+                stdout="",
+                stderr="fatal: docs/spec.pdf: smudge filter lfs failed",
+            )
+        out = "" if "status" in args else "main\n"
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=out, stderr="")
+
+    flaky_git = GitClient(runner=_lfs_flaky_runner)
+    status = flaky_git.checkout_target_branch(meta_repo, "origin", "feat/telemetry-v2")
+    assert status == "synced"
+    assert any("-c" in call and "filter.lfs.smudge=git-lfs smudge --skip -- %f" in call for call in calls)
+

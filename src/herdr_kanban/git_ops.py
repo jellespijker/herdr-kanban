@@ -12,6 +12,18 @@ from pathlib import Path
 GitRunner = Callable[[list[str], Path | None], subprocess.CompletedProcess[str]]
 
 REMOTE_RE = re.compile(r"(?:github\.com[:/])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+LFS_SKIP_ARGS = (
+    "-c",
+    "filter.lfs.smudge=git-lfs smudge --skip -- %f",
+    "-c",
+    "filter.lfs.process=git-lfs filter-process --skip",
+)
+
+
+def _is_lfs_smudge_error(message: str) -> bool:
+    lowered = message.lower()
+    return "smudge filter lfs failed" in lowered or "git-lfs filter-process" in lowered
+
 
 
 class GitError(RuntimeError):
@@ -113,15 +125,32 @@ class GitClient:
             return worktree_path.resolve(), local_branch
 
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        self._git(
-            "worktree",
-            "add",
-            "-B",
-            local_branch,
-            str(worktree_path),
-            f"{remote}/{target_branch}",
-            cwd=main_repo,
-        )
+        try:
+            self._git(
+                "worktree",
+                "add",
+                "-B",
+                local_branch,
+                str(worktree_path),
+                f"{remote}/{target_branch}",
+                cwd=main_repo,
+            )
+        except GitError as exc:
+            if not _is_lfs_smudge_error(str(exc)):
+                raise
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            self._git("worktree", "prune", cwd=main_repo, check=False)
+            self._git(
+                *LFS_SKIP_ARGS,
+                "worktree",
+                "add",
+                "-B",
+                local_branch,
+                str(worktree_path),
+                f"{remote}/{target_branch}",
+                cwd=main_repo,
+            )
         return worktree_path.resolve(), local_branch
 
     def remove_ticket_worktree(
@@ -222,11 +251,36 @@ class GitClient:
                     == 0
                 )
                 if has_local:
-                    self._git("checkout", branch, cwd=repo_dir)
+                    checkout_args = ["checkout", branch]
                 else:
-                    self._git("checkout", "--track", "-b", branch, f"{remote}/{branch}", cwd=repo_dir)
+                    checkout_args = ["checkout", "--track", "-b", branch, f"{remote}/{branch}"]
+                try:
+                    self._git(*checkout_args, cwd=repo_dir)
+                except GitError as exc:
+                    if not _is_lfs_smudge_error(str(exc)):
+                        raise
+                    self._git("clean", "-fd", cwd=repo_dir, check=False)
+                    self._git(
+                        *LFS_SKIP_ARGS,
+                        "checkout",
+                        "-f",
+                        "-B",
+                        branch,
+                        "--track",
+                        f"{remote}/{branch}",
+                        cwd=repo_dir,
+                    )
             if self.is_clean(repo_dir):
                 ff = self._git("merge", "--ff-only", f"{remote}/{branch}", cwd=repo_dir, check=False)
+                if ff.returncode != 0 and _is_lfs_smudge_error(ff.stderr or ff.stdout):
+                    ff = self._git(
+                        *LFS_SKIP_ARGS,
+                        "merge",
+                        "--ff-only",
+                        f"{remote}/{branch}",
+                        cwd=repo_dir,
+                        check=False,
+                    )
                 return "synced" if ff.returncode == 0 else "diverged"
             return "dirty (kept local changes)"
 
@@ -299,6 +353,27 @@ class GitClient:
         )
         output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
         return proc.returncode == 0, output
+
+    def ensure_gitignore_entries(self, repo_root: Path, entries: list[str]) -> bool:
+        """Ensure relative child repo paths are present in `.gitignore` of a meta-repository."""
+        if not (repo_root / ".git").exists():
+            return False
+        gitignore = repo_root / ".gitignore"
+        existing_text = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+        existing_norm = {line.strip().strip("/") for line in existing_text.splitlines() if line.strip()}
+        to_add: list[str] = []
+        for raw in entries:
+            norm = raw.strip().strip("/")
+            if not norm or norm == "." or norm in existing_norm:
+                continue
+            existing_norm.add(norm)
+            to_add.append(f"/{norm}/")
+        if not to_add:
+            return False
+        prefix = "" if (not existing_text or existing_text.endswith("\n")) else "\n"
+        gitignore.write_text(f"{existing_text}{prefix}" + "\n".join(to_add) + "\n", encoding="utf-8")
+        return True
+
 
 
 def parse_remote_url(url: str) -> tuple[str, str] | None:

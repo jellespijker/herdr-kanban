@@ -16,7 +16,7 @@ from .engine import (
     KanbanError,
 )
 from .git_ops import GitError
-from .github import GitHubError, gh_binary
+from .github import GitHubError, gh_binary, has_project_scope
 from .model import COLUMN_TITLES, Column, strip_meta
 from .tui import BoardTUI
 
@@ -55,11 +55,56 @@ def _discover_child_repos(
     return found
 
 
+def _parse_repo_spec(spec: str, default_owner: str) -> config.RepoEntry:
+    """Parse `[alias=][owner/]repo[:branch]` into a RepoEntry."""
+    raw = spec.strip()
+    if not raw:
+        raise KanbanError("Empty `--repo` specification")
+    if "=" in raw:
+        alias_part, rest = raw.split("=", 1)
+        alias = alias_part.strip()
+    else:
+        alias = ""
+        rest = raw
+
+    if ":" in rest:
+        repo_part, branch_part = rest.split(":", 1)
+        target_branch = branch_part.strip()
+    else:
+        repo_part = rest
+        target_branch = ""
+
+    repo_part = repo_part.strip().strip("/")
+    if "/" in repo_part:
+        owner, repo_name = repo_part.split("/", 1)
+    else:
+        owner = default_owner
+        repo_name = repo_part
+
+    owner = owner.strip()
+    repo_name = repo_name.strip()
+    alias = alias or repo_name
+    if not owner or not repo_name or not alias:
+        raise KanbanError(
+            f"Invalid `--repo` spec '{spec}' (expected `[alias=][owner/]repo[:branch]`)"
+        )
+    return config.RepoEntry(
+        alias=alias,
+        owner=owner,
+        repo=repo_name,
+        path=alias,
+        target_branch=target_branch,
+    )
+
+
 def cmd_init(args: argparse.Namespace, engine: KanbanEngine) -> int:
     cwd = engine.resolve_cwd(Path(args.cwd) if args.cwd else None)
     wt_root = engine.git.worktree_root(cwd)
     child_repos = _discover_child_repos(cwd, engine)
-    is_umbrella = bool(args.umbrella or child_repos or (wt_root is None and args.umbrella))
+    cli_repo_specs: list[str] = list(getattr(args, "repo", None) or [])
+    is_umbrella = bool(
+        args.umbrella or child_repos or cli_repo_specs or (wt_root is None and args.umbrella)
+    )
 
     if wt_root is None and not is_umbrella:
         print(
@@ -68,18 +113,23 @@ def cmd_init(args: argparse.Namespace, engine: KanbanEngine) -> int:
         )
         return EXIT_RUNTIME
 
+    meta_owner_repo: tuple[str, str] | None = None
+    if wt_root is not None:
+        main_root = engine.git.main_repo_root(wt_root) or wt_root
+        meta_owner_repo = engine.git.parse_github_remote(main_root)
+
     if is_umbrella:
-        first_remote = next((r for _, _, r in child_repos if r is not None), None)
-        first_path = child_repos[0][1] if child_repos else None
+        first_remote = next((r for _, _, r in child_repos if r is not None), None) or meta_owner_repo
+        first_path = child_repos[0][1] if child_repos else wt_root
         default_owner = args.project_owner or (first_remote[0] if first_remote else "")
         repo_owner = ""
-        repo_name = cwd.name
+        repo_name = meta_owner_repo[1] if meta_owner_repo else cwd.name
         default_branch = args.branch or (engine.git.current_branch(first_path) if first_path else "main")
         config_root = cwd
     else:
         assert wt_root is not None
         main_root = engine.git.main_repo_root(wt_root) or wt_root
-        owner_repo = engine.git.parse_github_remote(main_root)
+        owner_repo = meta_owner_repo
         default_owner = args.project_owner or (owner_repo[0] if owner_repo else "")
         repo_owner = owner_repo[0] if owner_repo else default_owner
         repo_name = owner_repo[1] if owner_repo else main_root.name
@@ -147,16 +197,32 @@ def cmd_init(args: argparse.Namespace, engine: KanbanEngine) -> int:
         )
 
     repos_map: dict[str, config.RepoEntry] = {}
+    default_repo = ""
     if is_umbrella:
-        for alias, _path, rem in child_repos:
+        if wt_root is not None and wt_root.resolve() == cwd.resolve() and meta_owner_repo and cli_repo_specs:
+            meta_alias = meta_owner_repo[1]
+            repos_map[meta_alias] = config.RepoEntry(
+                alias=meta_alias,
+                owner=meta_owner_repo[0],
+                repo=meta_owner_repo[1],
+                path=".",
+                target_branch=engine.git.current_branch(wt_root),
+            )
+            default_repo = meta_alias
+        for alias, child_path, rem in child_repos:
             r_owner = rem[0] if rem else project_owner
             r_name = rem[1] if rem else alias
+            child_branch = engine.git.current_branch(child_path)
             repos_map[alias] = config.RepoEntry(
                 alias=alias,
                 owner=r_owner,
                 repo=r_name,
                 path=alias,
+                target_branch=child_branch if child_branch != target_branch else "",
             )
+        for spec in cli_repo_specs:
+            entry = _parse_repo_spec(spec, project_owner)
+            repos_map[entry.alias] = entry
 
     board_cfg = config.BoardConfig(
         project_owner=project_owner,
@@ -164,6 +230,7 @@ def cmd_init(args: argparse.Namespace, engine: KanbanEngine) -> int:
         target_branch=target_branch,
         repo_owner="" if is_umbrella else (repo_owner or project_owner),
         repo_name="" if is_umbrella else repo_name,
+        default_repo=default_repo,
         check_command=check_cmd,
         require_review=bool(args.require_review),
         repos=repos_map,
@@ -179,6 +246,9 @@ def cmd_init(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(config.render_board_config_toml(board_cfg), encoding="utf-8")
+    if is_umbrella and (config_root / ".git").exists():
+        child_paths = [e.path for e in repos_map.values() if e.path != "." and not Path(e.path).is_absolute()]
+        engine.git.ensure_gitignore_entries(config_root, child_paths)
     print(f"Wrote board configuration to {dest}")
     if is_umbrella:
         print(
@@ -613,6 +683,17 @@ def cmd_doctor(args: argparse.Namespace, engine: KanbanEngine) -> int:
         checks.append(
             ("gh auth", auth_ok, first_line or ("authenticated" if auth_ok else "run `gh auth login`"))
         )
+        if auth_ok:
+            scope_ok = has_project_scope(auth_out)
+            checks.append(
+                (
+                    "gh project scope",
+                    scope_ok,
+                    "granted"
+                    if scope_ok
+                    else "missing 'project' scope — run `gh auth refresh -s project,read:project`",
+                )
+            )
 
     herdr_ok = engine.herdr.available()
     checks.append(("herdr", herdr_ok, "detected" if herdr_ok else "outside herdr or missing binary"))
@@ -708,6 +789,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--umbrella",
         action="store_true",
         help="Initialize an umbrella multi-repository `.herdr-kanban.toml`",
+    )
+    p_init.add_argument(
+        "--repo",
+        action="append",
+        metavar="[ALIAS=][OWNER/]REPO[:BRANCH]",
+        help="Register a child repository in an umbrella workspace (repeatable)",
     )
     p_init.add_argument("--local-only", action="store_true", help="Save config locally instead of repo root")
     p_init.add_argument("--interactive", action="store_true", help="Interactive setup wizard")
