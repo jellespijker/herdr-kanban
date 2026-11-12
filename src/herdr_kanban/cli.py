@@ -524,7 +524,11 @@ def cmd_install_skill(args: argparse.Namespace, engine: KanbanEngine) -> int:
             print(f"{st:<10} {name:<8} {dest}  ({readers})")
         return EXIT_OK
     try:
-        rows = skill.install(args.harness or None, uninstall=args.uninstall)
+        rows = skill.install(
+            args.harness or None,
+            uninstall=args.uninstall,
+            refresh_only=args.refresh,
+        )
         for line in rows:
             print(line)
         if args.notify and engine.herdr.available():
@@ -710,6 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sk.add_argument("harness", nargs="*")
     p_sk.add_argument("--status", action="store_true")
     p_sk.add_argument("--uninstall", action="store_true")
+    p_sk.add_argument("--refresh", action="store_true", help="Relink existing outdated herdr-kanban links")
     p_sk.add_argument("--notify", action="store_true")
     p_sk.add_argument("--wait", action="store_true", help=argparse.SUPPRESS)
 

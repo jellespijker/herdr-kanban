@@ -42,8 +42,14 @@ def status(home: Path | None = None) -> list[tuple[str, Path, str, str]]:
     for name, (dest, readers) in targets(home).items():
         source = _source_for(name)
         if dest.is_symlink():
-            resolved = (dest.parent / os.readlink(dest)).resolve()
-            state = "installed" if resolved == source.resolve() else "other-link"
+            raw_link = os.readlink(dest)
+            resolved = (dest.parent / raw_link).resolve()
+            if resolved == source.resolve():
+                state = "installed"
+            elif SKILL_NAME in raw_link:
+                state = "outdated"
+            else:
+                state = "other-link"
         elif dest.exists():
             state = "foreign"
         else:
@@ -56,6 +62,7 @@ def install(
     names: list[str] | None = None,
     *,
     uninstall: bool = False,
+    refresh_only: bool = False,
     home: Path | None = None,
 ) -> list[str]:
     all_targets = targets(home)
@@ -70,17 +77,27 @@ def install(
             continue
         source = _source_for(name)
         if uninstall:
-            if state == "installed":
+            if state in ("installed", "outdated"):
                 dest.unlink()
                 report.append(f"removed  {dest}")
             else:
                 report.append(f"skipped  {dest} ({state})")
+            continue
+        if refresh_only:
+            if state == "outdated":
+                dest.unlink()
+                dest.symlink_to(source)
+                report.append(f"relinked {dest}  ({readers})")
             continue
         if name == "agy" and not dest.parent.parent.is_dir() and names is None:
             report.append(f"skipped  {dest} (agy not configured)")
             continue
         if state == "installed":
             report.append(f"ok       {dest}  ({readers})")
+        elif state == "outdated":
+            dest.unlink()
+            dest.symlink_to(source)
+            report.append(f"relinked {dest}  ({readers})")
         elif state == "missing":
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.symlink_to(source)

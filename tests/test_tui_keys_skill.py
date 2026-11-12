@@ -122,6 +122,14 @@ def test_skill_installer_never_overwrites_foreign_files(tmp_path: Path) -> None:
     assert (fake_home / ".gemini" / "config" / "skills" / "herdr-kanban").is_symlink()
     assert (foreign / "custom.md").read_text(encoding="utf-8") == "keep me"
 
+    # Simulate `herdr plugin update` leaving a symlink to an older herdr-kanban checkout
+    cli_link = fake_home / ".local" / "bin" / "herdr-kanban"
+    cli_link.unlink()
+    cli_link.symlink_to("/tmp/github-installations/herdr-kanban-old/bin/herdr-kanban")
+    relinked = skill.install(refresh_only=True, home=fake_home)
+    assert any("relinked" in line for line in relinked)
+    assert cli_link.resolve() == skill.CLI_SRC.resolve()
+
     uninstalled = skill.install(uninstall=True, home=fake_home)
     assert any("removed" in line for line in uninstalled)
     assert not (fake_home / ".local" / "bin" / "herdr-kanban").exists()
