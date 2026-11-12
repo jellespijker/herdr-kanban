@@ -21,10 +21,11 @@ from .model import (
     InboxItem,
     RelayMeta,
     Ticket,
-    compute_file_overlaps,
     decode_meta,
     is_lease_expired,
     lease_until_iso,
+    parse_ticket_ref,
+    populate_file_overlaps,
     render_claim_comment,
     render_deposit_body,
     render_relay_comment,
@@ -32,6 +33,8 @@ from .model import (
     strip_meta,
     utc_now_iso,
 )
+
+TicketRefInput = int | str
 
 
 class KanbanError(RuntimeError):
@@ -67,6 +70,25 @@ class RepoContext:
     slug: str
     board: config.BoardConfig
     settings: config.UserSettings
+    umbrella_root: Path | None = None
+    repos: dict[str, config.RepoEntry] = field(default_factory=dict)
+    active_repo_alias: str = ""
+
+    @property
+    def is_multi_repo(self) -> bool:
+        return self.board.is_multi_repo
+
+    @property
+    def display_name(self) -> str:
+        if self.is_multi_repo:
+            label = self.umbrella_root.name if self.umbrella_root else self.board.project_owner
+            return f"{label} ({len(self.repos)} repos)"
+        return f"{self.repo_owner}/{self.repo_name}"
+
+    def repo_slugs(self) -> list[str]:
+        if self.is_multi_repo:
+            return [entry.slug for entry in self.repos.values()]
+        return [self.slug]
 
 
 @dataclass(slots=True)
@@ -83,8 +105,12 @@ class LandingResult:
     status: str  # landed | review_pending
     target_branch: str
     commit_sha: str
+    repo_alias: str = ""
     closed_issue: bool = False
     worktree_removed: bool = False
+
+    def ref(self) -> str:
+        return f"{self.repo_alias}#{self.issue_number}" if self.repo_alias else f"#{self.issue_number}"
 
 
 class KanbanEngine:
@@ -116,9 +142,55 @@ class KanbanEngine:
     def resolve_context(self, explicit_cwd: Path | None = None) -> RepoContext:
         start = self.resolve_cwd(explicit_cwd)
         wt_root = self.git.worktree_root(start)
+        main_root = (self.git.main_repo_root(wt_root) or wt_root) if wt_root is not None else None
+        cwd_claim = state.find_claim_by_cwd(start)
+
+        umbrella_dir = config.find_umbrella_dir(start, main_root)
+        if umbrella_dir is None and cwd_claim and cwd_claim.umbrella_root:
+            cand = Path(cwd_claim.umbrella_root)
+            if cand.is_dir():
+                umbrella_dir = cand.resolve()
+
+        if umbrella_dir is not None:
+            board = config.load_board_config(wt_root, main_root, None, umbrella_root=umbrella_dir)
+            if board is not None and board.is_multi_repo:
+                active_alias = ""
+                if cwd_claim and cwd_claim.repo_alias in board.repos:
+                    active_alias = cwd_claim.repo_alias
+                elif main_root is not None:
+                    for alias, entry in board.repos.items():
+                        if entry.resolved_path(umbrella_dir) == main_root.resolve():
+                            active_alias = alias
+                            break
+
+                primary_alias = (
+                    active_alias
+                    if active_alias in board.repos
+                    else (
+                        board.default_repo if board.default_repo in board.repos else next(iter(board.repos))
+                    )
+                )
+                primary = board.repos[primary_alias]
+                slug = f"umbrella__{config.repo_slug(board.project_owner, umbrella_dir.name)}"
+                return RepoContext(
+                    worktree_cwd=wt_root or start,
+                    main_repo_root=main_root or primary.resolved_path(umbrella_dir),
+                    repo_owner=primary.owner,
+                    repo_name=primary.repo,
+                    slug=slug,
+                    board=board,
+                    settings=config.load_user_settings(),
+                    umbrella_root=umbrella_dir,
+                    repos=dict(board.repos),
+                    active_repo_alias=active_alias,
+                )
+
         if wt_root is None:
-            raise KanbanError(f"{start} is not inside a Git repository")
-        main_root = self.git.main_repo_root(wt_root) or wt_root
+            raise KanbanError(
+                f"{start} is not inside a Git repository "
+                "(run `herdr-kanban init` inside a repo or multi-repo parent directory)"
+            )
+        assert main_root is not None
         owner_repo = self.git.parse_github_remote(main_root)
         board = config.load_board_config(wt_root, main_root, owner_repo)
         if board is None:
@@ -130,6 +202,15 @@ class KanbanEngine:
         board.repo_owner = repo_owner
         board.repo_name = repo_name
         slug = config.repo_slug(repo_owner, repo_name)
+        single = config.RepoEntry(
+            alias=repo_name,
+            owner=repo_owner,
+            repo=repo_name,
+            path=str(main_root),
+            target_branch=board.target_branch,
+            remote=board.remote,
+            check_command=board.check_command,
+        )
         return RepoContext(
             worktree_cwd=wt_root,
             main_repo_root=main_root,
@@ -138,17 +219,160 @@ class KanbanEngine:
             slug=slug,
             board=board,
             settings=config.load_user_settings(),
+            umbrella_root=None,
+            repos={repo_name: single},
+            active_repo_alias=repo_name,
         )
 
-    def refresh_board(self, ctx: RepoContext) -> tuple[ProjectSchema, list[Ticket]]:
-        schema, tickets = self.github.fetch_board(
-            project_owner=ctx.board.project_owner,
-            project_number=ctx.board.project_number,
-            repo_owner=ctx.repo_owner,
-            repo_name=ctx.repo_name,
-            column_map=ctx.board.columns,
-            label_filter=ctx.board.label_filter,
+    def resolve_repo_entry(
+        self,
+        ctx: RepoContext,
+        selector: str | None = None,
+    ) -> config.RepoEntry:
+        if not ctx.is_multi_repo:
+            only = next(iter(ctx.repos.values()))
+            if selector:
+                sel_lc = selector.lower()
+                valid = {
+                    only.alias.lower(),
+                    only.repo.lower(),
+                    f"{only.owner}/{only.repo}".lower(),
+                }
+                if sel_lc not in valid:
+                    raise KanbanError(f"Repository '{selector}' does not match {only.owner}/{only.repo}")
+            return only
+
+        if selector:
+            if selector in ctx.repos:
+                return ctx.repos[selector]
+            sel_lc = selector.lower()
+            matches = [
+                e
+                for e in ctx.repos.values()
+                if e.alias.lower() == sel_lc
+                or e.repo.lower() == sel_lc
+                or f"{e.owner}/{e.repo}".lower() == sel_lc
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                aliases = ", ".join(m.alias for m in matches)
+                raise KanbanError(f"Ambiguous repository '{selector}' (matches: {aliases})")
+            avail = ", ".join(ctx.repos)
+            raise KanbanError(f"Unknown repository '{selector}' (configured: {avail})")
+
+        if ctx.active_repo_alias and ctx.active_repo_alias in ctx.repos:
+            return ctx.repos[ctx.active_repo_alias]
+        if ctx.board.default_repo and ctx.board.default_repo in ctx.repos:
+            return ctx.repos[ctx.board.default_repo]
+        if len(ctx.repos) == 1:
+            return next(iter(ctx.repos.values()))
+        avail = ", ".join(ctx.repos)
+        raise KanbanError(
+            f"Multiple repositories configured ({avail}); pass `--repo <alias>` or `<alias>#<number>`."
         )
+
+    def resolve_ticket_target(
+        self,
+        ctx: RepoContext,
+        ref: TicketRefInput,
+        tickets: list[Ticket] | None = None,
+    ) -> tuple[config.RepoEntry, int]:
+        if isinstance(ref, int):
+            if ref < 1:
+                raise KanbanError(f"Ticket number must be >= 1, got {ref}")
+            repo_sel, issue_number = None, ref
+        else:
+            try:
+                repo_sel, issue_number = parse_ticket_ref(str(ref))
+            except ValueError as exc:
+                raise KanbanError(str(exc)) from exc
+
+        if not ctx.is_multi_repo or repo_sel is not None:
+            return self.resolve_repo_entry(ctx, repo_sel), issue_number
+
+        # Bare `<number>` inside an umbrella workspace:
+        cwd_claim = state.find_claim_by_cwd(ctx.worktree_cwd)
+        if cwd_claim and cwd_claim.issue_number == issue_number and cwd_claim.repo_alias in ctx.repos:
+            return ctx.repos[cwd_claim.repo_alias], issue_number
+
+        board_tickets = tickets
+        if board_tickets is None:
+            cached = self.load_cached_tickets(ctx)
+            board_tickets = cached[1] if cached is not None else self.refresh_board(ctx)[1]
+
+        matches = [t for t in board_tickets if t.number == issue_number and t.repo_alias in ctx.repos]
+        if len(matches) == 1:
+            return ctx.repos[matches[0].repo_alias], issue_number
+        if len(matches) > 1:
+            if ctx.active_repo_alias and any(m.repo_alias == ctx.active_repo_alias for m in matches):
+                return ctx.repos[ctx.active_repo_alias], issue_number
+            refs = ", ".join(f"{m.repo_alias}#{issue_number}" for m in matches)
+            raise KanbanError(
+                f"Ambiguous issue #{issue_number} exists in multiple repositories: {refs}. "
+                f"Specify `<repo>#{issue_number}`."
+            )
+
+        local_matches = [
+            e for e in ctx.repos.values() if state.get_local_claim(e.slug, issue_number) is not None
+        ]
+        if len(local_matches) == 1:
+            return local_matches[0], issue_number
+
+        if ctx.active_repo_alias and ctx.active_repo_alias in ctx.repos:
+            return ctx.repos[ctx.active_repo_alias], issue_number
+        if ctx.board.default_repo and ctx.board.default_repo in ctx.repos:
+            return ctx.repos[ctx.board.default_repo], issue_number
+
+        avail = ", ".join(f"{alias}#{issue_number}" for alias in ctx.repos)
+        raise KanbanError(f"Issue #{issue_number} is ambiguous across umbrella repos; specify e.g. {avail}.")
+
+    def _entry_main_root(self, ctx: RepoContext, entry: config.RepoEntry) -> Path:
+        if not ctx.is_multi_repo:
+            return ctx.main_repo_root
+        base = ctx.umbrella_root or ctx.main_repo_root
+        root = entry.resolved_path(base)
+        if not (root / ".git").exists():
+            raise KanbanError(
+                f"Repository '{entry.alias}' ({entry.owner}/{entry.repo}) is not cloned at {root}. "
+                "Run `herdr-kanban sync-repos` first."
+            )
+        return root
+
+    @staticmethod
+    def _find_board_ticket(
+        tickets: list[Ticket],
+        entry: config.RepoEntry,
+        issue_number: int,
+        multi_repo: bool,
+    ) -> Ticket | None:
+        key = (entry.owner.lower(), entry.repo.lower())
+        for ticket in tickets:
+            if ticket.number != issue_number:
+                continue
+            if not multi_repo or ticket.repo_key() == key or ticket.repo_alias == entry.alias:
+                return ticket
+        return None
+
+    def refresh_board(self, ctx: RepoContext) -> tuple[ProjectSchema, list[Ticket]]:
+        if ctx.is_multi_repo:
+            allowed = {(entry.owner.lower(), entry.repo.lower()): alias for alias, entry in ctx.repos.items()}
+            schema, tickets = self.github.fetch_board(
+                project_owner=ctx.board.project_owner,
+                project_number=ctx.board.project_number,
+                column_map=ctx.board.columns,
+                label_filter=ctx.board.label_filter,
+                allowed_repos=allowed,
+            )
+        else:
+            schema, tickets = self.github.fetch_board(
+                project_owner=ctx.board.project_owner,
+                project_number=ctx.board.project_number,
+                repo_owner=ctx.repo_owner,
+                repo_name=ctx.repo_name,
+                column_map=ctx.board.columns,
+                label_filter=ctx.board.label_filter,
+            )
         state.save_board_cache(
             ctx.slug,
             ctx.board.project_number,
@@ -162,15 +386,56 @@ class KanbanEngine:
             return None
         fetched_at, rows = cached
         tickets = [self._deserialize_cached_ticket(r) for r in rows if isinstance(r, dict)]
-        overlaps = compute_file_overlaps(tickets)
-        for t in tickets:
-            t.overlaps = overlaps.get(t.number, [])
+        populate_file_overlaps(tickets)
         return fetched_at, tickets
+
+    def sync_repos(self, ctx: RepoContext, *, create_branches: bool = False) -> list[dict[str, str]]:
+        """Clone missing child repos and check out each repo's shared target branch."""
+        results: list[dict[str, str]] = []
+        base = ctx.umbrella_root or ctx.main_repo_root.parent
+        for entry in ctx.repos.values():
+            dest = entry.resolved_path(base) if ctx.is_multi_repo else ctx.main_repo_root
+            cloned = False
+            if not (dest / ".git").exists():
+                self.github.clone_repo(entry.owner, entry.repo, dest)
+                cloned = True
+            remote = entry.effective_remote(ctx.board)
+            branch = entry.effective_branch(ctx.board)
+            branch_state = self.git.checkout_target_branch(
+                dest,
+                remote,
+                branch,
+                create_if_missing=create_branches,
+            )
+            results.append(
+                {
+                    "alias": entry.alias,
+                    "repo": f"{entry.owner}/{entry.repo}",
+                    "path": str(dest),
+                    "branch": branch,
+                    "status": f"cloned + {branch_state}" if cloned else branch_state,
+                }
+            )
+        return results
+
+    def _link_siblings_if_multi(
+        self,
+        ctx: RepoContext,
+        entry: config.RepoEntry,
+        wt_path: Path,
+    ) -> list[str]:
+        if not ctx.is_multi_repo:
+            return []
+        base = ctx.umbrella_root or ctx.main_repo_root.parent
+        siblings = {
+            alias: other.resolved_path(base) for alias, other in ctx.repos.items() if alias != entry.alias
+        }
+        return self.git.link_sibling_repos(wt_path, siblings)
 
     def claim_ticket(
         self,
         ctx: RepoContext,
-        issue_number: int,
+        ref: TicketRefInput,
         *,
         agent_kind: str | None = None,
         agent_name: str = "",
@@ -180,12 +445,15 @@ class KanbanEngine:
     ) -> ClaimResult:
         chosen_kind = agent_kind or ctx.settings.default_agent_kind
         schema, tickets = self.refresh_board(ctx)
-        ticket = next((t for t in tickets if t.number == issue_number), None)
+        entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
+        ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
+        disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
         if ticket is None:
-            raise KanbanError(f"Issue #{issue_number} is not on GitHub Project #{ctx.board.project_number}")
+            raise KanbanError(f"Issue {disp} is not on GitHub Project #{ctx.board.project_number}")
 
-        existing_local = state.get_local_claim(ctx.slug, issue_number)
+        existing_local = state.get_local_claim(entry.slug, issue_number)
         if existing_local and Path(existing_local.worktree_path).is_dir():
+            self._link_siblings_if_multi(ctx, entry, Path(existing_local.worktree_path))
             return ClaimResult(
                 claim=existing_local,
                 ticket=ticket,
@@ -193,7 +461,7 @@ class KanbanEngine:
                 reused=True,
             )
 
-        comments = self.github.list_issue_comments(ctx.repo_owner, ctx.repo_name, issue_number)
+        comments = self.github.list_issue_comments(entry.owner, entry.repo, issue_number)
         winning = resolve_winning_claim(comments)
         takeover_of: int | None = None
         if winning is not None:
@@ -201,27 +469,32 @@ class KanbanEngine:
             expired = is_lease_expired(win_claim.lease_until)
             if not expired:
                 raise ClaimConflictError(
-                    f"Issue #{issue_number} is already claimed by @{win_claim.owner} "
+                    f"Issue {disp} is already claimed by @{win_claim.owner} "
                     f"({win_claim.agent_kind}) until {win_claim.lease_until}"
                 )
             if not takeover:
                 raise ClaimStaleError(
-                    f"Issue #{issue_number} has a STALE claim by @{win_claim.owner} "
+                    f"Issue {disp} has a STALE claim by @{win_claim.owner} "
                     f"(expired {win_claim.lease_until}). Re-run with `--takeover` to reclaim."
                 )
             takeover_of = win_cid
 
+        main_repo = self._entry_main_root(ctx, entry)
+        remote = entry.effective_remote(ctx.board)
+        target_branch = entry.effective_branch(ctx.board)
+
         user = self.github.current_user()
-        wt_base = ctx.settings.resolved_worktree_root() / ctx.slug / f"issue-{issue_number}"
+        wt_base = ctx.settings.resolved_worktree_root() / entry.slug / f"issue-{issue_number}"
         had_wt = wt_base.exists()
-        self.git.ensure_remote_branch(ctx.main_repo_root, ctx.board.remote, ctx.board.target_branch)
+        self.git.ensure_remote_branch(main_repo, remote, target_branch)
         wt_path, local_branch = self.git.create_ticket_worktree(
-            ctx.main_repo_root,
+            main_repo,
             wt_base,
-            ctx.board.remote,
-            ctx.board.target_branch,
+            remote,
+            target_branch,
             issue_number,
         )
+        self._link_siblings_if_multi(ctx, entry, wt_path)
 
         now_iso = utc_now_iso()
         lease_iso = lease_until_iso(ctx.board.lease_ttl_minutes)
@@ -237,33 +510,33 @@ class KanbanEngine:
             lease_until=lease_iso,
             herdr_session=state.herdr_session_key(),
             pane_id=caller_pane,
-            branch=ctx.board.target_branch,
+            branch=target_branch,
             risk_gate=risk_gate or ctx.board.require_review,
             takeover_of=takeover_of,
         )
 
         posted = self.github.post_comment(
-            ctx.repo_owner,
-            ctx.repo_name,
+            entry.owner,
+            entry.repo,
             issue_number,
             render_claim_comment(meta),
         )
         my_cid = int(posted["id"])
 
         # Optimistic concurrency verification: earliest active comment ID wins.
-        after_comments = self.github.list_issue_comments(ctx.repo_owner, ctx.repo_name, issue_number)
+        after_comments = self.github.list_issue_comments(entry.owner, entry.repo, issue_number)
         verified = resolve_winning_claim(after_comments)
         if verified is None or verified[0] != my_cid:
-            self.github.delete_comment(ctx.repo_owner, ctx.repo_name, my_cid)
+            self.github.delete_comment(entry.owner, entry.repo, my_cid)
             if not had_wt and self.git.is_clean(wt_path):
-                self.git.remove_ticket_worktree(ctx.main_repo_root, wt_path, local_branch)
+                self.git.remove_ticket_worktree(main_repo, wt_path, local_branch)
             holder = f"@{verified[1].owner}" if verified else "another agent"
             raise ClaimRaceLostError(
-                f"Lost simultaneous claim race on #{issue_number} to {holder}; claim rolled back."
+                f"Lost simultaneous claim race on {disp} to {holder}; claim rolled back."
             )
 
         try:
-            self.github.assign_issue(ctx.repo_owner, ctx.repo_name, issue_number, user)
+            self.github.assign_issue(entry.owner, entry.repo, issue_number, user)
         except GitHubError:
             pass
         if ticket.project_item_id:
@@ -275,15 +548,15 @@ class KanbanEngine:
             )
 
         local_claim = state.LocalClaim(
-            repo_slug=ctx.slug,
-            repo_owner=ctx.repo_owner,
-            repo_name=ctx.repo_name,
-            main_repo_root=str(ctx.main_repo_root),
+            repo_slug=entry.slug,
+            repo_owner=entry.owner,
+            repo_name=entry.repo,
+            main_repo_root=str(main_repo),
             issue_number=issue_number,
             worktree_path=str(wt_path),
             local_branch=local_branch,
-            target_branch=ctx.board.target_branch,
-            remote=ctx.board.remote,
+            target_branch=target_branch,
+            remote=remote,
             comment_id=my_cid,
             owner=user,
             agent_kind=chosen_kind,
@@ -293,26 +566,28 @@ class KanbanEngine:
             herdr_session=state.herdr_session_key(),
             risk_gate=meta.risk_gate,
             started_at=now_iso,
+            umbrella_root=str(ctx.umbrella_root) if ctx.umbrella_root else "",
+            repo_alias=entry.alias if ctx.is_multi_repo else "",
         )
         state.save_local_claim(local_claim)
         if after_comments:
-            state.set_watermark(ctx.slug, issue_number, max(int(c["id"]) for c in after_comments))
+            state.set_watermark(entry.slug, issue_number, max(int(c["id"]) for c in after_comments))
 
         ticket.claim = meta
         ticket.claim_comment_id = my_cid
         ticket.column = Column.IN_PROGRESS
-        overlaps = compute_file_overlaps(tickets)
+        populate_file_overlaps(tickets)
         return ClaimResult(
             claim=local_claim,
             ticket=ticket,
-            overlaps=overlaps.get(issue_number, []),
+            overlaps=list(ticket.overlaps),
             reused=False,
         )
 
     def dispatch_ticket(
         self,
         ctx: RepoContext,
-        issue_number: int,
+        ref: TicketRefInput,
         *,
         agent_kind: str | None = None,
         risk_gate: bool = False,
@@ -322,7 +597,7 @@ class KanbanEngine:
         chosen_kind = agent_kind or ctx.settings.default_agent_kind
         res = self.claim_ticket(
             ctx,
-            issue_number,
+            ref,
             agent_kind=chosen_kind,
             risk_gate=risk_gate,
             takeover=takeover,
@@ -330,10 +605,11 @@ class KanbanEngine:
         prompt = self._build_agent_prompt(ctx, res.ticket, res.claim, res.overlaps)
         spawned = self.herdr.spawn_ticket_agent(
             worktree_path=Path(res.claim.worktree_path),
-            issue_number=issue_number,
+            issue_number=res.claim.issue_number,
             title=res.ticket.title,
             agent_kind=chosen_kind,
             prompt_text=prompt,
+            repo_alias=res.claim.repo_alias if ctx.is_multi_repo else "",
             focus=focus,
         )
         res.claim.pane_id = spawned["pane_id"]
@@ -347,8 +623,8 @@ class KanbanEngine:
             res.ticket.claim.agent_name = spawned["agent_name"]
             try:
                 self.github.patch_comment(
-                    ctx.repo_owner,
-                    ctx.repo_name,
+                    res.claim.repo_owner,
+                    res.claim.repo_name,
                     res.claim.comment_id,
                     render_claim_comment(res.ticket.claim),
                 )
@@ -359,14 +635,15 @@ class KanbanEngine:
     def release_ticket(
         self,
         ctx: RepoContext,
-        issue_number: int,
+        ref: TicketRefInput,
         *,
         reason: str = "",
         force_remove_worktree: bool = False,
-    ) -> None:
+    ) -> tuple[config.RepoEntry, int]:
         schema, tickets = self.refresh_board(ctx)
-        ticket = next((t for t in tickets if t.number == issue_number), None)
-        local_claim = state.get_local_claim(ctx.slug, issue_number)
+        entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
+        ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
+        local_claim = state.get_local_claim(entry.slug, issue_number)
 
         cid = local_claim.comment_id if local_claim else (ticket.claim_comment_id if ticket else None)
         claim_meta = ticket.claim if (ticket and ticket.claim) else None
@@ -388,8 +665,8 @@ class KanbanEngine:
             if reason:
                 claim_meta.note = reason
             self.github.patch_comment(
-                ctx.repo_owner,
-                ctx.repo_name,
+                entry.owner,
+                entry.repo,
                 cid,
                 render_claim_comment(claim_meta),
             )
@@ -398,7 +675,7 @@ class KanbanEngine:
             self.github.set_item_column(schema, ticket.project_item_id, Column.READY, ctx.board.columns)
         try:
             user = self.github.current_user()
-            self.github.unassign_issue(ctx.repo_owner, ctx.repo_name, issue_number, user)
+            self.github.unassign_issue(entry.owner, entry.repo, issue_number, user)
         except GitHubError:
             pass
 
@@ -415,25 +692,28 @@ class KanbanEngine:
                     local_claim.local_branch,
                     force=force_remove_worktree,
                 )
-            state.remove_local_claim(ctx.slug, issue_number)
+            state.remove_local_claim(entry.slug, issue_number)
+        return entry, issue_number
 
     def update_progress(
         self,
         ctx: RepoContext,
-        issue_number: int,
+        ref: TicketRefInput,
         *,
         note: str | None = None,
         checklist: list[str] | None = None,
     ) -> ClaimMeta:
-        local_claim = state.get_local_claim(ctx.slug, issue_number)
-        comments = self.github.list_issue_comments(ctx.repo_owner, ctx.repo_name, issue_number)
+        entry, issue_number = self.resolve_ticket_target(ctx, ref)
+        local_claim = state.get_local_claim(entry.slug, issue_number)
+        comments = self.github.list_issue_comments(entry.owner, entry.repo, issue_number)
         winning = resolve_winning_claim(comments)
+        disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
         if winning is None:
-            raise KanbanError(f"Issue #{issue_number} has no active claim to update")
+            raise KanbanError(f"Issue {disp} has no active claim to update")
         cid, meta = winning
 
         wt = Path(local_claim.worktree_path) if local_claim else ctx.worktree_cwd
-        base_ref = f"{ctx.board.remote}/{ctx.board.target_branch}"
+        base_ref = f"{entry.effective_remote(ctx.board)}/{entry.effective_branch(ctx.board)}"
         if wt.is_dir():
             meta.touched_files = self.git.touched_files(wt, base_ref)
         meta.heartbeat_at = utc_now_iso()
@@ -443,7 +723,7 @@ class KanbanEngine:
         if checklist is not None:
             meta.checklist = checklist
 
-        self.github.patch_comment(ctx.repo_owner, ctx.repo_name, cid, render_claim_comment(meta))
+        self.github.patch_comment(entry.owner, entry.repo, cid, render_claim_comment(meta))
         return meta
 
     def deposit_issue(
@@ -452,23 +732,50 @@ class KanbanEngine:
         title: str,
         *,
         body: str = "",
-        parent_issue: int | None = None,
+        parent_issue: TicketRefInput | None = None,
         file_line: str = "",
         ready: bool = False,
+        repo_selector: str | None = None,
     ) -> Ticket:
+        entry = self.resolve_repo_entry(ctx, repo_selector)
+        parent_num: int | None = None
+        parent_repo = ""
+        if parent_issue is not None:
+            if isinstance(parent_issue, int):
+                parent_num = parent_issue
+                if ctx.is_multi_repo:
+                    parent_repo = ctx.active_repo_alias or entry.alias
+            else:
+                p_sel, p_num = parse_ticket_ref(str(parent_issue))
+                parent_num = p_num
+                if ctx.is_multi_repo:
+                    p_entry = (
+                        self.resolve_repo_entry(ctx, p_sel)
+                        if p_sel
+                        else (ctx.repos.get(ctx.active_repo_alias) or entry)
+                    )
+                    parent_repo = p_entry.alias
+
         user = self.github.current_user()
+        commit_cwd = ctx.worktree_cwd
+        if ctx.is_multi_repo and not (commit_cwd / ".git").exists():
+            cand = entry.resolved_path(ctx.umbrella_root or commit_cwd)
+            if (cand / ".git").exists():
+                commit_cwd = cand
+
         deposit = DepositMeta(
             deposited_by=user,
-            branch=ctx.board.target_branch,
-            parent_issue=parent_issue,
+            branch=entry.effective_branch(ctx.board),
+            parent_issue=parent_num,
+            parent_repo=parent_repo,
             file_line=file_line,
-            commit_sha=self.git.head_sha(ctx.worktree_cwd),
+            commit_sha=self.git.head_sha(commit_cwd) if (commit_cwd / ".git").exists() else "",
         )
         full_body = render_deposit_body(body, deposit)
         labels = [ctx.board.label_filter] if ctx.board.label_filter else None
         created = self.github.create_issue(
-            ctx.repo_owner,
-            ctx.repo_name,
+            entry.owner,
+            entry.repo,
             title,
             body=full_body,
             labels=labels,
@@ -495,14 +802,19 @@ class KanbanEngine:
             labels=labels or [],
             column=target_col,
             project_item_id=item_id,
+            repo_owner=entry.owner,
+            repo_name=entry.repo,
+            repo_alias=entry.alias if ctx.is_multi_repo else "",
             deposit=deposit,
         )
 
-    def move_ticket(self, ctx: RepoContext, issue_number: int, column: Column) -> Ticket:
+    def move_ticket(self, ctx: RepoContext, ref: TicketRefInput, column: Column) -> Ticket:
         schema, tickets = self.refresh_board(ctx)
-        ticket = next((t for t in tickets if t.number == issue_number), None)
+        entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
+        ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
+        disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
         if ticket is None or not ticket.project_item_id:
-            raise KanbanError(f"Issue #{issue_number} not found on Project #{ctx.board.project_number}")
+            raise KanbanError(f"Issue {disp} not found on Project #{ctx.board.project_number}")
         ok = self.github.set_item_column(schema, ticket.project_item_id, column, ctx.board.columns)
         if not ok:
             raise KanbanError(
@@ -511,99 +823,135 @@ class KanbanEngine:
         ticket.column = column
         return ticket
 
-    def post_comment(self, ctx: RepoContext, issue_number: int, body: str) -> dict[str, Any]:
-        return self.github.post_comment(ctx.repo_owner, ctx.repo_name, issue_number, body)
+    def post_comment(self, ctx: RepoContext, ref: TicketRefInput, body: str) -> dict[str, Any]:
+        entry, issue_number = self.resolve_ticket_target(ctx, ref)
+        return self.github.post_comment(entry.owner, entry.repo, issue_number, body)
 
     def ask_ticket(
         self,
         ctx: RepoContext,
-        to_issue: int,
+        to_issue: TicketRefInput,
         message: str,
         *,
-        from_issue: int | None = None,
+        from_issue: TicketRefInput | None = None,
         urgent: bool = False,
     ) -> dict[str, Any]:
+        to_entry, to_num = self.resolve_ticket_target(ctx, to_issue)
         user = self.github.current_user()
-        caller_claim = (
-            state.get_local_claim(ctx.slug, from_issue)
-            if from_issue
-            else state.find_claim_by_cwd(ctx.worktree_cwd)
-        )
-        resolved_from = from_issue or (caller_claim.issue_number if caller_claim else None)
-        from_agent = caller_claim.agent_kind if caller_claim else os.environ.get("HERDR_KANBAN_AGENT", "")
 
+        resolved_from: int | None = None
+        from_repo_alias = ""
+        caller_claim: state.LocalClaim | None = None
+        if from_issue is not None:
+            from_entry, resolved_from = self.resolve_ticket_target(ctx, from_issue)
+            caller_claim = state.get_local_claim(from_entry.slug, resolved_from)
+            if ctx.is_multi_repo:
+                from_repo_alias = from_entry.alias
+        else:
+            caller_claim = state.find_claim_by_cwd(ctx.worktree_cwd)
+            if caller_claim:
+                resolved_from = caller_claim.issue_number
+                if ctx.is_multi_repo:
+                    from_repo_alias = caller_claim.repo_alias
+
+        from_agent = caller_claim.agent_kind if caller_claim else os.environ.get("HERDR_KANBAN_AGENT", "")
         relay = RelayMeta(
             from_owner=user,
             from_agent=from_agent,
+            from_repo=from_repo_alias,
             from_issue=resolved_from,
-            to_issue=to_issue,
+            to_issue=to_num,
             created_at=utc_now_iso(),
             urgent=urgent,
         )
         posted = self.github.post_comment(
-            ctx.repo_owner,
-            ctx.repo_name,
-            to_issue,
+            to_entry.owner,
+            to_entry.repo,
+            to_num,
             render_relay_comment(relay, message),
         )
         cid = int(posted["id"])
 
         # Local / herdr-machine fast path when target ticket runs on our own session or saved machine.
         delivered_fast = False
-        target_local = state.get_local_claim(ctx.slug, to_issue)
-        wakeup_text = self._format_wakeup_prompt(to_issue, user, from_agent, resolved_from, message)
+        target_local = state.get_local_claim(to_entry.slug, to_num)
+        to_ref_str = f"{to_entry.alias}#{to_num}" if ctx.is_multi_repo else str(to_num)
+        from_ref_str = (
+            (f"{from_repo_alias}#{resolved_from}" if from_repo_alias else str(resolved_from))
+            if resolved_from is not None
+            else None
+        )
+        wakeup_text = self._format_wakeup_prompt(
+            to_ref_str,
+            user,
+            from_agent,
+            from_ref_str,
+            message,
+        )
         if target_local is not None:
             target_handle = target_local.agent_name or target_local.pane_id
             delivered_fast = self.herdr.prompt_if_idle(target_handle, wakeup_text)
             state.append_inbox_item(
-                ctx.slug,
+                to_entry.slug,
                 InboxItem(
                     comment_id=cid,
-                    issue_number=to_issue,
+                    issue_number=to_num,
                     author=user,
                     body=message.strip(),
                     created_at=relay.created_at,
                     from_agent=from_agent,
+                    from_repo=from_repo_alias,
                     from_issue=resolved_from,
                     trusted=True,
                     delivered=delivered_fast,
                 ),
             )
-            state.set_watermark(ctx.slug, to_issue, cid)
+            state.set_watermark(to_entry.slug, to_num, cid)
         else:
+            remote_agent = f"{to_entry.alias}-{to_num}" if ctx.is_multi_repo else f"issue-{to_num}"
             for machine in ctx.settings.machines:
-                if self.herdr.prompt_if_idle(f"issue-{to_issue}", wakeup_text, machine=machine):
+                if self.herdr.prompt_if_idle(remote_agent, wakeup_text, machine=machine):
                     delivered_fast = True
                     break
 
-        return {"comment_id": cid, "url": posted["url"], "delivered_immediately": delivered_fast}
+        return {
+            "comment_id": cid,
+            "url": posted["url"],
+            "to_ref": f"{to_entry.alias}#{to_num}" if ctx.is_multi_repo else f"#{to_num}",
+            "delivered_immediately": delivered_fast,
+        }
 
     def complete_ticket(
         self,
         ctx: RepoContext,
-        issue_number: int,
+        ref: TicketRefInput,
         *,
         summary: str = "",
         approve: bool = False,
         allow_empty: bool = False,
     ) -> LandingResult:
-        local_claim = state.get_local_claim(ctx.slug, issue_number)
+        entry, issue_number = self.resolve_ticket_target(ctx, ref)
+        disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
+        cli_ref = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else str(issue_number)
+
+        local_claim = state.get_local_claim(entry.slug, issue_number)
         wt = Path(local_claim.worktree_path) if local_claim else ctx.worktree_cwd
-        if not wt.is_dir():
-            raise LandingGateError(f"Worktree {wt} does not exist for issue #{issue_number}")
+        if not wt.is_dir() or not (wt / ".git").exists():
+            raise LandingGateError(f"Worktree {wt} does not exist for issue {disp}")
 
         if self.git.is_rebase_in_progress(wt):
             raise LandingGateError(
                 f"A rebase is still in progress in {wt}. Resolve conflicts, run `git rebase --continue`, "
-                f"and re-run `herdr-kanban done {issue_number}`."
+                f"and re-run `herdr-kanban done {cli_ref}`."
             )
         if not self.git.is_clean(wt):
             raise LandingGateError(
                 f"Worktree {wt} has uncommitted changes. Commit or clean them before calling `done`."
             )
 
-        remote = ctx.board.remote
-        target = ctx.board.target_branch
+        remote = entry.effective_remote(ctx.board)
+        target = entry.effective_branch(ctx.board)
+        check_cmd = entry.effective_check(ctx.board)
         self.git.fetch_branch(wt, remote, target)
         ahead = self.git.commit_count_ahead(wt, f"{remote}/{target}")
         if ahead == 0 and not allow_empty:
@@ -614,9 +962,9 @@ class KanbanEngine:
 
         needs_review = (ctx.board.require_review or (local_claim and local_claim.risk_gate)) and not approve
         if needs_review:
-            self._rebase_and_verify(wt, remote, target, ctx.board.check_command, issue_number)
+            self._rebase_and_verify(wt, remote, target, check_cmd, cli_ref)
             schema, tickets = self.refresh_board(ctx)
-            ticket = next((t for t in tickets if t.number == issue_number), None)
+            ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
             if ticket and ticket.project_item_id:
                 self.github.set_item_column(schema, ticket.project_item_id, Column.REVIEW, ctx.board.columns)
             if ticket and ticket.claim and ticket.claim_comment_id:
@@ -626,26 +974,25 @@ class KanbanEngine:
                 if summary:
                     ticket.claim.note = summary
                 self.github.patch_comment(
-                    ctx.repo_owner,
-                    ctx.repo_name,
+                    entry.owner,
+                    entry.repo,
                     ticket.claim_comment_id,
                     render_claim_comment(ticket.claim),
                 )
-            self.herdr.notify(
-                f"Kanban #{issue_number} ready for Review", f"Approve push to {target} in TUI (`a`)."
-            )
+            self.herdr.notify(f"Kanban {disp} ready for Review", f"Approve push to {target} in TUI (`a`).")
             return LandingResult(
                 issue_number=issue_number,
                 status="review_pending",
                 target_branch=target,
                 commit_sha=self.git.head_sha(wt),
+                repo_alias=entry.alias if ctx.is_multi_repo else "",
             )
 
         # Rebase -> Check -> Fast-Forward Push (up to 3 attempts on concurrent push race).
         pushed = False
         last_push_err = ""
         for _attempt in range(3):
-            self._rebase_and_verify(wt, remote, target, ctx.board.check_command, issue_number)
+            self._rebase_and_verify(wt, remote, target, check_cmd, cli_ref)
             if ahead == 0 and allow_empty:
                 pushed = True
                 break
@@ -663,22 +1010,22 @@ class KanbanEngine:
 
         sha = self.git.head_sha(wt)
         schema, tickets = self.refresh_board(ctx)
-        ticket = next((t for t in tickets if t.number == issue_number), None)
+        ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
         cid = local_claim.comment_id if local_claim else (ticket.claim_comment_id if ticket else None)
         if cid and ticket and ticket.claim:
             ticket.claim.state = "completed"
             ticket.claim.heartbeat_at = utc_now_iso()
             ticket.claim.note = summary or f"Landed `{sha[:8]}` onto `{target}`"
             self.github.patch_comment(
-                ctx.repo_owner,
-                ctx.repo_name,
+                entry.owner,
+                entry.repo,
                 cid,
                 render_claim_comment(ticket.claim),
             )
         elif summary:
             self.github.post_comment(
-                ctx.repo_owner,
-                ctx.repo_name,
+                entry.owner,
+                entry.repo,
                 issue_number,
                 f"**[herdr-kanban]** Landed `{sha[:8]}` onto `{target}`.\n\n{summary}",
             )
@@ -688,12 +1035,12 @@ class KanbanEngine:
 
         closed = False
         if ctx.board.close_issue_on_done:
-            self.github.close_issue(ctx.repo_owner, ctx.repo_name, issue_number)
+            self.github.close_issue(entry.owner, entry.repo, issue_number)
             closed = True
 
         removed_wt = False
         if local_claim:
-            state.remove_local_claim(ctx.slug, issue_number)
+            state.remove_local_claim(entry.slug, issue_number)
             cwd_now = Path.cwd().resolve()
             wt_resolved = wt.resolve()
             if cwd_now != wt_resolved and wt_resolved not in cwd_now.parents:
@@ -709,6 +1056,7 @@ class KanbanEngine:
             status="landed",
             target_branch=target,
             commit_sha=sha,
+            repo_alias=entry.alias if ctx.is_multi_repo else "",
             closed_issue=closed,
             worktree_removed=removed_wt,
         )
@@ -731,23 +1079,30 @@ class KanbanEngine:
             wt = Path(local_claim.worktree_path)
             if not main_root.is_dir():
                 continue
+            ctx_dir = (
+                Path(local_claim.umbrella_root)
+                if local_claim.umbrella_root and Path(local_claim.umbrella_root).is_dir()
+                else main_root
+            )
             try:
-                ctx = self.resolve_context(main_root)
+                ctx = self.resolve_context(ctx_dir)
             except KanbanError:
                 continue
 
-            hb_key = f"{local_claim.repo_slug}:{local_claim.issue_number}"
+            owner = local_claim.repo_owner or ctx.repo_owner
+            repo = local_claim.repo_name or ctx.repo_name
+            slug = local_claim.repo_slug
+            remote = local_claim.remote or ctx.board.remote
+            target_branch = local_claim.target_branch or ctx.board.target_branch
+
+            hb_key = f"{slug}:{local_claim.issue_number}"
             due = force_heartbeat or (
                 last_heartbeat_by_key is None
                 or (now - last_heartbeat_by_key.get(hb_key, 0.0)) >= ctx.settings.heartbeat_seconds
             )
 
             try:
-                comments = self.github.list_issue_comments(
-                    ctx.repo_owner,
-                    ctx.repo_name,
-                    local_claim.issue_number,
-                )
+                comments = self.github.list_issue_comments(owner, repo, local_claim.issue_number)
             except GitHubError:
                 continue
 
@@ -759,14 +1114,14 @@ class KanbanEngine:
                         if wt.is_dir():
                             meta.touched_files = self.git.touched_files(
                                 wt,
-                                f"{ctx.board.remote}/{ctx.board.target_branch}",
+                                f"{remote}/{target_branch}",
                             )
                         meta.heartbeat_at = utc_now_iso()
                         meta.lease_until = lease_until_iso(ctx.board.lease_ttl_minutes)
                         try:
                             self.github.patch_comment(
-                                ctx.repo_owner,
-                                ctx.repo_name,
+                                owner,
+                                repo,
                                 local_claim.comment_id,
                                 render_claim_comment(meta),
                             )
@@ -776,10 +1131,10 @@ class KanbanEngine:
                             pass
 
             # Relay new comments since watermark
-            watermark = state.get_watermark(ctx.slug, local_claim.issue_number)
+            watermark = state.get_watermark(slug, local_claim.issue_number)
             trusted_set = self.github.trusted_collaborators(
-                ctx.repo_owner,
-                ctx.repo_name,
+                owner,
+                repo,
                 ctx.board.trusted_authors,
             )
             max_seen = watermark
@@ -796,34 +1151,50 @@ class KanbanEngine:
                 author = str(entry.get("author") or "").strip()
                 is_trusted = bool(author and author.lower() in trusted_set)
                 from_agent = ""
+                from_repo = ""
                 from_issue: int | None = None
                 if meta_dict and meta_dict.get("type") == "relay":
                     relay = RelayMeta.from_dict(meta_dict)
                     from_agent = relay.from_agent
+                    from_repo = relay.from_repo
                     from_issue = relay.from_issue
-                    if relay.from_owner == local_claim.owner and from_issue == local_claim.issue_number:
+                    same_repo = (not from_repo) or (from_repo == local_claim.repo_alias)
+                    if (
+                        relay.from_owner == local_claim.owner
+                        and from_issue == local_claim.issue_number
+                        and same_repo
+                    ):
                         continue
 
                 clean_text = strip_meta(body)
-                # Strip rendered relay header line if present so inbox stays crisp
                 if clean_text.startswith("**[herdr-kanban message"):
                     parts = clean_text.split("\n\n", 1)
                     clean_text = parts[1].strip() if len(parts) > 1 else clean_text
 
                 delivered = False
+                to_ref_str = (
+                    f"{local_claim.repo_alias}#{local_claim.issue_number}"
+                    if local_claim.repo_alias
+                    else str(local_claim.issue_number)
+                )
+                from_ref_str = (
+                    (f"{from_repo}#{from_issue}" if from_repo else str(from_issue))
+                    if from_issue is not None
+                    else None
+                )
                 if is_trusted:
                     target = local_claim.agent_name or local_claim.pane_id
                     wakeup = self._format_wakeup_prompt(
-                        local_claim.issue_number,
+                        to_ref_str,
                         author,
                         from_agent,
-                        from_issue,
+                        from_ref_str,
                         clean_text,
                     )
                     delivered = self.herdr.prompt_if_idle(target, wakeup)
                     if not delivered:
                         self.herdr.notify(
-                            f"Kanban #{local_claim.issue_number}: message from @{author}",
+                            f"Kanban {to_ref_str}: message from @{author}",
                             clean_text[:100],
                         )
 
@@ -834,15 +1205,16 @@ class KanbanEngine:
                     body=clean_text,
                     created_at=str(entry.get("created_at") or utc_now_iso()),
                     from_agent=from_agent,
+                    from_repo=from_repo,
                     from_issue=from_issue,
                     trusted=is_trusted,
                     delivered=delivered,
                 )
-                if state.append_inbox_item(ctx.slug, inbox_item):
+                if state.append_inbox_item(slug, inbox_item):
                     delivered_or_queued.append(inbox_item)
 
             if max_seen > watermark:
-                state.set_watermark(ctx.slug, local_claim.issue_number, max_seen)
+                state.set_watermark(slug, local_claim.issue_number, max_seen)
 
         return delivered_or_queued
 
@@ -856,18 +1228,33 @@ class KanbanEngine:
         base_ref = f"{local_claim.remote}/{local_claim.target_branch}"
         clean = not wt.exists() or self.git.is_clean(wt)
         ahead = self.git.commit_count_ahead(wt, base_ref) if wt.is_dir() else 0
+        disp = (
+            f"{local_claim.repo_alias}#{local_claim.issue_number}"
+            if local_claim.repo_alias
+            else f"#{local_claim.issue_number}"
+        )
 
         if clean and ahead == 0:
             try:
-                ctx = self.resolve_context(main_root)
+                ctx_dir = (
+                    Path(local_claim.umbrella_root)
+                    if local_claim.umbrella_root and Path(local_claim.umbrella_root).is_dir()
+                    else main_root
+                )
+                ctx = self.resolve_context(ctx_dir)
+                ref: TicketRefInput = (
+                    f"{local_claim.repo_alias}#{local_claim.issue_number}"
+                    if local_claim.repo_alias
+                    else local_claim.issue_number
+                )
                 self.release_ticket(
                     ctx,
-                    local_claim.issue_number,
+                    ref,
                     reason="Agent pane closed with zero commits",
                     force_remove_worktree=True,
                 )
                 self.herdr.notify(
-                    f"Kanban #{local_claim.issue_number} released",
+                    f"Kanban {disp} released",
                     "Agent pane closed with no commits; returned to Ready.",
                 )
                 return "released"
@@ -875,7 +1262,7 @@ class KanbanEngine:
                 return None
 
         self.herdr.notify(
-            f"Kanban #{local_claim.issue_number}: work preserved",
+            f"Kanban {disp}: work preserved",
             f"Pane closed with changes in {wt}",
         )
         return "preserved"
@@ -886,7 +1273,7 @@ class KanbanEngine:
         remote: str,
         target: str,
         check_command: str,
-        issue_number: int,
+        cli_ref: str,
     ) -> None:
         rebase = self.git.rebase_onto_target(wt, remote, target)
         if not rebase.ok:
@@ -894,7 +1281,7 @@ class KanbanEngine:
             raise LandingGateError(
                 f"Rebase onto `{remote}/{target}` hit conflicts in: {files}.\n"
                 f"Resolve conflicts in {wt}, run `git rebase --continue`, and re-run "
-                f"`herdr-kanban done {issue_number}`.\n{rebase.output}"
+                f"`herdr-kanban done {cli_ref}`.\n{rebase.output}"
             )
         if check_command:
             proc = subprocess.run(
@@ -910,7 +1297,7 @@ class KanbanEngine:
                 tail = "\n".join(combined.splitlines()[-35:])
                 raise LandingGateError(
                     f"Check command `{check_command}` failed (exit {proc.returncode}). "
-                    f"Fix the failure in {wt} and re-run `herdr-kanban done {issue_number}`:\n{tail}"
+                    f"Fix the failure in {wt} and re-run `herdr-kanban done {cli_ref}`:\n{tail}"
                 )
 
     def _build_agent_prompt(
@@ -920,15 +1307,35 @@ class KanbanEngine:
         claim: state.LocalClaim,
         overlaps: list[FileOverlap],
     ) -> str:
+        cli_ref = (
+            f"{claim.repo_alias}#{ticket.number}"
+            if (ctx.is_multi_repo and claim.repo_alias)
+            else str(ticket.number)
+        )
+        disp = f"#{ticket.number}" if not claim.repo_alias else f"{claim.repo_alias}#{ticket.number}"
         lines = [
-            f"You are assigned GitHub Issue #{ticket.number}: {ticket.title}",
-            f"Repository: {ctx.repo_owner}/{ctx.repo_name} | Shared branch: `{ctx.board.target_branch}`",
+            f"You are assigned GitHub Issue {disp}: {ticket.title}",
+            f"Repository: {claim.repo_owner}/{claim.repo_name} | Shared branch: `{claim.target_branch}`",
             f"Your current directory (`{claim.worktree_path}`) is an isolated Git worktree "
-            f"off `{ctx.board.remote}/{ctx.board.target_branch}`.",
-            "",
-            "## Issue Description",
-            strip_meta(ticket.body) or "(No description provided.)",
+            f"off `{claim.remote}/{claim.target_branch}`.",
         ]
+        if ctx.is_multi_repo:
+            sibs = [
+                f"`.siblings/{alias}` ({entry.owner}/{entry.repo})"
+                for alias, entry in ctx.repos.items()
+                if alias != claim.repo_alias
+            ]
+            if sibs:
+                lines.append(
+                    "Read-only sibling repositories in this umbrella workspace: " + ", ".join(sibs) + "."
+                )
+        lines.extend(
+            [
+                "",
+                "## Issue Description",
+                strip_meta(ticket.body) or "(No description provided.)",
+            ]
+        )
         if overlaps:
             lines.extend(["", "## Active Teammate Overlap Warnings"])
             for ov in overlaps:
@@ -936,38 +1343,42 @@ class KanbanEngine:
                 lines.append(
                     f"- #{ov.other_issue} (@{ov.other_owner}, {ov.other_agent}) touches: {files_csv}"
                 )
-        num = ticket.number
+        dep_repo_flag = f" --repo {claim.repo_alias}" if (ctx.is_multi_repo and claim.repo_alias) else ""
+        ask_example = "<repo#issue>" if ctx.is_multi_repo else "<issue>"
         lines.extend(
             [
                 "",
                 "## Workflow Commands (`herdr-kanban`)",
-                f'- Report progress in-place: `herdr-kanban progress {num} --note "..."`',
+                f'- Report progress in-place: `herdr-kanban progress {cli_ref} --note "..."`',
                 "- Deposit newly discovered bugs into Triage: "
-                f'`herdr-kanban deposit "Title" --parent {num} --file-line path:line`',
-                f'- Ask another active ticket\'s agent: `herdr-kanban ask <issue> "..." --from {num}`',
+                f'`herdr-kanban deposit "Title"{dep_repo_flag} --parent {cli_ref} --file-line path:line`',
+                "- Ask another active ticket's agent: "
+                f'`herdr-kanban ask {ask_example} "..." --from {cli_ref}`',
                 "- Check incoming agent replies: `herdr-kanban inbox --ack`",
-                f"- When finished & committed cleanly, land onto `{ctx.board.target_branch}`: "
-                f'`herdr-kanban done {num} --summary "..."`',
+                f"- When finished & committed cleanly, land onto `{claim.target_branch}`: "
+                f'`herdr-kanban done {cli_ref} --summary "..."`',
             ]
         )
         return "\n".join(lines)
 
     @staticmethod
     def _format_wakeup_prompt(
-        issue_number: int,
+        to_ref: str,
         author: str,
         from_agent: str,
-        from_issue: int | None,
+        from_ref: str | None,
         message: str,
     ) -> str:
+        to_disp = to_ref if "#" in to_ref else f"#{to_ref}"
+        from_disp = (from_ref if "#" in from_ref else f"#{from_ref}") if from_ref else ""
         sender = f"@{author}" + (f" ({from_agent})" if from_agent else "")
-        via = f" working on #{from_issue}" if from_issue else ""
+        via = f" working on {from_disp}" if from_disp else ""
         reply_hint = (
-            f'Reply with `herdr-kanban ask {from_issue} "..." --from {issue_number}`.'
-            if from_issue
-            else f'Reply with `herdr-kanban comment {issue_number} "..."`.'
+            f'Reply with `herdr-kanban ask {from_ref} "..." --from {to_ref}`.'
+            if from_ref
+            else f'Reply with `herdr-kanban comment {to_ref} "..."`.'
         )
-        return f"[herdr-kanban message on #{issue_number} from {sender}{via}]\n{message}\n\n{reply_hint}"
+        return f"[herdr-kanban message on {to_disp} from {sender}{via}]\n{message}\n\n{reply_hint}"
 
     @staticmethod
     def _serialize_cached_ticket(ticket: Ticket) -> dict[str, Any]:
@@ -995,6 +1406,9 @@ class KanbanEngine:
             column=col,
             status_name=str(raw.get("status_name") or ""),
             project_item_id=str(raw.get("project_item_id") or ""),
+            repo_owner=str(raw.get("repo_owner") or ""),
+            repo_name=str(raw.get("repo_name") or ""),
+            repo_alias=str(raw.get("repo_alias") or ""),
             claim=claim,
             claim_comment_id=int(raw["claim_comment_id"])
             if raw.get("claim_comment_id") is not None

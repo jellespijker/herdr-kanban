@@ -1,4 +1,4 @@
-"""Board & user configuration loading and TOML rendering (docs/spec.md §5, ADR-0005)."""
+"""Board & user configuration loading and TOML rendering (docs/spec.md §5, ADR-0005, ADR-0007)."""
 
 from __future__ import annotations
 
@@ -39,12 +39,41 @@ def user_settings_path() -> Path:
 
 
 @dataclass(slots=True)
+class RepoEntry:
+    alias: str
+    owner: str
+    repo: str
+    path: str
+    target_branch: str = ""
+    remote: str = ""
+    check_command: str = ""
+
+    @property
+    def slug(self) -> str:
+        return repo_slug(self.owner, self.repo)
+
+    def resolved_path(self, base_dir: Path) -> Path:
+        p = Path(self.path).expanduser()
+        return p.resolve() if p.is_absolute() else (base_dir / p).resolve()
+
+    def effective_branch(self, board: BoardConfig) -> str:
+        return self.target_branch or board.target_branch
+
+    def effective_remote(self, board: BoardConfig) -> str:
+        return self.remote or board.remote
+
+    def effective_check(self, board: BoardConfig) -> str:
+        return self.check_command if self.check_command else board.check_command
+
+
+@dataclass(slots=True)
 class BoardConfig:
     project_owner: str
     project_number: int
     target_branch: str
     repo_owner: str = ""
     repo_name: str = ""
+    default_repo: str = ""
     remote: str = "origin"
     check_command: str = ""
     lease_ttl_minutes: int = 30
@@ -56,7 +85,12 @@ class BoardConfig:
     columns: dict[str, str] = field(
         default_factory=lambda: {col.value: title for col, title in COLUMN_TITLES.items()}
     )
+    repos: dict[str, RepoEntry] = field(default_factory=dict)
     source_path: Path | None = None
+
+    @property
+    def is_multi_repo(self) -> bool:
+        return len(self.repos) > 0
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], source_path: Path | None = None) -> BoardConfig:
@@ -81,12 +115,33 @@ class BoardConfig:
                 if key in cols and isinstance(val, str) and val.strip():
                     cols[key] = val.strip()
 
+        repos_map: dict[str, RepoEntry] = {}
+        raw_repos = data.get("repos")
+        if isinstance(raw_repos, dict):
+            for alias, entry in raw_repos.items():
+                if not isinstance(entry, dict):
+                    continue
+                owner = str(entry.get("owner") or project_owner).strip()
+                rname = str(entry.get("repo") or alias).strip()
+                rpath = str(entry.get("path") or alias).strip()
+                if owner and rname and rpath:
+                    repos_map[str(alias)] = RepoEntry(
+                        alias=str(alias),
+                        owner=owner,
+                        repo=rname,
+                        path=rpath,
+                        target_branch=str(entry.get("target_branch") or "").strip(),
+                        remote=str(entry.get("remote") or "").strip(),
+                        check_command=str(entry.get("check_command") or "").strip(),
+                    )
+
         return cls(
             project_owner=project_owner,
             project_number=project_number,
             target_branch=target_branch,
             repo_owner=str(board.get("repo_owner") or "").strip(),
             repo_name=str(board.get("repo_name") or "").strip(),
+            default_repo=str(board.get("default_repo") or "").strip(),
             remote=str(board.get("remote") or "origin").strip() or "origin",
             check_command=str(board.get("check_command") or "").strip(),
             lease_ttl_minutes=max(5, int(board.get("lease_ttl_minutes") or 30)),
@@ -96,6 +151,7 @@ class BoardConfig:
             label_filter=str(board.get("label_filter") or "").strip(),
             trusted_authors=[str(u).strip() for u in (board.get("trusted_authors") or []) if str(u).strip()],
             columns=cols,
+            repos=repos_map,
             source_path=source_path,
         )
 
@@ -131,20 +187,51 @@ def _read_toml(path: Path) -> dict[str, Any]:
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
+def find_umbrella_dir(start: Path, main_repo_root: Path | None = None) -> Path | None:
+    """Walk upward to find an umbrella directory whose `.herdr-kanban.toml` has `[repos]`,
+    or `start` itself if it is a non-git folder containing `.herdr-kanban.toml`.
+    """
+    roots_to_walk: list[Path] = []
+    if main_repo_root is not None:
+        roots_to_walk.extend([main_repo_root.parent, main_repo_root])
+    roots_to_walk.extend([start, *list(start.parents)[:4]])
+
+    seen: set[Path] = set()
+    for directory in roots_to_walk:
+        resolved = directory.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        cfg_file = resolved / BOARD_FILENAME
+        if not cfg_file.is_file():
+            continue
+        try:
+            raw = _read_toml(cfg_file)
+        except tomllib.TOMLDecodeError:
+            continue
+        if isinstance(raw.get("repos"), dict) and raw["repos"]:
+            return resolved
+        if resolved == start.resolve() and main_repo_root is None:
+            return resolved
+    return None
+
+
 def load_board_config(
     worktree_root: Path | None,
     common_repo_root: Path | None = None,
     owner_repo: tuple[str, str] | None = None,
+    umbrella_root: Path | None = None,
 ) -> BoardConfig | None:
-    """Discover and merge board configuration from worktree, main repo, and local overrides."""
+    """Discover and merge board configuration from umbrella root, main repo, worktree, and local overrides."""
     candidates: list[Path] = []
-    for root in (common_repo_root, worktree_root):
+    roots = [umbrella_root] if umbrella_root is not None else [common_repo_root, worktree_root]
+    for root in roots:
         if root is not None:
             for name in (BOARD_FILENAME, LOCAL_BOARD_FILENAME):
                 path = root / name
                 if path not in candidates:
                     candidates.append(path)
-    if owner_repo:
+    if owner_repo and umbrella_root is None:
         candidates.append(local_repo_config_path(*owner_repo))
 
     merged: dict[str, Any] = {}
@@ -159,7 +246,7 @@ def load_board_config(
     if not merged:
         return None
     cfg = BoardConfig.from_mapping(merged, source_path=primary_source)
-    if owner_repo and not cfg.repo_owner:
+    if owner_repo and not cfg.is_multi_repo and not cfg.repo_owner:
         cfg.repo_owner, cfg.repo_name = owner_repo
     return cfg
 
@@ -200,10 +287,9 @@ def _toml_quote(value: str) -> str:
 
 
 def render_board_config_toml(cfg: BoardConfig) -> str:
-    """Serialize a BoardConfig as clean, commented TOML suitable for committing."""
+    """Serialize a BoardConfig as clean, commented TOML."""
     lines = [
         "# .herdr-kanban.toml — shared multi-agent Kanban configuration.",
-        "# Colleagues checking out this branch automatically connect to the same GitHub Project.",
         "",
         "[board]",
         f"project_owner = {_toml_quote(cfg.project_owner)}",
@@ -211,9 +297,11 @@ def render_board_config_toml(cfg: BoardConfig) -> str:
         f"target_branch = {_toml_quote(cfg.target_branch)}",
         f"remote = {_toml_quote(cfg.remote)}",
     ]
-    if cfg.repo_owner and cfg.repo_name:
+    if not cfg.is_multi_repo and cfg.repo_owner and cfg.repo_name:
         lines.append(f"repo_owner = {_toml_quote(cfg.repo_owner)}")
         lines.append(f"repo_name = {_toml_quote(cfg.repo_name)}")
+    if cfg.default_repo:
+        lines.append(f"default_repo = {_toml_quote(cfg.default_repo)}")
     if cfg.check_command:
         lines.append(f"check_command = {_toml_quote(cfg.check_command)}")
     lines.extend(
@@ -229,8 +317,27 @@ def render_board_config_toml(cfg: BoardConfig) -> str:
     if cfg.trusted_authors:
         authors = ", ".join(_toml_quote(a) for a in cfg.trusted_authors)
         lines.append(f"trusted_authors = [{authors}]")
+
     lines.extend(["", "[columns]"])
     for col in Column:
         name = cfg.columns.get(col.value, COLUMN_TITLES[col])
         lines.append(f"{col.value} = {_toml_quote(name)}")
+
+    for alias, entry in cfg.repos.items():
+        lines.extend(
+            [
+                "",
+                f"[repos.{alias}]",
+                f"owner = {_toml_quote(entry.owner)}",
+                f"repo = {_toml_quote(entry.repo)}",
+                f"path = {_toml_quote(entry.path)}",
+            ]
+        )
+        if entry.target_branch:
+            lines.append(f"target_branch = {_toml_quote(entry.target_branch)}")
+        if entry.remote:
+            lines.append(f"remote = {_toml_quote(entry.remote)}")
+        if entry.check_command:
+            lines.append(f"check_command = {_toml_quote(entry.check_command)}")
+
     return "\n".join(lines) + "\n"

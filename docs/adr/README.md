@@ -12,3 +12,4 @@ old one and set the old one's status to `Superseded by ADR-NNNN`.
 | [0004](0004-triage-first-for-agent-deposited-issues.md) | Triage-first workflow for agent-deposited issues | Accepted |
 | [0005](0005-committed-board-config-with-local-override.md) | Committed `.herdr-kanban.toml` on the shared branch with local overrides | Accepted |
 | [0006](0006-python-stdlib-and-external-clis.md) | Python 3.11+ standard library at runtime; `gh`, `git`, and `herdr` as external CLIs | Accepted |
+| [0007](0007-umbrella-polyrepo-workspaces.md) | Umbrella multi-repository workspaces and `.siblings/` worktree links | Accepted |

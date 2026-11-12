@@ -133,6 +133,7 @@ class GitClient:
         force: bool = False,
     ) -> None:
         if worktree_path.exists():
+            self.unlink_sibling_repos(worktree_path)
             args = ["worktree", "remove"]
             if force:
                 args.append("--force")
@@ -141,6 +142,99 @@ class GitClient:
         self._git("worktree", "prune", cwd=main_repo, check=False)
         if local_branch:
             self._git("branch", "-D", local_branch, cwd=main_repo, check=False)
+
+    def link_sibling_repos(self, worktree_path: Path, siblings: dict[str, Path]) -> list[str]:
+        """Symlink sibling repos into `<worktree>/.siblings/<alias>` and exclude via git info/exclude."""
+        valid = {alias: target.resolve() for alias, target in siblings.items() if target.is_dir()}
+        if not valid:
+            return []
+
+        excl_proc = self._git("rev-parse", "--git-path", "info/exclude", cwd=worktree_path, check=False)
+        excl_raw = excl_proc.stdout.strip()
+        if excl_raw:
+            excl_path = Path(excl_raw) if Path(excl_raw).is_absolute() else (worktree_path / excl_raw)
+            excl_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = excl_path.read_text(encoding="utf-8") if excl_path.is_file() else ""
+            existing_lines = {line.strip() for line in existing.splitlines()}
+            if "/.siblings/" not in existing_lines and ".siblings/" not in existing_lines:
+                prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+                excl_path.write_text(f"{existing}{prefix}/.siblings/\n", encoding="utf-8")
+
+        sib_dir = worktree_path / ".siblings"
+        sib_dir.mkdir(parents=True, exist_ok=True)
+        linked: list[str] = []
+        for alias, target in sorted(valid.items()):
+            dest = sib_dir / alias
+            if dest.is_symlink():
+                if dest.resolve() == target:
+                    linked.append(alias)
+                    continue
+                dest.unlink()
+            elif dest.exists():
+                continue
+            dest.symlink_to(target, target_is_directory=True)
+            linked.append(alias)
+        return linked
+
+    def unlink_sibling_repos(self, worktree_path: Path) -> None:
+        """Remove `.siblings` symlinks inside a worktree without touching target directories."""
+        sib_dir = worktree_path / ".siblings"
+        if sib_dir.is_symlink():
+            sib_dir.unlink()
+            return
+        if not sib_dir.is_dir():
+            return
+        for child in sib_dir.iterdir():
+            if child.is_symlink():
+                child.unlink()
+        try:
+            sib_dir.rmdir()
+        except OSError:
+            pass
+
+    def checkout_target_branch(
+        self,
+        repo_dir: Path,
+        remote: str,
+        branch: str,
+        *,
+        create_if_missing: bool = False,
+    ) -> str:
+        """Fetch `remote` and align `repo_dir` onto `branch` for multi-repo `sync-repos`."""
+        self._git("fetch", "--quiet", remote, cwd=repo_dir, check=False)
+        remote_ref = f"refs/remotes/{remote}/{branch}"
+        has_remote = (
+            self._git("rev-parse", "--verify", "--quiet", remote_ref, cwd=repo_dir, check=False).returncode
+            == 0
+        )
+        if has_remote:
+            cur = self.current_branch(repo_dir)
+            if cur != branch:
+                has_local = (
+                    self._git(
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{branch}",
+                        cwd=repo_dir,
+                        check=False,
+                    ).returncode
+                    == 0
+                )
+                if has_local:
+                    self._git("checkout", branch, cwd=repo_dir)
+                else:
+                    self._git("checkout", "--track", "-b", branch, f"{remote}/{branch}", cwd=repo_dir)
+            if self.is_clean(repo_dir):
+                ff = self._git("merge", "--ff-only", f"{remote}/{branch}", cwd=repo_dir, check=False)
+                return "synced" if ff.returncode == 0 else "diverged"
+            return "dirty (kept local changes)"
+
+        if create_if_missing:
+            self._git("checkout", "-B", branch, cwd=repo_dir)
+            self._git("push", "-u", remote, f"HEAD:refs/heads/{branch}", cwd=repo_dir)
+            return "created & pushed branch"
+        return f"remote branch {remote}/{branch} not found (pass --create-branches to create)"
 
     def is_clean(self, worktree_path: Path) -> bool:
         proc = self._git("status", "--porcelain", cwd=worktree_path, check=False)

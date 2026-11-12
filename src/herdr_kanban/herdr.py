@@ -121,13 +121,15 @@ class HerdrClient:
         title: str,
         agent_kind: str,
         prompt_text: str,
+        repo_alias: str = "",
         workspace_id: str | None = None,
         focus: bool = True,
     ) -> dict[str, str]:
         """Create a new Herdr tab in `worktree_path`, start `agent_kind`, and send initial prompt."""
         ws = workspace_id or os.environ.get("HERDR_WORKSPACE_ID")
         short_title = title[:28].strip()
-        label = f"#{issue_number} {short_title}"
+        ref_txt = f"{repo_alias}#{issue_number}" if repo_alias else f"#{issue_number}"
+        label = f"{ref_txt} {short_title}"
         tab_args = ["tab", "create", "--cwd", str(worktree_path), "--label", label]
         if ws:
             tab_args.extend(["--workspace", ws])
@@ -144,7 +146,8 @@ class HerdrClient:
         if not pane_id:
             raise RuntimeError("herdr tab create did not return a root_pane ID")
 
-        agent_name = sanitize_agent_name(f"issue-{issue_number}")
+        base_agent = f"{repo_alias}-{issue_number}" if repo_alias else f"issue-{issue_number}"
+        agent_name = sanitize_agent_name(base_agent)
         started = self.call(
             "agent",
             "start",
@@ -159,7 +162,7 @@ class HerdrClient:
         )
         if started is None:
             # Fallback to unique name if `issue-<N>` was already live in another workspace
-            agent_name = sanitize_agent_name(f"issue-{issue_number}-{pane_id.replace(':', '-')}")
+            agent_name = sanitize_agent_name(f"{base_agent}-{pane_id.replace(':', '-')}")
             started = self.call(
                 "agent",
                 "start",

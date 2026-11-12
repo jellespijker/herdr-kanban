@@ -40,10 +40,11 @@ MOVE_TARGETS: tuple[tuple[str, Column], ...] = (
 
 @dataclass(slots=True)
 class PromptState:
-    mode: str  # new_ticket | comment | pick_agent | pick_column | confirm_takeover
+    mode: str  # pick_repo | new_ticket | comment | pick_agent | pick_column | confirm_takeover
     label: str
     buffer: str = ""
-    issue_number: int = 0
+    ticket_ref: str = ""
+    repo_alias: str = ""
 
 
 class BoardTUI:
@@ -64,8 +65,8 @@ class BoardTUI:
 
         self.ctx: RepoContext | None = None
         self.tickets: list[Ticket] = []
-        self.local_claims: dict[int, state.LocalClaim] = {}
-        self.inbox_counts: dict[int, int] = {}
+        self.local_claims: dict[tuple[str, int], state.LocalClaim] = {}
+        self.inbox_counts: dict[tuple[str, int], int] = {}
 
         self.col_idx = 1  # Default focus on Ready
         self.row_by_col: list[int] = [0 for _ in UI_GROUPS]
@@ -90,6 +91,19 @@ class BoardTUI:
             except OSError:
                 pass
 
+    def _tref(self, ticket: Ticket) -> str:
+        return ticket.ref(bool(self.ctx and self.ctx.is_multi_repo))
+
+    def _cli_ref(self, ticket: Ticket) -> str:
+        if self.ctx and self.ctx.is_multi_repo and ticket.repo_alias:
+            return f"{ticket.repo_alias}#{ticket.number}"
+        return str(ticket.number)
+
+    def _state_key(self, ticket: Ticket) -> tuple[str, int]:
+        owner = ticket.repo_owner or (self.ctx.repo_owner if self.ctx else "")
+        repo = ticket.repo_name or (self.ctx.repo_name if self.ctx else "")
+        return config.repo_slug(owner, repo), ticket.number
+
     def load_initial_state(self) -> None:
         try:
             self.ctx = self.engine.resolve_context(self.explicit_cwd)
@@ -108,11 +122,15 @@ class BoardTUI:
     def _reload_local_overlays(self) -> None:
         if not self.ctx:
             return
-        claims = state.list_local_claims(self.ctx.slug)
-        self.local_claims = {c.issue_number: c for c in claims}
-        counts: dict[int, int] = {}
-        for item in state.list_inbox(self.ctx.slug, include_acked=False):
-            counts[item.issue_number] = counts.get(item.issue_number, 0) + 1
+        claims_map: dict[tuple[str, int], state.LocalClaim] = {}
+        counts: dict[tuple[str, int], int] = {}
+        for slug in self.ctx.repo_slugs():
+            for claim in state.list_local_claims(slug):
+                claims_map[(claim.repo_slug, claim.issue_number)] = claim
+            for item in state.list_inbox(slug, include_acked=False):
+                key = (slug, item.issue_number)
+                counts[key] = counts.get(key, 0) + 1
+        self.local_claims = claims_map
         self.inbox_counts = counts
 
     def group_tickets(self, idx: int) -> list[Ticket]:
@@ -173,7 +191,8 @@ class BoardTUI:
         def worker() -> None:
             msg = ""
             err = ""
-            need_takeover = 0
+            need_takeover_ref = ""
+            need_takeover_disp = ""
             try:
                 msg = fn() or ""
                 if self.ctx:
@@ -185,7 +204,8 @@ class BoardTUI:
                 err = str(exc)
                 cur = self.selected_ticket()
                 if cur:
-                    need_takeover = cur.number
+                    need_takeover_ref = self._cli_ref(cur)
+                    need_takeover_disp = self._tref(cur)
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
             with self._lock:
@@ -194,11 +214,11 @@ class BoardTUI:
                     self.status_msg = msg
                 if err:
                     self.error_msg = err
-                if need_takeover:
+                if need_takeover_ref:
                     self.prompt = PromptState(
                         mode="confirm_takeover",
-                        label=f"Claim on #{need_takeover} is STALE. Reclaim with takeover? [y/N]: ",
-                        issue_number=need_takeover,
+                        label=f"Claim on {need_takeover_disp} is STALE. Reclaim with takeover? [y/N]: ",
+                        ticket_ref=need_takeover_ref,
                     )
                 self._reload_local_overlays()
             self._wake()
@@ -235,7 +255,7 @@ class BoardTUI:
             left = terminal.bold(" herdr-kanban ") + terminal.yellow(" (not initialized)")
             return terminal.pad_ansi(left, cols)
 
-        repo_lbl = f"{self.ctx.repo_owner}/{self.ctx.repo_name}"
+        repo_lbl = self.ctx.display_name
         branch_lbl = f"{self.ctx.board.remote}/{self.ctx.board.target_branch}"
         proj_lbl = f"Project #{self.ctx.board.project_number}"
         local_n = len(self.local_claims)
@@ -347,7 +367,7 @@ class BoardTUI:
         *,
         selected: bool,
     ) -> list[str]:
-        prefix = f"#{ticket.number} "
+        prefix = f"{self._tref(ticket)} "
         title_space = max(4, width - len(prefix))
         line1_plain = prefix + terminal.truncate(ticket.title, title_space)
         if selected:
@@ -358,9 +378,10 @@ class BoardTUI:
         if slot_h == 1:
             return [terminal.pad_ansi(line1, width)]
 
+        skey = self._state_key(ticket)
         badges: list[str] = []
-        if ticket.number in self.local_claims:
-            lc = self.local_claims[ticket.number]
+        if skey in self.local_claims:
+            lc = self.local_claims[skey]
             badges.append(terminal.green(f"●local:{lc.agent_kind}"))
         elif ticket.claim and ticket.claim.state in ("active", "review_ready"):
             badges.append(terminal.cyan(f"@{ticket.claim.owner}·{ticket.claim.agent_kind}"))
@@ -375,17 +396,21 @@ class BoardTUI:
             badges.append(terminal.red("BLOCKED"))
         if ticket.overlaps:
             badges.append(terminal.yellow("OVERLAP!"))
-        unread = self.inbox_counts.get(ticket.number, 0)
+        unread = self.inbox_counts.get(skey, 0)
         if unread:
             badges.append(terminal.magenta(f"✉{unread}"))
         if ticket.deposit and ticket.deposit.parent_issue:
-            badges.append(terminal.dim(f"←#{ticket.deposit.parent_issue}"))
+            parent_ref = (
+                f"{ticket.deposit.parent_repo}#{ticket.deposit.parent_issue}"
+                if ticket.deposit.parent_repo
+                else f"#{ticket.deposit.parent_issue}"
+            )
+            badges.append(terminal.dim(f"←{parent_ref}"))
 
         meta_str = " ".join(badges) if badges else terminal.dim("unclaimed")
         if terminal.visible_len(meta_str) > width - 2:
-            # Fallback to compact plain badges when narrow
             plain_badges = []
-            if ticket.number in self.local_claims:
+            if skey in self.local_claims:
                 plain_badges.append("local")
             elif ticket.claim:
                 plain_badges.append(f"@{ticket.claim.owner}")
@@ -411,18 +436,21 @@ class BoardTUI:
                 out.append("")
             return [terminal.pad_ansi(line, cols) for line in out[:height]]
 
-        short_title = terminal.truncate(ticket.title, inner_w - 25)
+        tref = self._tref(ticket)
+        skey = self._state_key(ticket)
+        short_title = terminal.truncate(ticket.title, inner_w - 28)
         hdr = (
-            f" {terminal.bold(f'#{ticket.number}')} {terminal.bold(short_title)} "
-            f"{terminal.dim(f'[{ticket.column.value}]')}"
+            f" {terminal.bold(tref)} {terminal.bold(short_title)} {terminal.dim(f'[{ticket.column.value}]')}"
         )
         lines = [sep, hdr]
 
         meta_parts: list[str] = []
+        if self.ctx and self.ctx.is_multi_repo and ticket.repo_owner and ticket.repo_name:
+            meta_parts.append(terminal.dim(f"{ticket.repo_owner}/{ticket.repo_name}"))
         if ticket.claim and ticket.claim.state in ("active", "review_ready"):
             holder = f"@{ticket.claim.owner} ({ticket.claim.agent_kind})"
-            if ticket.number in self.local_claims and self.local_claims[ticket.number].pane_id:
-                holder += f" pane:{self.local_claims[ticket.number].pane_id}"
+            if skey in self.local_claims and self.local_claims[skey].pane_id:
+                holder += f" pane:{self.local_claims[skey].pane_id}"
             meta_parts.append(f"Claim: {terminal.cyan(holder)}")
             if ticket.stale:
                 meta_parts.append(terminal.red(f"STALE (expired {ticket.claim.lease_until})"))
@@ -432,7 +460,14 @@ class BoardTUI:
                 meta_parts.append(f"Note: {terminal.truncate(ticket.claim.note, 42)}")
         elif ticket.deposit:
             loc = f" at {ticket.deposit.file_line}" if ticket.deposit.file_line else ""
-            parent = f" from #{ticket.deposit.parent_issue}" if ticket.deposit.parent_issue else ""
+            parent = ""
+            if ticket.deposit.parent_issue:
+                pref = (
+                    f"{ticket.deposit.parent_repo}#{ticket.deposit.parent_issue}"
+                    if ticket.deposit.parent_repo
+                    else f"#{ticket.deposit.parent_issue}"
+                )
+                parent = f" from {pref}"
             meta_parts.append(terminal.dim(f"Deposited by @{ticket.deposit.deposited_by}{parent}{loc}"))
         if ticket.labels:
             meta_parts.append("Labels: " + ", ".join(ticket.labels[:4]))
@@ -445,8 +480,13 @@ class BoardTUI:
 
         if ticket.overlaps:
             ov = ticket.overlaps[0]
+            ov_ref = (
+                f"{ticket.repo_alias}#{ov.other_issue}"
+                if (self.ctx and self.ctx.is_multi_repo and ticket.repo_alias)
+                else f"#{ov.other_issue}"
+            )
             warn = (
-                f" ⚠ File overlap with #{ov.other_issue} (@{ov.other_owner}): "
+                f" ⚠ File overlap with {ov_ref} (@{ov.other_owner}): "
                 f"{', '.join(ov.files[:4])} — press `c` to message"
             )
             lines.append(terminal.yellow(terminal.truncate(warn, cols)))
@@ -486,9 +526,9 @@ class BoardTUI:
     def _render_unconfigured(self, cols: int, height: int) -> list[str]:
         msg_lines = [
             "",
-            terminal.bold("  No `.herdr-kanban.toml` found for this repository."),
+            terminal.bold("  No `.herdr-kanban.toml` found for this workspace."),
             "",
-            "  Connect this branch to a GitHub Project v2:",
+            "  Connect this repo or multi-repo umbrella directory to a GitHub Project v2:",
             f"    • Run {terminal.cyan('herdr-kanban init --interactive')} in your terminal, or",
             f"    • Run Herdr action {terminal.cyan('Kanban: connect branch to GitHub Project')}",
             "",
@@ -578,8 +618,8 @@ class BoardTUI:
                 opts = " ".join(f"{i + 1}:{k}" for i, k in enumerate(config.SUPPORTED_AGENTS[:6]))
                 self.prompt = PromptState(
                     mode="pick_agent",
-                    label=f"Dispatch #{cur.number} with agent ({opts}): ",
-                    issue_number=cur.number,
+                    label=f"Dispatch {self._tref(cur)} with agent ({opts}): ",
+                    ticket_ref=self._cli_ref(cur),
                 )
         elif key == "f":
             self._action_focus_pane()
@@ -591,28 +631,41 @@ class BoardTUI:
                 opts = " ".join(lbl for lbl, _ in MOVE_TARGETS)
                 self.prompt = PromptState(
                     mode="pick_column",
-                    label=f"Move #{cur.number} to ({opts}): ",
-                    issue_number=cur.number,
+                    label=f"Move {self._tref(cur)} to ({opts}): ",
+                    ticket_ref=self._cli_ref(cur),
                 )
         elif key == "a":
             self._action_approve_push()
         elif key == "R":
             self._action_release_or_takeover()
         elif key == "n":
-            self.prompt = PromptState(mode="new_ticket", label="New Ready ticket title: ")
+            if self.ctx.is_multi_repo and len(self.ctx.repos) > 1:
+                aliases = list(self.ctx.repos.keys())[:9]
+                opts = " ".join(f"{i + 1}:{a}" for i, a in enumerate(aliases))
+                self.prompt = PromptState(
+                    mode="pick_repo",
+                    label=f"Select repo for new ticket ({opts}): ",
+                )
+            else:
+                default_alias = next(iter(self.ctx.repos)) if self.ctx.is_multi_repo else ""
+                self.prompt = PromptState(
+                    mode="new_ticket",
+                    label="New Ready ticket title: ",
+                    repo_alias=default_alias,
+                )
         elif key == "c":
             cur = self.selected_ticket()
             if cur:
                 self.prompt = PromptState(
                     mode="comment",
-                    label=f"Message/comment to #{cur.number}: ",
-                    issue_number=cur.number,
+                    label=f"Message/comment to {self._tref(cur)}: ",
+                    ticket_ref=self._cli_ref(cur),
                 )
         elif key == "o":
             cur = self.selected_ticket()
             if cur and cur.url:
                 terminal.open_url(cur.url)
-                self.status_msg = f"Opened #{cur.number} in browser"
+                self.status_msg = f"Opened {self._tref(cur)} in browser"
         return True
 
     def _handle_prompt_event(self, ev: terminal.InputEvent) -> None:
@@ -623,32 +676,46 @@ class BoardTUI:
             self.prompt = None
             return
 
+        if p.mode == "pick_repo":
+            aliases = list(self.ctx.repos.keys())[:9]
+            if ev.key.isdigit() and 1 <= int(ev.key) <= len(aliases):
+                chosen_repo = aliases[int(ev.key) - 1]
+                self.prompt = PromptState(
+                    mode="new_ticket",
+                    label=f"New Ready ticket in {chosen_repo}: ",
+                    repo_alias=chosen_repo,
+                )
+            return
+
         if p.mode == "pick_agent":
             if ev.key in ("1", "2", "3", "4", "5", "6"):
                 chosen = config.SUPPORTED_AGENTS[int(ev.key) - 1]
+                tref = p.ticket_ref
                 self.prompt = None
-                self._action_dispatch(chosen, issue_number=p.issue_number)
+                self._action_dispatch(chosen, ticket_ref=tref)
             return
 
         if p.mode == "pick_column":
             if ev.key in ("1", "2", "3", "4", "5", "6"):
                 _, target_col = MOVE_TARGETS[int(ev.key) - 1]
-                issue_num = p.issue_number
+                tref = p.ticket_ref
+                disp = tref if "#" in tref else f"#{tref}"
+                ctx = self.ctx
                 self.prompt = None
                 self._run_background_action(
-                    f"Moving #{issue_num} → {target_col.value}…",
+                    f"Moving {disp} → {target_col.value}…",
                     lambda: (
-                        self.engine.move_ticket(self.ctx, issue_num, target_col),  # type: ignore[arg-type]
-                        f"Moved #{issue_num} to {target_col.value}",
+                        self.engine.move_ticket(ctx, tref, target_col),
+                        f"Moved {disp} to {target_col.value}",
                     )[1],
                 )
             return
 
         if p.mode == "confirm_takeover":
-            issue_num = p.issue_number
+            tref = p.ticket_ref
             self.prompt = None
             if ev.key.lower() == "y":
-                self._action_dispatch(None, issue_number=issue_num, takeover=True)
+                self._action_dispatch(None, ticket_ref=tref, takeover=True)
             return
 
         if ev.key == "backspace":
@@ -656,23 +723,27 @@ class BoardTUI:
         elif ev.key == "enter":
             text = p.buffer.strip()
             mode = p.mode
-            issue_num = p.issue_number
+            tref = p.ticket_ref
+            repo_alias = p.repo_alias
+            ctx = self.ctx
             self.prompt = None
             if not text:
                 return
             if mode == "new_ticket":
-                self._run_background_action(
-                    "Creating Ready ticket…",
-                    lambda: (
-                        f"Created #{self.engine.deposit_issue(self.ctx, text, ready=True).number}"  # type: ignore[arg-type]
-                    ),
-                )
+                sel = repo_alias or None
+
+                def _create_new() -> str:
+                    created = self.engine.deposit_issue(ctx, text, ready=True, repo_selector=sel)
+                    return f"Created {created.ref(ctx.is_multi_repo)}"
+
+                self._run_background_action("Creating Ready ticket…", _create_new)
             elif mode == "comment":
+                disp = tref if "#" in tref else f"#{tref}"
                 self._run_background_action(
-                    f"Sending message to #{issue_num}…",
+                    f"Sending message to {disp}…",
                     lambda: (
-                        self.engine.ask_ticket(self.ctx, issue_num, text),  # type: ignore[arg-type]
-                        f"Sent message to #{issue_num}",
+                        self.engine.ask_ticket(ctx, tref, text),
+                        f"Sent message to {disp}",
                     )[1],
                 )
         elif len(ev.key) == 1 and ev.key.isprintable():
@@ -708,42 +779,45 @@ class BoardTUI:
         self,
         agent_kind: str | None,
         *,
-        issue_number: int | None = None,
+        ticket_ref: str | None = None,
         takeover: bool = False,
     ) -> None:
         if self.ctx is None:
             return
-        num = issue_number
-        if num is None:
+        ref = ticket_ref
+        if ref is None:
             cur = self.selected_ticket()
             if cur is None:
                 return
-            num = cur.number
-            if num in self.local_claims and self.local_claims[num].pane_id:
+            skey = self._state_key(cur)
+            if skey in self.local_claims and self.local_claims[skey].pane_id:
                 self._action_focus_pane()
                 return
+            ref = self._cli_ref(cur)
+        disp = ref if "#" in ref else f"#{ref}"
         kind = agent_kind or self.ctx.settings.default_agent_kind
         ctx = self.ctx
 
         def job() -> str:
             res = self.engine.dispatch_ticket(
                 ctx,
-                num,
+                ref,
                 agent_kind=kind,
                 takeover=takeover,
                 focus=True,
             )
-            return f"Dispatched #{num} to {kind} ({res.claim.pane_id})"
+            return f"Dispatched {disp} to {kind} ({res.claim.pane_id})"
 
-        self._run_background_action(f"Dispatching #{num} to `{kind}`…", job)
+        self._run_background_action(f"Dispatching {disp} to `{kind}`…", job)
 
     def _action_focus_pane(self) -> None:
         cur = self.selected_ticket()
         if not cur:
             return
-        lc = self.local_claims.get(cur.number)
+        lc = self.local_claims.get(self._state_key(cur))
+        disp = self._tref(cur)
         if not lc or not lc.pane_id:
-            self.error_msg = f"#{cur.number} has no local Herdr agent pane on this machine"
+            self.error_msg = f"{disp} has no local Herdr agent pane on this machine"
             return
         if self.engine.herdr.focus_pane(lc.pane_id):
             self.status_msg = f"Focused {lc.pane_id}"
@@ -755,10 +829,11 @@ class BoardTUI:
         if not cur or self.ctx is None:
             return
         ctx = self.ctx
-        num = cur.number
+        ref = self._cli_ref(cur)
+        disp = self._tref(cur)
         self._run_background_action(
-            f"Promoting #{num} → Ready…",
-            lambda: (self.engine.move_ticket(ctx, num, Column.READY), f"Promoted #{num} to Ready")[1],
+            f"Promoting {disp} → Ready…",
+            lambda: (self.engine.move_ticket(ctx, ref, Column.READY), f"Promoted {disp} to Ready")[1],
         )
 
     def _action_approve_push(self) -> None:
@@ -766,28 +841,33 @@ class BoardTUI:
         if not cur or self.ctx is None:
             return
         ctx = self.ctx
-        num = cur.number
+        ref = self._cli_ref(cur)
+        disp = self._tref(cur)
         self._run_background_action(
-            f"Approving & pushing #{num} to {ctx.board.target_branch}…",
-            lambda: f"Landed #{num} ({self.engine.complete_ticket(ctx, num, approve=True).commit_sha[:8]})",
+            f"Approving & pushing {disp} to {ctx.board.target_branch}…",
+            lambda: f"Landed {disp} ({self.engine.complete_ticket(ctx, ref, approve=True).commit_sha[:8]})",
         )
 
     def _action_release_or_takeover(self) -> None:
         cur = self.selected_ticket()
         if not cur or self.ctx is None:
             return
-        if cur.stale and cur.number not in self.local_claims:
+        ref = self._cli_ref(cur)
+        disp = self._tref(cur)
+        if cur.stale and self._state_key(cur) not in self.local_claims:
             self.prompt = PromptState(
                 mode="confirm_takeover",
-                label=f"Reclaim STALE #{cur.number} and dispatch agent? [y/N]: ",
-                issue_number=cur.number,
+                label=f"Reclaim STALE {disp} and dispatch agent? [y/N]: ",
+                ticket_ref=ref,
             )
             return
         ctx = self.ctx
-        num = cur.number
         self._run_background_action(
-            f"Releasing #{num}…",
-            lambda: (self.engine.release_ticket(ctx, num, reason="Released from TUI"), f"Released #{num}")[1],
+            f"Releasing {disp}…",
+            lambda: (
+                self.engine.release_ticket(ctx, ref, reason="Released from TUI"),
+                f"Released {disp}",
+            )[1],
         )
 
     # --- Main Event Loop ---

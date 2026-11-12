@@ -13,12 +13,20 @@ Run `herdr-kanban` as a plain command (pass `--json` when you want structured JS
 
 ## Check the board & your inbox
 
+In single-repo workspaces, pass bare issue numbers (`42`). In **multi-repository umbrella**
+workspaces (`[repos.<alias>]` in `.herdr-kanban.toml`), prefix tickets with the repo alias
+(`firmware#10`, `cloud#42`).
+
 ```bash
-herdr-kanban board                 # overview of columns, active claims, and file overlaps
-herdr-kanban list --column ready   # unclaimed Ready tickets
-herdr-kanban show 42               # full ticket body, lease holder, touched files, comments
-herdr-kanban inbox --ack           # check & acknowledge messages from sibling/colleague agents
+herdr-kanban board                       # overview of columns, active claims, and file overlaps
+herdr-kanban list --column ready         # unclaimed Ready tickets (optional: --repo cloud)
+herdr-kanban show 42                     # or: herdr-kanban show cloud#42
+herdr-kanban inbox --ack                 # check & acknowledge messages from sibling/colleague agents
 ```
+
+Inside a multi-repo ticket worktree, read-only symlinks to sibling repositories are available under
+`.siblings/<alias>/` (automatically excluded from `git status`) so you can inspect cross-repo
+interfaces, protobufs, or schemas without leaving your sandbox.
 
 ## Claim & work on a ticket
 
@@ -47,6 +55,7 @@ herdr-kanban deposit "Fix race in token refresh" \
   --parent 42 \
   --file-line "src/auth/refresh.py:88"
 ```
+*(In multi-repo workspaces, pass `--repo <alias>` when depositing into a specific child repo, e.g. `--repo cloud --parent firmware#10`.)*
 
 Update your live claim status in place (edits your single claim comment—zero comment spam):
 
@@ -62,6 +71,8 @@ ticket directly:
 
 ```bash
 herdr-kanban ask 41 "Are you changing AuthSession's constructor signature?" --from 42
+# Or across repos in an umbrella workspace:
+herdr-kanban ask cloud#18 "Did TelemetryPacket v2 add sequence_id?" --from firmware#10
 ```
 
 This posts a structured relay comment on `#41` and wakes the colleague's (or your own) agent

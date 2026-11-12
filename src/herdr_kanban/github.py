@@ -15,10 +15,10 @@ from .model import (
     Column,
     DepositMeta,
     Ticket,
-    compute_file_overlaps,
     decode_meta,
     is_lease_expired,
     match_column,
+    populate_file_overlaps,
     resolve_winning_claim,
 )
 
@@ -291,15 +291,23 @@ class GitHubClient:
             raise GitHubError("failed to create GitHub Project v2")
         return proj
 
+    def clone_repo(self, owner: str, repo: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        proc = self._run(["repo", "clone", f"{owner}/{repo}", str(dest)], None)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()
+            raise GitHubError(f"gh repo clone {owner}/{repo} failed: {detail}")
+
     def fetch_board(
         self,
         *,
         project_owner: str,
         project_number: int,
-        repo_owner: str,
-        repo_name: str,
+        repo_owner: str = "",
+        repo_name: str = "",
         column_map: dict[str, str],
         label_filter: str = "",
+        allowed_repos: dict[tuple[str, str], str] | None = None,
     ) -> tuple[ProjectSchema, list[Ticket]]:
         cursor: str | None = None
         schema: ProjectSchema | None = None
@@ -342,12 +350,22 @@ class GitHubClient:
                 if not isinstance(issue, dict) or not issue.get("number"):
                     continue
                 issue_repo = issue.get("repository") or {}
-                issue_owner = ((issue_repo.get("owner") or {}).get("login") or "").lower()
-                issue_repo_name = str(issue_repo.get("name") or "").lower()
-                if repo_owner and issue_owner and issue_owner != repo_owner.lower():
-                    continue
-                if repo_name and issue_repo_name and issue_repo_name != repo_name.lower():
-                    continue
+                raw_issue_owner = str((issue_repo.get("owner") or {}).get("login") or "").strip()
+                raw_issue_repo = str(issue_repo.get("name") or "").strip()
+                issue_owner_lc = raw_issue_owner.lower()
+                issue_repo_lc = raw_issue_repo.lower()
+
+                alias = ""
+                if allowed_repos is not None:
+                    matched_alias = allowed_repos.get((issue_owner_lc, issue_repo_lc))
+                    if matched_alias is None:
+                        continue
+                    alias = matched_alias
+                else:
+                    if repo_owner and issue_owner_lc and issue_owner_lc != repo_owner.lower():
+                        continue
+                    if repo_name and issue_repo_lc and issue_repo_lc != repo_name.lower():
+                        continue
 
                 labels = [
                     str(lbl["name"])
@@ -407,6 +425,9 @@ class GitHubClient:
                         column=col,
                         status_name=status_name,
                         project_item_id=str(node["id"]),
+                        repo_owner=raw_issue_owner or repo_owner,
+                        repo_name=raw_issue_repo or repo_name,
+                        repo_alias=alias,
                         claim=claim_meta,
                         claim_comment_id=claim_cid,
                         stale=stale,
@@ -423,10 +444,8 @@ class GitHubClient:
                 break
 
         assert schema is not None
-        overlaps = compute_file_overlaps(tickets)
-        for ticket in tickets:
-            ticket.overlaps = overlaps.get(ticket.number, [])
-        tickets.sort(key=lambda t: t.number)
+        populate_file_overlaps(tickets)
+        tickets.sort(key=lambda t: (t.repo_alias or t.repo_name, t.number))
         return schema, tickets
 
     def set_item_column(

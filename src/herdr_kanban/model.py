@@ -12,6 +12,20 @@ from typing import Any
 META_PREFIX = "<!-- herdr-kanban:v1 "
 META_SUFFIX = " -->"
 META_PATTERN = re.compile(r"<!--\s*herdr-kanban:v1\s+(\{.*?\})\s*-->", re.DOTALL)
+TICKET_REF_RE = re.compile(r"^(?:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)#)?#?(\d+)$")
+
+
+def parse_ticket_ref(raw: str) -> tuple[str | None, int]:
+    """Parse `42`, `#42`, `cloud#42`, or `org/cloud#42` into `(repo_selector, number)`."""
+    text = raw.strip()
+    match = TICKET_REF_RE.match(text)
+    if not match:
+        raise ValueError(f"invalid ticket reference '{raw}' (expected e.g. `42` or `repo#42`)")
+    repo_sel = match.group(1) or None
+    num = int(match.group(2))
+    if num < 1:
+        raise ValueError(f"ticket number must be >= 1, got {num}")
+    return repo_sel, num
 
 
 class Column(StrEnum):
@@ -170,12 +184,13 @@ class RelayMeta:
     to_issue: int
     created_at: str
     from_agent: str = ""
+    from_repo: str = ""
     from_issue: int | None = None
     to_owner: str = ""
     urgent: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "v": 1,
             "type": "relay",
             "from_owner": self.from_owner,
@@ -186,6 +201,9 @@ class RelayMeta:
             "created_at": self.created_at,
             "urgent": self.urgent,
         }
+        if self.from_repo:
+            data["from_repo"] = self.from_repo
+        return data
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> RelayMeta:
@@ -194,6 +212,7 @@ class RelayMeta:
             to_issue=int(raw["to_issue"]),
             created_at=str(raw.get("created_at") or ""),
             from_agent=str(raw.get("from_agent") or ""),
+            from_repo=str(raw.get("from_repo") or ""),
             from_issue=int(raw["from_issue"]) if raw.get("from_issue") is not None else None,
             to_owner=str(raw.get("to_owner") or ""),
             urgent=bool(raw.get("urgent", False)),
@@ -205,11 +224,12 @@ class DepositMeta:
     deposited_by: str
     branch: str
     parent_issue: int | None = None
+    parent_repo: str = ""
     file_line: str = ""
     commit_sha: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "v": 1,
             "type": "deposit",
             "deposited_by": self.deposited_by,
@@ -218,6 +238,9 @@ class DepositMeta:
             "file_line": self.file_line,
             "commit_sha": self.commit_sha,
         }
+        if self.parent_repo:
+            data["parent_repo"] = self.parent_repo
+        return data
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> DepositMeta:
@@ -225,6 +248,7 @@ class DepositMeta:
             deposited_by=str(raw["deposited_by"]),
             branch=str(raw.get("branch") or ""),
             parent_issue=int(raw["parent_issue"]) if raw.get("parent_issue") is not None else None,
+            parent_repo=str(raw.get("parent_repo") or ""),
             file_line=str(raw.get("file_line") or ""),
             commit_sha=str(raw.get("commit_sha") or ""),
         )
@@ -288,7 +312,10 @@ def render_claim_comment(claim: ClaimMeta) -> str:
 
 
 def render_relay_comment(relay: RelayMeta, message: str) -> str:
-    origin = f"#{relay.from_issue}" if relay.from_issue else "board"
+    if relay.from_issue:
+        origin = f"{relay.from_repo}#{relay.from_issue}" if relay.from_repo else f"#{relay.from_issue}"
+    else:
+        origin = "board"
     sender = f"@{relay.from_owner}" + (f" ({relay.from_agent})" if relay.from_agent else "")
     header = f"**[herdr-kanban message from {sender} via {origin}]**"
     return f"{header}\n\n{message.strip()}\n\n{encode_meta(relay.to_dict())}"
@@ -298,7 +325,12 @@ def render_deposit_body(body: str, deposit: DepositMeta) -> str:
     parts = [body.strip()] if body.strip() else []
     context_lines = ["---", "**Deposited via `herdr-kanban`**"]
     if deposit.parent_issue:
-        context_lines.append(f"- Discovered while working on: #{deposit.parent_issue}")
+        ref = (
+            f"{deposit.parent_repo}#{deposit.parent_issue}"
+            if deposit.parent_repo
+            else f"#{deposit.parent_issue}"
+        )
+        context_lines.append(f"- Discovered while working on: {ref}")
     if deposit.file_line:
         context_lines.append(f"- Location: `{deposit.file_line}`")
     if deposit.branch:
@@ -363,6 +395,9 @@ class Ticket:
     column: Column = Column.TRIAGE
     status_name: str = ""
     project_item_id: str = ""
+    repo_owner: str = ""
+    repo_name: str = ""
+    repo_alias: str = ""
     claim: ClaimMeta | None = None
     claim_comment_id: int | None = None
     stale: bool = False
@@ -371,10 +406,22 @@ class Ticket:
     updated_at: str = ""
     overlaps: list[FileOverlap] = field(default_factory=list)
 
+    def ref(self, multi_repo: bool = False) -> str:
+        prefix = self.repo_alias or self.repo_name
+        if multi_repo and prefix:
+            return f"{prefix}#{self.number}"
+        return f"#{self.number}"
+
+    def repo_key(self) -> tuple[str, str]:
+        return (self.repo_owner.lower(), self.repo_name.lower())
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "number": self.number,
             "title": self.title,
+            "repo_owner": self.repo_owner,
+            "repo_name": self.repo_name,
+            "repo_alias": self.repo_alias,
             "body": strip_meta(self.body),
             "state": self.state,
             "url": self.url,
@@ -394,20 +441,23 @@ class Ticket:
         }
 
 
-def compute_file_overlaps(tickets: list[Ticket]) -> dict[int, list[FileOverlap]]:
-    """Return issue_number -> list of overlapping active claims touching the same files."""
+def populate_file_overlaps(tickets: list[Ticket]) -> None:
+    """Populate `ticket.overlaps` in-place, scoped per repository."""
     active = [
         t
         for t in tickets
         if t.claim and t.claim.state in ("active", "review_ready") and t.claim.touched_files
     ]
-    result: dict[int, list[FileOverlap]] = {}
-    for ticket in active:
-        assert ticket.claim is not None
-        mine = set(ticket.claim.touched_files)
+    active_by_id = {(t.repo_key(), t.number): t for t in active}
+    for ticket in tickets:
+        t_claim = active_by_id.get((ticket.repo_key(), ticket.number))
+        if t_claim is None or t_claim.claim is None:
+            ticket.overlaps = []
+            continue
+        mine = set(t_claim.claim.touched_files)
         hits: list[FileOverlap] = []
         for other in active:
-            if other.number == ticket.number or other.claim is None:
+            if other.repo_key() != ticket.repo_key() or other.number == ticket.number or other.claim is None:
                 continue
             shared = sorted(mine & set(other.claim.touched_files))
             if shared:
@@ -419,9 +469,13 @@ def compute_file_overlaps(tickets: list[Ticket]) -> dict[int, list[FileOverlap]]
                         files=shared,
                     )
                 )
-        if hits:
-            result[ticket.number] = hits
-    return result
+        ticket.overlaps = hits
+
+
+def compute_file_overlaps(tickets: list[Ticket]) -> dict[int, list[FileOverlap]]:
+    """Return issue_number -> list of overlapping active claims (same-repo scoped)."""
+    populate_file_overlaps(tickets)
+    return {t.number: list(t.overlaps) for t in tickets if t.overlaps}
 
 
 @dataclass(slots=True)
@@ -432,6 +486,7 @@ class InboxItem:
     body: str
     created_at: str
     from_agent: str = ""
+    from_repo: str = ""
     from_issue: int | None = None
     trusted: bool = False
     delivered: bool = False
@@ -449,6 +504,7 @@ class InboxItem:
             body=str(raw.get("body") or ""),
             created_at=str(raw.get("created_at") or ""),
             from_agent=str(raw.get("from_agent") or ""),
+            from_repo=str(raw.get("from_repo") or ""),
             from_issue=int(raw["from_issue"]) if raw.get("from_issue") is not None else None,
             trusted=bool(raw.get("trusted", False)),
             delivered=bool(raw.get("delivered", False)),

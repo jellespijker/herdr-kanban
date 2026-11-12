@@ -5,8 +5,8 @@
 
 id = "herdr-kanban"
 name = "Kanban"
-version = "0.1.0"
-description = "Collaborate with colleagues and multiple coding agents on one shared branch through GitHub Projects v2 and Issues."
+version = "0.2.0"
+description = "Collaborate with colleagues and multiple coding agents on one shared branch (single-repo or multi-repo umbrella) through GitHub Projects v2 and Issues."
 min_herdr_version = "0.9.3"
 platforms = ["linux", "macos"]
 
@@ -33,9 +33,15 @@ command = ["bin/herdr-kanban", "open", "--placement", "split"]
 
 [[actions]]
 id = "init"
-title = "Kanban: connect branch to GitHub Project"
+title = "Kanban: connect branch or umbrella workspace to GitHub Project"
 contexts = ["workspace", "pane"]
 command = ["bin/herdr-kanban", "popup", "init"]
+
+[[actions]]
+id = "sync-repos"
+title = "Kanban: sync multi-repo checkouts & shared branch"
+contexts = ["workspace", "pane"]
+command = ["bin/herdr-kanban", "popup", "sync-repos"]
 
 [[actions]]
 id = "install-skill"
@@ -94,6 +100,14 @@ placement = "popup"
 width = 110
 height = "80%"
 command = ["bin/herdr-kanban", "init", "--interactive", "--wait"]
+
+[[panes]]
+id = "sync-repos"
+title = "Kanban: sync repos"
+placement = "popup"
+width = 115
+height = "75%"
+command = ["bin/herdr-kanban", "sync-repos", "--wait"]
 
 [[panes]]
 id = "doctor"

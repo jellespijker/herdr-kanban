@@ -11,6 +11,7 @@
       "properties": {
         "repo_owner": { "type": "string" },
         "repo_name": { "type": "string" },
+        "default_repo": { "type": "string" },
         "project_owner": { "type": "string", "minLength": 1 },
         "project_number": { "type": "integer", "minimum": 1 },
         "target_branch": { "type": "string", "minLength": 1 },
@@ -36,6 +37,22 @@
         "done": { "type": "string" }
       },
       "additionalProperties": false
+    },
+    "repos": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["owner", "repo", "path"],
+        "properties": {
+          "owner": { "type": "string", "minLength": 1 },
+          "repo": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "target_branch": { "type": "string" },
+          "remote": { "type": "string" },
+          "check_command": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": false

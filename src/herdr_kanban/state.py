@@ -85,6 +85,8 @@ class LocalClaim:
     herdr_session: str = ""
     risk_gate: bool = False
     started_at: str = ""
+    umbrella_root: str = ""
+    repo_alias: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -111,6 +113,8 @@ class LocalClaim:
             herdr_session=str(raw.get("herdr_session") or ""),
             risk_gate=bool(raw.get("risk_gate", False)),
             started_at=str(raw.get("started_at") or ""),
+            umbrella_root=str(raw.get("umbrella_root") or ""),
+            repo_alias=str(raw.get("repo_alias") or ""),
         )
 
 

@@ -1,6 +1,6 @@
 # herdr-kanban specification
 
-Version: 0.1.0
+Version: 0.2.0
 
 `herdr-kanban` is a [Herdr](https://herdr.dev) plugin that lets a team of colleagues combine
 their coding agents (Claude Code, Antigravity, Codex, OpenCode, Gemini CLI, Copilot CLI, etc.)
@@ -146,8 +146,18 @@ Human-readable summary...
    (`default_agent_kind`, `worktree_root`, `poll_seconds`, `machines`).
 
 Because ephemeral worktrees may run before `.herdr-kanban.toml` is committed or from a subdirectory,
-config discovery checks both the current worktree root and the main checkout root derived from
-`git rev-parse --git-common-dir`.
+config discovery checks an enclosing umbrella root (`[repos.<alias>]`, ADR-0007), the current
+worktree root, and the main checkout root derived from `git rev-parse --git-common-dir`.
+
+### 5.1 Multi-Repository Umbrella Workspaces (ADR-0007)
+
+When `.herdr-kanban.toml` defines `[repos.<alias>]` entries in a parent folder (plain directory or
+Git meta-repo):
+- `herdr-kanban init` auto-discovers immediate child Git checkouts; `herdr-kanban sync-repos` clones
+  any missing repos via `gh repo clone` and checks out each repo's `target_branch`.
+- Tickets across all configured child repos appear on one unified Kanban board as `<alias>#<N>`.
+- Ephemeral worktrees are isolated per repo (`<worktree_root>/<owner>__<repo>/issue-<N>`) and expose
+  sibling checkouts at `<worktree>/.siblings/<alias>` (ignored via `git rev-parse --git-path info/exclude`).
 
 ---
 

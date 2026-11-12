@@ -97,6 +97,34 @@ bin/herdr-kanban setup-keys      # binds prefix+m to open the Kanban board tab
 
 ---
 
+## Multi-Repository ("Umbrella") Workspaces
+
+GitHub Projects v2 naturally span multiple repositories (`firmware`, `cloud`, `software`, etc.).
+To coordinate across multiple repos on a shared feature branch:
+
+1. Create a parent directory (either a plain folder or a small Git meta-repo) and clone your repos
+   inside it:
+   ```bash
+   mkdir acme-platform && cd acme-platform
+   gh repo clone acme/firmware
+   gh repo clone acme/cloud
+   gh repo clone acme/software
+   herdr-kanban init --interactive   # auto-discovers firmware, cloud, software into [repos.<alias>]
+   ```
+2. Teammates who pull or copy `.herdr-kanban.toml` into their umbrella folder can clone any missing
+   repos and align every repo onto the shared `target_branch` in one step:
+   ```bash
+   herdr-kanban sync-repos --create-branches
+   ```
+3. Tickets are displayed and addressed as `<alias>#<number>` (`firmware#10`, `cloud#18`), so issue
+   `#10` in `firmware` and issue `#10` in `cloud` never collide.
+4. When an agent is dispatched into an ephemeral worktree for `cloud#18`, `herdr-kanban`
+   automatically symlinks `.siblings/firmware` and `.siblings/software` inside that worktree (and
+   excludes `/.siblings/` via Git `info/exclude`), giving sandboxed coding agents read access to
+   sibling repos while keeping `git status` clean.
+
+---
+
 ## Agent CLI Reference
 
 Installed coding agents receive the `herdr-kanban` skill automatically:
