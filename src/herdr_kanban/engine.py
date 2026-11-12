@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,9 +24,12 @@ from .model import (
     RelayMeta,
     Ticket,
     decode_meta,
+    detect_dependency_cycle,
     is_lease_expired,
     lease_until_iso,
+    parse_body_dependencies,
     parse_ticket_ref,
+    populate_dependency_waves,
     populate_file_overlaps,
     render_claim_comment,
     render_deposit_body,
@@ -32,6 +37,7 @@ from .model import (
     resolve_winning_claim,
     strip_meta,
     utc_now_iso,
+    validate_ready_gate,
 )
 
 TicketRefInput = int | str
@@ -108,6 +114,7 @@ class LandingResult:
     repo_alias: str = ""
     closed_issue: bool = False
     worktree_removed: bool = False
+    unblocked_tickets: list[int] = field(default_factory=list)
 
     def ref(self) -> str:
         return f"{self.repo_alias}#{self.issue_number}" if self.repo_alias else f"#{self.issue_number}"
@@ -263,6 +270,8 @@ class KanbanEngine:
 
         if ctx.active_repo_alias and ctx.active_repo_alias in ctx.repos:
             return ctx.repos[ctx.active_repo_alias]
+        if ctx.board.issues_repo and ctx.board.issues_repo in ctx.repos:
+            return ctx.repos[ctx.board.issues_repo]
         if ctx.board.default_repo and ctx.board.default_repo in ctx.repos:
             return ctx.repos[ctx.board.default_repo]
         if len(ctx.repos) == 1:
@@ -271,6 +280,68 @@ class KanbanEngine:
         raise KanbanError(
             f"Multiple repositories configured ({avail}); pass `--repo <alias>` or `<alias>#<number>`."
         )
+
+    def resolve_issues_entry(
+        self,
+        ctx: RepoContext,
+        fallback_entry: config.RepoEntry | None = None,
+    ) -> config.RepoEntry:
+        """Return the repository that stores GitHub Issues, labels, and milestones."""
+        if ctx.board.issues_repo:
+            return self.resolve_repo_entry(ctx, ctx.board.issues_repo)
+        if fallback_entry is not None:
+            return fallback_entry
+        return self.resolve_repo_entry(ctx, None)
+
+    def normalize_labels(self, ctx: RepoContext, raw_labels: list[str] | None) -> list[str]:
+        """Expand `facet=value` or `facet:value` shorthands using configured `[taxonomy.facets.*]`."""
+        if not raw_labels:
+            return []
+        out: list[str] = []
+        for item in raw_labels:
+            for part in item.split(","):
+                tok = part.strip()
+                if not tok:
+                    continue
+                if "=" in tok:
+                    fname, fval = tok.split("=", 1)
+                    spec = ctx.board.facets.get(fname.strip())
+                    if spec:
+                        tok = f"{spec.prefix}{fval.strip()}"
+                out.append(tok)
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for lbl in out:
+            if lbl not in seen:
+                seen.add(lbl)
+                deduped.append(lbl)
+        return deduped
+
+    def merge_labels_with_facets(
+        self,
+        ctx: RepoContext,
+        existing_labels: list[str],
+        add_labels: list[str],
+        rm_labels: list[str],
+    ) -> list[str]:
+        """Merge labels while replacing single-value (`multiple = false`) facet labels."""
+        rm_set = set(self.normalize_labels(ctx, rm_labels))
+        norm_add = self.normalize_labels(ctx, add_labels)
+        single_prefixes_to_replace: set[str] = set()
+        for spec in ctx.board.facets.values():
+            if not spec.multiple and spec.prefix and any(lbl.startswith(spec.prefix) for lbl in norm_add):
+                single_prefixes_to_replace.add(spec.prefix)
+
+        kept = [
+            lbl
+            for lbl in existing_labels
+            if lbl not in rm_set
+            and not any(lbl.startswith(pref) for pref in single_prefixes_to_replace)
+        ]
+        for lbl in norm_add:
+            if lbl not in kept and lbl not in rm_set:
+                kept.append(lbl)
+        return kept
 
     def resolve_ticket_target(
         self,
@@ -355,6 +426,9 @@ class KanbanEngine:
         return None
 
     def refresh_board(self, ctx: RepoContext) -> tuple[ProjectSchema, list[Ticket]]:
+        extra_kwargs: dict[str, Any] = {}
+        if ctx.board.priority_field and ctx.board.priority_field != "Priority":
+            extra_kwargs["priority_field"] = ctx.board.priority_field
         if ctx.is_multi_repo:
             allowed = {(entry.owner.lower(), entry.repo.lower()): alias for alias, entry in ctx.repos.items()}
             schema, tickets = self.github.fetch_board(
@@ -363,7 +437,16 @@ class KanbanEngine:
                 column_map=ctx.board.columns,
                 label_filter=ctx.board.label_filter,
                 allowed_repos=allowed,
+                **extra_kwargs,
             )
+            for t in tickets:
+                if not t.target_repo:
+                    inferred = self._infer_code_entry_from_ticket(
+                        ctx,
+                        ctx.repos.get(t.repo_alias) or next(iter(ctx.repos.values())),
+                        t,
+                    )
+                    t.target_repo = inferred.alias
         else:
             schema, tickets = self.github.fetch_board(
                 project_owner=ctx.board.project_owner,
@@ -372,7 +455,10 @@ class KanbanEngine:
                 repo_name=ctx.repo_name,
                 column_map=ctx.board.columns,
                 label_filter=ctx.board.label_filter,
+                **extra_kwargs,
             )
+        populate_dependency_waves(tickets)
+        populate_file_overlaps(tickets)
         state.save_board_cache(
             ctx.slug,
             ctx.board.project_number,
@@ -386,8 +472,81 @@ class KanbanEngine:
             return None
         fetched_at, rows = cached
         tickets = [self._deserialize_cached_ticket(r) for r in rows if isinstance(r, dict)]
+        populate_dependency_waves(tickets)
         populate_file_overlaps(tickets)
         return fetched_at, tickets
+
+    def priority_rank(self, ctx: RepoContext, priority: str) -> int:
+        if not priority:
+            return 999
+        p_lc = priority.strip().lower()
+        for idx, configured in enumerate(ctx.board.priorities):
+            c_lc = configured.lower()
+            if p_lc == c_lc or p_lc.startswith(c_lc) or c_lc.startswith(p_lc):
+                return idx
+        default_order = ("p0", "p1", "p2", "p3", "critical", "high", "medium", "low")
+        for idx, prefix in enumerate(default_order):
+            if p_lc.startswith(prefix):
+                return idx
+        return 500
+
+    def sort_tickets_for_display(self, ctx: RepoContext, tickets: list[Ticket]) -> list[Ticket]:
+        return sorted(
+            tickets,
+            key=lambda t: (
+                t.wave,
+                self.priority_rank(ctx, t.priority),
+                t.repo_alias or t.repo_name,
+                t.number,
+            ),
+        )
+
+    def sync_labels(self, ctx: RepoContext) -> dict[str, Any]:
+        """Provision configured taxonomy labels, milestones, and Project v2 Priority options."""
+        issues_entry = self.resolve_issues_entry(ctx)
+        existing_labels = self.github.list_labels(issues_entry.owner, issues_entry.repo)
+        label_results: list[dict[str, str]] = []
+        for facet in ctx.board.facets.values():
+            for val in facet.values:
+                full_name = f"{facet.prefix}{val}"
+                desc = facet.description or f"{facet.name}: {val}"
+                status = self.github.upsert_label(
+                    issues_entry.owner,
+                    issues_entry.repo,
+                    full_name,
+                    facet.color,
+                    desc,
+                    existing=existing_labels,
+                )
+                label_results.append({"name": full_name, "color": facet.color, "status": status})
+
+        existing_ms = self.github.list_milestones(issues_entry.owner, issues_entry.repo)
+        milestone_results: list[dict[str, Any]] = []
+        for ms_title in ctx.board.milestones:
+            ms_num, ms_status = self.github.ensure_milestone(
+                issues_entry.owner,
+                issues_entry.repo,
+                ms_title,
+                existing=existing_ms,
+            )
+            milestone_results.append({"title": ms_title, "number": ms_num, "status": ms_status})
+
+        schema, _ = self.refresh_board(ctx)
+        added_priorities: list[str] = []
+        if ctx.board.priorities and schema.priority_field_id:
+            added_priorities = self.github.ensure_single_select_options(
+                schema.priority_field_id,
+                ctx.board.priority_field,
+                ctx.board.priorities,
+                schema.priority_options_by_name,
+            )
+
+        return {
+            "issues_repo": f"{issues_entry.owner}/{issues_entry.repo}",
+            "labels": label_results,
+            "milestones": milestone_results,
+            "added_priorities": added_priorities,
+        }
 
     def sync_repos(self, ctx: RepoContext, *, create_branches: bool = False) -> list[dict[str, str]]:
         """Clone missing child repos and check out each repo's shared target branch."""
@@ -449,6 +608,8 @@ class KanbanEngine:
         pane_id: str = "",
         risk_gate: bool = False,
         takeover: bool = False,
+        repo_selector: str | None = None,
+        force: bool = False,
     ) -> ClaimResult:
         chosen_kind = agent_kind or ctx.settings.default_agent_kind
         schema, tickets = self.refresh_board(ctx)
@@ -458,9 +619,35 @@ class KanbanEngine:
         if ticket is None:
             raise KanbanError(f"Issue {disp} is not on GitHub Project #{ctx.board.project_number}")
 
+        if ticket.unmet_deps and not force:
+            blockers = ", ".join(f"#{n}" for n in ticket.unmet_deps)
+            raise KanbanError(
+                f"Issue {disp} is blocked by unfinished dependency ticket(s): {blockers}. "
+                f"Complete {blockers} first (or pass `--force` to override)."
+            )
+
         existing_local = state.get_local_claim(entry.slug, issue_number)
         if existing_local and Path(existing_local.worktree_path).is_dir():
-            self._link_siblings_if_multi(ctx, entry, Path(existing_local.worktree_path))
+            code_entry = self._infer_code_entry_from_ticket(ctx, entry, ticket, explicit_repo=repo_selector)
+            self._link_siblings_if_multi(ctx, code_entry, Path(existing_local.worktree_path))
+            if chosen_kind and existing_local.agent_kind != chosen_kind:
+                existing_local.agent_kind = chosen_kind
+                state.save_local_claim(existing_local)
+            comments = self.github.list_issue_comments(entry.owner, entry.repo, issue_number)
+            winning = resolve_winning_claim(comments)
+            if winning is not None:
+                win_cid, win_claim = winning
+                if chosen_kind and win_claim.agent_kind != chosen_kind:
+                    win_claim.agent_kind = chosen_kind
+                    try:
+                        self.github.patch_comment(
+                            entry.owner,
+                            entry.repo,
+                            win_cid,
+                            render_claim_comment(win_claim),
+                        )
+                    except GitHubError:
+                        pass
             return ClaimResult(
                 claim=existing_local,
                 ticket=ticket,
@@ -486,12 +673,13 @@ class KanbanEngine:
                 )
             takeover_of = win_cid
 
-        main_repo = self._entry_main_root(ctx, entry)
-        remote = entry.effective_remote(ctx.board)
-        target_branch = entry.effective_branch(ctx.board)
+        code_entry = self._infer_code_entry_from_ticket(ctx, entry, ticket, explicit_repo=repo_selector)
+        main_repo = self._entry_main_root(ctx, code_entry)
+        remote = code_entry.effective_remote(ctx.board)
+        target_branch = code_entry.effective_branch(ctx.board)
 
         user = self.github.current_user()
-        wt_base = ctx.settings.resolved_worktree_root() / entry.slug / f"issue-{issue_number}"
+        wt_base = ctx.settings.resolved_worktree_root() / code_entry.slug / f"issue-{issue_number}"
         had_wt = wt_base.exists()
         self.git.ensure_remote_branch(main_repo, remote, target_branch)
         wt_path, local_branch = self.git.create_ticket_worktree(
@@ -501,7 +689,7 @@ class KanbanEngine:
             target_branch,
             issue_number,
         )
-        self._link_siblings_if_multi(ctx, entry, wt_path)
+        self._link_siblings_if_multi(ctx, code_entry, wt_path)
 
         now_iso = utc_now_iso()
         lease_iso = lease_until_iso(ctx.board.lease_ttl_minutes)
@@ -518,6 +706,7 @@ class KanbanEngine:
             herdr_session=state.herdr_session_key(),
             pane_id=caller_pane,
             branch=target_branch,
+            target_repo=code_entry.alias if ctx.is_multi_repo else "",
             risk_gate=risk_gate or ctx.board.require_review,
             takeover_of=takeover_of,
         )
@@ -731,7 +920,63 @@ class KanbanEngine:
             meta.checklist = checklist
 
         self.github.patch_comment(entry.owner, entry.repo, cid, render_claim_comment(meta))
+        if meta.checklist and all(
+            item.strip().lower().startswith("[x]") for item in meta.checklist if item.strip()
+        ):
+            cli_ref = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else str(issue_number)
+            if ctx.board.require_review:
+                try:
+                    self.move_ticket(ctx, cli_ref, Column.REVIEW)
+                except KanbanError:
+                    pass
+            print(
+                f"[herdr-kanban] All checklist items on {disp} are [x] complete! "
+                f"Commit all changes and run `herdr-kanban done {cli_ref} --summary \"...\"` "
+                f"to move {disp} across the board to Done.",
+                file=sys.stderr,
+            )
         return meta
+
+    def _infer_code_entry_from_ticket(
+        self,
+        ctx: RepoContext,
+        issue_entry: config.RepoEntry,
+        ticket: Ticket | None,
+        explicit_repo: str | None = None,
+    ) -> config.RepoEntry:
+        """Resolve the target code repository for a ticket when issues are centralized in `issues_repo`."""
+        if explicit_repo:
+            return self.resolve_repo_entry(ctx, explicit_repo)
+        if not ctx.is_multi_repo or ticket is None:
+            return issue_entry
+        for cand in (
+            ticket.target_repo,
+            ticket.claim.target_repo if ticket.claim else "",
+            ticket.deposit.target_repo if ticket.deposit else "",
+        ):
+            if cand and cand in ctx.repos:
+                return ctx.repos[cand]
+        for tag in re.findall(r"\[([A-Za-z0-9_.-]+)\]", ticket.title or ""):
+            if tag in ctx.repos and tag != issue_entry.alias:
+                return ctx.repos[tag]
+        return issue_entry
+
+    def _parse_dep_numbers(self, refs: list[TicketRefInput] | None) -> list[int]:
+        if not refs:
+            return []
+        nums: set[int] = set()
+        for r in refs:
+            if isinstance(r, int):
+                if r >= 1:
+                    nums.add(r)
+            else:
+                for part in str(r).split(","):
+                    tok = part.strip()
+                    if not tok:
+                        continue
+                    _, n = parse_ticket_ref(tok)
+                    nums.add(n)
+        return sorted(nums)
 
     def deposit_issue(
         self,
@@ -743,15 +988,22 @@ class KanbanEngine:
         file_line: str = "",
         ready: bool = False,
         repo_selector: str | None = None,
+        labels: list[str] | None = None,
+        priority: str = "",
+        milestone: str = "",
+        depends_on: list[TicketRefInput] | None = None,
+        blocks: list[TicketRefInput] | None = None,
+        force: bool = False,
     ) -> Ticket:
-        entry = self.resolve_repo_entry(ctx, repo_selector)
+        target_entry = self.resolve_repo_entry(ctx, repo_selector)
+        issue_entry = self.resolve_issues_entry(ctx, fallback_entry=target_entry)
         parent_num: int | None = None
         parent_repo = ""
         if parent_issue is not None:
             if isinstance(parent_issue, int):
                 parent_num = parent_issue
                 if ctx.is_multi_repo:
-                    parent_repo = ctx.active_repo_alias or entry.alias
+                    parent_repo = issue_entry.alias
             else:
                 p_sel, p_num = parse_ticket_ref(str(parent_issue))
                 parent_num = p_num
@@ -759,45 +1011,108 @@ class KanbanEngine:
                     p_entry = (
                         self.resolve_repo_entry(ctx, p_sel)
                         if p_sel
-                        else (ctx.repos.get(ctx.active_repo_alias) or entry)
+                        else issue_entry
                     )
                     parent_repo = p_entry.alias
+
+        dep_nums = self._parse_dep_numbers(depends_on)
+        block_nums = self._parse_dep_numbers(blocks)
+        body_deps, body_blocks = parse_body_dependencies(body, None)
+        all_deps = sorted(set(dep_nums) | set(body_deps))
+        all_blocks = sorted(set(block_nums) | set(body_blocks))
+
+        norm_labels = self.normalize_labels(ctx, labels)
+        if ctx.board.label_filter and ctx.board.label_filter not in norm_labels:
+            norm_labels.append(ctx.board.label_filter)
+
+        target_col = Column.READY if (ready or ctx.board.auto_ready_deposits) else Column.TRIAGE
+        if target_col == Column.READY and not force:
+            gate_errors = validate_ready_gate(
+                norm_labels,
+                priority,
+                ctx.board.facets,
+                ctx.board.require_priority_for_ready,
+            )
+            if gate_errors:
+                raise KanbanError(
+                    "Ticket cannot enter Ready until required taxonomy facets/priority are set:\n  - "
+                    + "\n  - ".join(gate_errors)
+                )
 
         user = self.github.current_user()
         commit_cwd = ctx.worktree_cwd
         if ctx.is_multi_repo and not (commit_cwd / ".git").exists():
-            cand = entry.resolved_path(ctx.umbrella_root or commit_cwd)
+            cand = target_entry.resolved_path(ctx.umbrella_root or commit_cwd)
             if (cand / ".git").exists():
                 commit_cwd = cand
 
         deposit = DepositMeta(
             deposited_by=user,
-            branch=entry.effective_branch(ctx.board),
+            branch=target_entry.effective_branch(ctx.board),
             parent_issue=parent_num,
             parent_repo=parent_repo,
+            target_repo=target_entry.alias if ctx.is_multi_repo else "",
             file_line=file_line,
             commit_sha=self.git.head_sha(commit_cwd) if (commit_cwd / ".git").exists() else "",
+            depends_on=all_deps,
+            blocks=all_blocks,
         )
         full_body = render_deposit_body(body, deposit)
-        labels = [ctx.board.label_filter] if ctx.board.label_filter else None
-        created = self.github.create_issue(
-            entry.owner,
-            entry.repo,
-            title,
-            body=full_body,
-            labels=labels,
-        )
+
+        milestone_num: int | None = None
+        if milestone.strip():
+            milestone_num, _ = self.github.ensure_milestone(
+                issue_entry.owner,
+                issue_entry.repo,
+                milestone.strip(),
+            )
+
+        issue_kwargs: dict[str, Any] = {
+            "body": full_body,
+            "labels": norm_labels or None,
+        }
+        if milestone_num is not None:
+            issue_kwargs["milestone_number"] = milestone_num
+
+        try:
+            created = self.github.create_issue(
+                issue_entry.owner,
+                issue_entry.repo,
+                title,
+                **issue_kwargs,
+            )
+        except GitHubError as exc:
+            if (
+                ctx.is_multi_repo
+                and "Issues has been disabled" in str(exc)
+                and ctx.board.default_repo in ctx.repos
+                and issue_entry.alias != ctx.board.default_repo
+            ):
+                fallback_entry = ctx.repos[ctx.board.default_repo]
+                tag_prefix = f"[{target_entry.alias}]"
+                if tag_prefix.lower() not in title.lower():
+                    title = f"{tag_prefix} {title}"
+                issue_entry = fallback_entry
+                created = self.github.create_issue(
+                    issue_entry.owner,
+                    issue_entry.repo,
+                    title,
+                    **issue_kwargs,
+                )
+            else:
+                raise
         issue_number = int(created["number"])
         node_id = str(created.get("node_id") or "")
         url = str(created.get("html_url") or "")
 
         schema, _ = self.refresh_board(ctx)
-        target_col = Column.READY if (ready or ctx.board.auto_ready_deposits) else Column.TRIAGE
         item_id = ""
         if node_id:
             item_id = self.github.add_issue_to_project(schema.project_id, node_id)
             if item_id:
                 self.github.set_item_column(schema, item_id, target_col, ctx.board.columns)
+                if priority.strip():
+                    self.github.set_item_priority(schema, item_id, priority.strip())
 
         return Ticket(
             number=issue_number,
@@ -806,29 +1121,158 @@ class KanbanEngine:
             state="OPEN",
             url=url,
             author=user,
-            labels=labels or [],
+            labels=norm_labels,
+            priority=priority.strip(),
+            milestone=milestone.strip(),
+            target_repo=target_entry.alias if ctx.is_multi_repo else "",
+            depends_on=all_deps,
+            blocks=all_blocks,
             column=target_col,
             project_item_id=item_id,
-            repo_owner=entry.owner,
-            repo_name=entry.repo,
-            repo_alias=entry.alias if ctx.is_multi_repo else "",
+            repo_owner=issue_entry.owner,
+            repo_name=issue_entry.repo,
+            repo_alias=issue_entry.alias if ctx.is_multi_repo else "",
             deposit=deposit,
         )
 
-    def move_ticket(self, ctx: RepoContext, ref: TicketRefInput, column: Column) -> Ticket:
+    def triage_ticket(
+        self,
+        ctx: RepoContext,
+        ref: TicketRefInput,
+        *,
+        column: Column | None = None,
+        add_labels: list[str] | None = None,
+        rm_labels: list[str] | None = None,
+        priority: str | None = None,
+        milestone: str | None = None,
+        target_repo: str | None = None,
+        add_depends_on: list[TicketRefInput] | None = None,
+        rm_depends_on: list[TicketRefInput] | None = None,
+        add_blocks: list[TicketRefInput] | None = None,
+        rm_blocks: list[TicketRefInput] | None = None,
+        force: bool = False,
+    ) -> Ticket:
         schema, tickets = self.refresh_board(ctx)
         entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
         ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
         disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
         if ticket is None or not ticket.project_item_id:
             raise KanbanError(f"Issue {disp} not found on Project #{ctx.board.project_number}")
-        ok = self.github.set_item_column(schema, ticket.project_item_id, column, ctx.board.columns)
-        if not ok:
-            raise KanbanError(
-                f"Project #{ctx.board.project_number} has no Status option mapped to column '{column.value}'"
+
+        new_labels = self.merge_labels_with_facets(
+            ctx,
+            ticket.labels,
+            add_labels or [],
+            rm_labels or [],
+        )
+        effective_priority = priority.strip() if priority is not None else ticket.priority
+        effective_col = column if column is not None else ticket.column
+
+        add_deps = set(self._parse_dep_numbers(add_depends_on))
+        rm_deps = set(self._parse_dep_numbers(rm_depends_on))
+        add_blks = set(self._parse_dep_numbers(add_blocks))
+        rm_blks = set(self._parse_dep_numbers(rm_blocks))
+
+        cur_deps, cur_blks = parse_body_dependencies(ticket.body, ticket.deposit)
+        next_deps = sorted((set(cur_deps) | add_deps) - rm_deps - {issue_number})
+        next_blks = sorted((set(cur_blks) | add_blks) - rm_blks - {issue_number})
+
+        if add_deps or add_blks:
+            edges: dict[int, set[int]] = {t.number: set(t.depends_on) for t in tickets}
+            edges[issue_number] = set(next_deps)
+            for b_num in next_blks:
+                edges.setdefault(b_num, set()).add(issue_number)
+            cycle = detect_dependency_cycle(edges)
+            if cycle is not None:
+                cyc_str = " -> ".join(f"#{n}" for n in cycle)
+                raise KanbanError(f"Dependency cycle detected: {cyc_str}")
+
+        if effective_col == Column.READY and not force:
+            gate_errors = validate_ready_gate(
+                new_labels,
+                effective_priority,
+                ctx.board.facets,
+                ctx.board.require_priority_for_ready,
             )
-        ticket.column = column
+            if gate_errors:
+                raise KanbanError(
+                    f"Cannot promote {disp} to Ready until required taxonomy facets/priority are set:\n  - "
+                    + "\n  - ".join(gate_errors)
+                )
+
+        milestone_num: int | None = None
+        if milestone is not None:
+            if milestone.strip():
+                milestone_num, _ = self.github.ensure_milestone(
+                    entry.owner,
+                    entry.repo,
+                    milestone.strip(),
+                )
+                ticket.milestone = milestone.strip()
+            else:
+                milestone_num = 0
+                ticket.milestone = ""
+
+        need_body_patch = bool(
+            target_repo is not None or add_deps or rm_deps or add_blks or rm_blks
+        )
+        new_body: str | None = None
+        if need_body_patch:
+            dep_meta = ticket.deposit or DepositMeta(
+                deposited_by=ticket.author or self.github.current_user(),
+                branch=entry.effective_branch(ctx.board),
+            )
+            if target_repo is not None:
+                resolved_target = self.resolve_repo_entry(ctx, target_repo)
+                dep_meta.target_repo = resolved_target.alias
+                ticket.target_repo = resolved_target.alias
+            dep_meta.depends_on = next_deps
+            dep_meta.blocks = next_blks
+            ticket.deposit = dep_meta
+            clean_user_body = strip_meta(ticket.body)
+            marker = "\n---\n**Deposited via `herdr-kanban`**"
+            if marker in clean_user_body:
+                clean_user_body = clean_user_body.split(marker, 1)[0].strip()
+            new_body = render_deposit_body(clean_user_body, dep_meta)
+            ticket.body = new_body
+
+        labels_changed = new_labels != ticket.labels
+        if labels_changed or milestone_num is not None or new_body is not None:
+            self.github.update_issue(
+                entry.owner,
+                entry.repo,
+                issue_number,
+                body=new_body,
+                labels=new_labels if labels_changed else None,
+                milestone_number=milestone_num,
+            )
+            ticket.labels = new_labels
+
+        if priority is not None and priority.strip():
+            ok_prio = self.github.set_item_priority(schema, ticket.project_item_id, priority.strip())
+            if not ok_prio:
+                avail_prio = ", ".join(schema.priority_options_by_name) or "(run `herdr-kanban sync-labels`)"
+                raise KanbanError(
+                    f"Priority '{priority}' not found on Project #{ctx.board.project_number} "
+                    f"(available: {avail_prio})"
+                )
+            ticket.priority = priority.strip()
+
+        if column is not None:
+            ok_col = self.github.set_item_column(schema, ticket.project_item_id, column, ctx.board.columns)
+            if not ok_col:
+                raise KanbanError(
+                    f"Project #{ctx.board.project_number} has no Status option "
+                    f"mapped to column '{column.value}'"
+                )
+            ticket.column = column
+
+        ticket.depends_on = next_deps
+        ticket.blocks = next_blks
         return ticket
+
+    def move_ticket(self, ctx: RepoContext, ref: TicketRefInput, column: Column) -> Ticket:
+        return self.triage_ticket(ctx, ref, column=column, force=True)
 
     def post_comment(self, ctx: RepoContext, ref: TicketRefInput, body: str) -> dict[str, Any]:
         entry, issue_number = self.resolve_ticket_target(ctx, ref)
@@ -942,9 +1386,31 @@ class KanbanEngine:
         cli_ref = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else str(issue_number)
 
         local_claim = state.get_local_claim(entry.slug, issue_number)
+        schema_pre, tickets_pre = self.refresh_board(ctx)
+        ticket_pre = self._find_board_ticket(tickets_pre, entry, issue_number, ctx.is_multi_repo)
+        code_entry = self._infer_code_entry_from_ticket(ctx, entry, ticket_pre)
+        main_code_root = self._entry_main_root(ctx, code_entry)
+
         wt = Path(local_claim.worktree_path) if local_claim else ctx.worktree_cwd
-        if not wt.is_dir() or not (wt / ".git").exists():
-            raise LandingGateError(f"Worktree {wt} does not exist for issue {disp}")
+        claim_main_mismatch = bool(
+            code_entry.alias != entry.alias
+            and local_claim
+            and Path(local_claim.main_repo_root).resolve() != main_code_root.resolve()
+        )
+        if not wt.is_dir() or not (wt / ".git").exists() or claim_main_mismatch:
+            wt = main_code_root
+
+        remote = code_entry.effective_remote(ctx.board)
+        target = code_entry.effective_branch(ctx.board)
+        check_cmd = code_entry.effective_check(ctx.board)
+        self.git.fetch_branch(wt, remote, target)
+        ahead = self.git.commit_count_ahead(wt, f"{remote}/{target}")
+        if ahead == 0 and main_code_root.is_dir() and (main_code_root / ".git").exists():
+            self.git.fetch_branch(main_code_root, remote, target)
+            main_ahead = self.git.commit_count_ahead(main_code_root, f"{remote}/{target}")
+            if main_ahead > 0:
+                wt = main_code_root
+                ahead = main_ahead
 
         if self.git.is_rebase_in_progress(wt):
             raise LandingGateError(
@@ -956,11 +1422,6 @@ class KanbanEngine:
                 f"Worktree {wt} has uncommitted changes. Commit or clean them before calling `done`."
             )
 
-        remote = entry.effective_remote(ctx.board)
-        target = entry.effective_branch(ctx.board)
-        check_cmd = entry.effective_check(ctx.board)
-        self.git.fetch_branch(wt, remote, target)
-        ahead = self.git.commit_count_ahead(wt, f"{remote}/{target}")
         if ahead == 0 and not allow_empty:
             raise LandingGateError(
                 f"No commits ahead of `{remote}/{target}` in {wt} "
@@ -1045,6 +1506,26 @@ class KanbanEngine:
             self.github.close_issue(entry.owner, entry.repo, issue_number)
             closed = True
 
+        # Auto-unblock downstream tickets whose dependencies are now 100% Done
+        unblocked_nums: list[int] = []
+        if ticket:
+            ticket.column = Column.DONE
+            ticket.state = "CLOSED"
+        populate_dependency_waves(tickets)
+        for other in tickets:
+            if other.number == issue_number or other.column == Column.DONE or other.state.upper() == "CLOSED":
+                continue
+            if issue_number in other.depends_on and not other.unmet_deps:
+                unblocked_nums.append(other.number)
+                if other.column == Column.BLOCKED and other.project_item_id:
+                    self.github.set_item_column(
+                        schema,
+                        other.project_item_id,
+                        Column.READY,
+                        ctx.board.columns,
+                    )
+                    other.column = Column.READY
+
         removed_wt = False
         if local_claim:
             state.remove_local_claim(entry.slug, issue_number)
@@ -1066,6 +1547,7 @@ class KanbanEngine:
             repo_alias=entry.alias if ctx.is_multi_repo else "",
             closed_issue=closed,
             worktree_removed=removed_wt,
+            unblocked_tickets=sorted(unblocked_nums),
         )
 
     def sync_claim_heartbeats_and_relays(
@@ -1410,6 +1892,13 @@ class KanbanEngine:
             author=str(raw.get("author") or ""),
             assignees=[str(a) for a in (raw.get("assignees") or [])],
             labels=[str(lbl) for lbl in (raw.get("labels") or [])],
+            priority=str(raw.get("priority") or ""),
+            milestone=str(raw.get("milestone") or ""),
+            target_repo=str(raw.get("target_repo") or ""),
+            depends_on=[int(x) for x in (raw.get("depends_on") or [])],
+            blocks=[int(x) for x in (raw.get("blocks") or [])],
+            unmet_deps=[int(x) for x in (raw.get("unmet_deps") or [])],
+            wave=int(raw.get("wave") or 0),
             column=col,
             status_name=str(raw.get("status_name") or ""),
             project_item_id=str(raw.get("project_item_id") or ""),

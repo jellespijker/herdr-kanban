@@ -18,11 +18,17 @@ workspaces (`[repos.<alias>]` in `.herdr-kanban.toml`), prefix tickets with the 
 (`firmware#10`, `cloud#42`).
 
 ```bash
-herdr-kanban board                       # overview of columns, active claims, and file overlaps
-herdr-kanban list --column ready         # unclaimed Ready tickets (optional: --repo cloud)
-herdr-kanban show 42                     # or: herdr-kanban show cloud#42
-herdr-kanban inbox --ack                 # check & acknowledge messages from sibling/colleague agents
+herdr-kanban board                                     # overview of columns, priorities, waves, labels, and claims
+herdr-kanban list --column ready --unblocked           # unblocked Ready tickets safe to claim in parallel now
+herdr-kanban list -l domain:rt-control -p P0           # filter by facet label and Project Priority
+herdr-kanban show 42                                   # inspect priority, milestone, labels, deps, and claim
+herdr-kanban inbox --ack                               # check & acknowledge messages from sibling/colleague agents
 ```
+
+If `.herdr-kanban.toml` sets `issues_repo = "<repo>"`, all GitHub Issues, labels, priorities, and
+milestones live in that central repository while `--repo <alias>` controls which child repository's
+Git worktree is branched, checked, and landed. Run `herdr-kanban sync-labels` to provision configured
+`[taxonomy.facets.*]` labels, milestones, and Project v2 `Priority` options.
 
 Inside a multi-repo ticket worktree, read-only symlinks to sibling repositories are available under
 `.siblings/<alias>/` (automatically excluded from `git status`) so you can inspect cross-repo
@@ -51,11 +57,25 @@ Deposit them into `Triage` instead so a human can promote them to `Ready`:
 
 ```bash
 herdr-kanban deposit "Fix race in token refresh" \
+  --repo auth-service \
   --body "Observed unlocked read when refreshing expired session." \
   --parent 42 \
-  --file-line "src/auth/refresh.py:88"
+  --file-line "src/auth/refresh.py:88" \
+  -l domain:som -l type:bug -l trl:production -l access:internal \
+  -p P1 -m "Onboard the teams" \
+  --depends-on 41
 ```
-*(In multi-repo workspaces, pass `--repo <alias>` when depositing into a specific child repo, e.g. `--repo cloud --parent firmware#10`.)*
+
+Triage or update labels, Project `Priority`, `Milestone`, target repo, and dependency DAG links in place:
+
+```bash
+herdr-kanban triage 42 \
+  -l domain:rt-control -l type:feature -l trl:experimental -l access:proprietary \
+  -p P0 -m "Onboard the teams" \
+  --depends-on 40 --blocks 45 \
+  --ready
+```
+*(When `[taxonomy.facets.*]` sets `required_for_ready = true` or `require_priority_for_ready = true`, `triage --ready` and `deposit --ready` validate that all required facets and priority are present before promoting to `Ready`. Tickets with unfinished `--depends-on` blockers cannot be claimed until upstream dependencies reach `Done`.)*
 
 Update your live claim status in place (edits your single claim comment—zero comment spam):
 

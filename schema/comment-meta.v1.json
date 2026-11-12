@@ -17,6 +17,7 @@
         "pane_id": { "type": "string" },
         "machine": { "type": "string" },
         "branch": { "type": "string" },
+        "target_repo": { "type": "string" },
         "state": { "enum": ["active", "review_ready", "released", "completed"] },
         "risk_gate": { "type": "boolean" },
         "started_at": { "type": "string" },
@@ -54,10 +55,13 @@
         "type": { "const": "deposit" },
         "parent_issue": { "type": ["integer", "null"] },
         "parent_repo": { "type": "string" },
+        "target_repo": { "type": "string" },
         "file_line": { "type": "string" },
         "branch": { "type": "string" },
         "commit_sha": { "type": "string" },
-        "deposited_by": { "type": "string", "minLength": 1 }
+        "deposited_by": { "type": "string", "minLength": 1 },
+        "depends_on": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "blocks": { "type": "array", "items": { "type": "integer", "minimum": 1 } }
       },
       "additionalProperties": false
     }

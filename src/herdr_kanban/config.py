@@ -67,6 +67,17 @@ class RepoEntry:
 
 
 @dataclass(slots=True)
+class FacetSpec:
+    name: str
+    prefix: str
+    required_for_ready: bool = False
+    multiple: bool = True
+    color: str = "ededed"
+    description: str = ""
+    values: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class BoardConfig:
     project_owner: str
     project_number: int
@@ -74,6 +85,7 @@ class BoardConfig:
     repo_owner: str = ""
     repo_name: str = ""
     default_repo: str = ""
+    issues_repo: str = ""
     remote: str = "origin"
     check_command: str = ""
     lease_ttl_minutes: int = 30
@@ -81,6 +93,11 @@ class BoardConfig:
     auto_ready_deposits: bool = False
     close_issue_on_done: bool = True
     label_filter: str = ""
+    priority_field: str = "Priority"
+    priorities: list[str] = field(default_factory=list)
+    require_priority_for_ready: bool = False
+    milestones: list[str] = field(default_factory=list)
+    facets: dict[str, FacetSpec] = field(default_factory=dict)
     trusted_authors: list[str] = field(default_factory=list)
     columns: dict[str, str] = field(
         default_factory=lambda: {col.value: title for col, title in COLUMN_TITLES.items()}
@@ -135,6 +152,29 @@ class BoardConfig:
                         check_command=str(entry.get("check_command") or "").strip(),
                     )
 
+        facets_map: dict[str, FacetSpec] = {}
+        taxonomy_raw = data.get("taxonomy")
+        raw_facets = taxonomy_raw.get("facets") if isinstance(taxonomy_raw, dict) else None
+        if isinstance(raw_facets, dict):
+            for fname, fentry in raw_facets.items():
+                if not isinstance(fentry, dict):
+                    continue
+                prefix = str(fentry.get("prefix") or f"{fname}:").strip()
+                color = str(fentry.get("color") or "ededed").strip().lstrip("#") or "ededed"
+                vals = [str(v).strip() for v in (fentry.get("values") or []) if str(v).strip()]
+                facets_map[str(fname)] = FacetSpec(
+                    name=str(fname),
+                    prefix=prefix,
+                    required_for_ready=bool(fentry.get("required_for_ready", False)),
+                    multiple=bool(fentry.get("multiple", True)),
+                    color=color,
+                    description=str(fentry.get("description") or "").strip(),
+                    values=vals,
+                )
+
+        priorities = [str(p).strip() for p in (board.get("priorities") or []) if str(p).strip()]
+        milestones = [str(m).strip() for m in (board.get("milestones") or []) if str(m).strip()]
+
         return cls(
             project_owner=project_owner,
             project_number=project_number,
@@ -142,6 +182,7 @@ class BoardConfig:
             repo_owner=str(board.get("repo_owner") or "").strip(),
             repo_name=str(board.get("repo_name") or "").strip(),
             default_repo=str(board.get("default_repo") or "").strip(),
+            issues_repo=str(board.get("issues_repo") or "").strip(),
             remote=str(board.get("remote") or "origin").strip() or "origin",
             check_command=str(board.get("check_command") or "").strip(),
             lease_ttl_minutes=max(5, int(board.get("lease_ttl_minutes") or 30)),
@@ -149,6 +190,11 @@ class BoardConfig:
             auto_ready_deposits=bool(board.get("auto_ready_deposits", False)),
             close_issue_on_done=bool(board.get("close_issue_on_done", True)),
             label_filter=str(board.get("label_filter") or "").strip(),
+            priority_field=str(board.get("priority_field") or "Priority").strip() or "Priority",
+            priorities=priorities,
+            require_priority_for_ready=bool(board.get("require_priority_for_ready", False)),
+            milestones=milestones,
+            facets=facets_map,
             trusted_authors=[str(u).strip() for u in (board.get("trusted_authors") or []) if str(u).strip()],
             columns=cols,
             repos=repos_map,
@@ -251,9 +297,24 @@ def load_board_config(
     return cfg
 
 
+def _detect_env_agent_kind() -> str:
+    env_agent = (os.environ.get("HERDR_KANBAN_AGENT") or "").strip()
+    if env_agent:
+        return env_agent
+    if os.environ.get("ANTIGRAVITY_AGENT") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+        return "agy"
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "claude"
+    if os.environ.get("OPENCODE"):
+        return "opencode"
+    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_CI"):
+        return "codex"
+    return ""
+
+
 def load_user_settings() -> UserSettings:
     raw = _read_toml(user_settings_path())
-    agent = str(raw.get("default_agent_kind") or os.environ.get("HERDR_KANBAN_AGENT") or "claude").strip()
+    agent = str(_detect_env_agent_kind() or raw.get("default_agent_kind") or "claude").strip()
     return UserSettings(
         default_agent_kind=agent,
         worktree_root=str(raw.get("worktree_root") or "").strip(),
@@ -302,6 +363,8 @@ def render_board_config_toml(cfg: BoardConfig) -> str:
         lines.append(f"repo_name = {_toml_quote(cfg.repo_name)}")
     if cfg.default_repo:
         lines.append(f"default_repo = {_toml_quote(cfg.default_repo)}")
+    if cfg.issues_repo:
+        lines.append(f"issues_repo = {_toml_quote(cfg.issues_repo)}")
     if cfg.check_command:
         lines.append(f"check_command = {_toml_quote(cfg.check_command)}")
     lines.extend(
@@ -314,6 +377,16 @@ def render_board_config_toml(cfg: BoardConfig) -> str:
     )
     if cfg.label_filter:
         lines.append(f"label_filter = {_toml_quote(cfg.label_filter)}")
+    if cfg.priority_field and cfg.priority_field != "Priority":
+        lines.append(f"priority_field = {_toml_quote(cfg.priority_field)}")
+    if cfg.priorities:
+        prios = ", ".join(_toml_quote(p) for p in cfg.priorities)
+        lines.append(f"priorities = [{prios}]")
+    if cfg.require_priority_for_ready:
+        lines.append("require_priority_for_ready = true")
+    if cfg.milestones:
+        ms = ", ".join(_toml_quote(m) for m in cfg.milestones)
+        lines.append(f"milestones = [{ms}]")
     if cfg.trusted_authors:
         authors = ", ".join(_toml_quote(a) for a in cfg.trusted_authors)
         lines.append(f"trusted_authors = [{authors}]")
@@ -322,6 +395,22 @@ def render_board_config_toml(cfg: BoardConfig) -> str:
     for col in Column:
         name = cfg.columns.get(col.value, COLUMN_TITLES[col])
         lines.append(f"{col.value} = {_toml_quote(name)}")
+
+    for fname, fspec in cfg.facets.items():
+        vals = ", ".join(_toml_quote(v) for v in fspec.values)
+        lines.extend(
+            [
+                "",
+                f"[taxonomy.facets.{fname}]",
+                f"prefix = {_toml_quote(fspec.prefix)}",
+                f"required_for_ready = {'true' if fspec.required_for_ready else 'false'}",
+                f"multiple = {'true' if fspec.multiple else 'false'}",
+                f"color = {_toml_quote(fspec.color)}",
+            ]
+        )
+        if fspec.description:
+            lines.append(f"description = {_toml_quote(fspec.description)}")
+        lines.append(f"values = [{vals}]")
 
     for alias, entry in cfg.repos.items():
         lines.extend(

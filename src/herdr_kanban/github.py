@@ -18,6 +18,7 @@ from .model import (
     decode_meta,
     is_lease_expired,
     match_column,
+    populate_dependency_waves,
     populate_file_overlaps,
     resolve_winning_claim,
 )
@@ -55,6 +56,8 @@ class ProjectSchema:
     url: str
     status_field_id: str
     options_by_name: dict[str, str] = field(default_factory=dict)  # exact option name -> optionId
+    priority_field_id: str = ""
+    priority_options_by_name: dict[str, str] = field(default_factory=dict)
 
     def option_id_for_column(self, col: Column, column_map: dict[str, str]) -> str | None:
         preferred = column_map.get(col.value, "")
@@ -64,6 +67,18 @@ class ProjectSchema:
                     return opt_id
         for opt_name, opt_id in self.options_by_name.items():
             if match_column(opt_name, column_map) == col:
+                return opt_id
+        return None
+
+    def option_id_for_priority(self, priority: str) -> str | None:
+        target = priority.strip().lower()
+        if not target:
+            return None
+        for opt_name, opt_id in self.priority_options_by_name.items():
+            if opt_name.lower() == target:
+                return opt_id
+        for opt_name, opt_id in self.priority_options_by_name.items():
+            if opt_name.lower().startswith(target):
                 return opt_id
         return None
 
@@ -99,7 +114,7 @@ def default_gh_runner(args: list[str], stdin_data: str | None = None) -> subproc
 
 
 PROJECT_BOARD_QUERY = """
-query($owner: String!, $number: Int!, $cursor: String) {
+query($owner: String!, $number: Int!, $cursor: String, $priorityField: String!) {
   repositoryOwner(login: $owner) {
     login
     ... on Organization {
@@ -130,6 +145,16 @@ fragment ProjectFields on ProjectV2 {
       }
     }
   }
+  priorityField: field(name: $priorityField) {
+    ... on ProjectV2SingleSelectField {
+      id
+      name
+      options {
+        id
+        name
+      }
+    }
+  }
   items(first: 100, after: $cursor) {
     pageInfo {
       hasNextPage
@@ -138,6 +163,12 @@ fragment ProjectFields on ProjectV2 {
     nodes {
       id
       fieldValueByName(name: "Status") {
+        ... on ProjectV2ItemFieldSingleSelectValue {
+          name
+          optionId
+        }
+      }
+      priorityValue: fieldValueByName(name: $priorityField) {
         ... on ProjectV2ItemFieldSingleSelectValue {
           name
           optionId
@@ -154,7 +185,11 @@ fragment ProjectFields on ProjectV2 {
           updatedAt
           author { login }
           assignees(first: 10) { nodes { login } }
-          labels(first: 15) { nodes { name } }
+          labels(first: 25) { nodes { name } }
+          milestone {
+            number
+            title
+          }
           repository {
             name
             owner { login }
@@ -335,6 +370,7 @@ class GitHubClient:
         repo_name: str = "",
         column_map: dict[str, str],
         label_filter: str = "",
+        priority_field: str = "Priority",
         allowed_repos: dict[tuple[str, str], str] | None = None,
     ) -> tuple[ProjectSchema, list[Ticket]]:
         cursor: str | None = None
@@ -344,7 +380,12 @@ class GitHubClient:
         while True:
             data = self.graphql(
                 PROJECT_BOARD_QUERY,
-                {"owner": project_owner, "number": project_number, "cursor": cursor},
+                {
+                    "owner": project_owner,
+                    "number": project_number,
+                    "cursor": cursor,
+                    "priorityField": priority_field or "Priority",
+                },
             )
             owner_node = data.get("repositoryOwner") or {}
             proj = owner_node.get("projectV2")
@@ -361,6 +402,12 @@ class GitHubClient:
                     for opt in (status_field.get("options") or [])
                     if isinstance(opt, dict) and opt.get("name") and opt.get("id")
                 }
+                prio_field = proj.get("priorityField") or {}
+                prio_options = {
+                    str(opt["name"]): str(opt["id"])
+                    for opt in (prio_field.get("options") or [])
+                    if isinstance(opt, dict) and opt.get("name") and opt.get("id")
+                }
                 schema = ProjectSchema(
                     project_id=str(proj["id"]),
                     number=int(proj["number"]),
@@ -368,6 +415,8 @@ class GitHubClient:
                     url=str(proj.get("url") or ""),
                     status_field_id=str(status_field.get("id") or ""),
                     options_by_name=options,
+                    priority_field_id=str(prio_field.get("id") or ""),
+                    priority_options_by_name=prio_options,
                 )
 
             items_conn = proj.get("items") or {}
@@ -409,6 +458,14 @@ class GitHubClient:
                 if str(issue.get("state") or "").upper() == "CLOSED" and col != Column.DONE:
                     col = Column.DONE
 
+                prio_val = node.get("priorityValue") or {}
+                priority_name = str(prio_val.get("name") or "")
+
+                milestone_node = issue.get("milestone") or {}
+                milestone_title = (
+                    str(milestone_node.get("title") or "") if isinstance(milestone_node, dict) else ""
+                )
+
                 comments_conn = issue.get("comments") or {}
                 raw_comments = [
                     {
@@ -434,6 +491,10 @@ class GitHubClient:
                     if raw_body_meta and raw_body_meta.get("type") == "deposit"
                     else None
                 )
+                target_repo = (
+                    (claim_meta.target_repo if claim_meta and claim_meta.target_repo else "")
+                    or (deposit.target_repo if deposit and deposit.target_repo else "")
+                )
 
                 assignees = [
                     str(a["login"])
@@ -450,6 +511,9 @@ class GitHubClient:
                         author=str((issue.get("author") or {}).get("login") or ""),
                         assignees=assignees,
                         labels=labels,
+                        priority=priority_name,
+                        milestone=milestone_title,
+                        target_repo=target_repo,
                         column=col,
                         status_name=status_name,
                         project_item_id=str(node["id"]),
@@ -472,6 +536,7 @@ class GitHubClient:
                 break
 
         assert schema is not None
+        populate_dependency_waves(tickets)
         populate_file_overlaps(tickets)
         tickets.sort(key=lambda t: (t.repo_alias or t.repo_name, t.number))
         return schema, tickets
@@ -499,6 +564,80 @@ class GitHubClient:
         )
         return True
 
+    def set_item_priority(
+        self,
+        schema: ProjectSchema,
+        project_item_id: str,
+        priority: str,
+    ) -> bool:
+        if not schema.priority_field_id or not project_item_id:
+            return False
+        option_id = schema.option_id_for_priority(priority)
+        if not option_id:
+            return False
+        self.graphql(
+            SET_STATUS_MUTATION,
+            {
+                "projectId": schema.project_id,
+                "itemId": project_item_id,
+                "fieldId": schema.priority_field_id,
+                "optionId": option_id,
+            },
+        )
+        return True
+
+    def ensure_single_select_options(
+        self,
+        field_id: str,
+        field_name: str,
+        desired_options: list[str],
+        existing_options: dict[str, str],
+    ) -> list[str]:
+        """Ensure a ProjectV2 single-select field contains `desired_options`."""
+        if not field_id or not desired_options:
+            return []
+        existing_lc = {k.lower() for k in existing_options}
+        missing = [opt for opt in desired_options if opt.lower() not in existing_lc]
+        if not missing:
+            return []
+        palette = ("RED", "ORANGE", "YELLOW", "BLUE", "GREEN", "PURPLE", "GRAY", "PINK")
+        merged_names = list(existing_options.keys()) + missing
+        options_input = [
+            {
+                "name": name,
+                "color": palette[idx % len(palette)],
+                "description": f"Priority {name}",
+            }
+            for idx, name in enumerate(merged_names)
+        ]
+        mutation = """
+        mutation($fieldId: ID!, $name: String!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
+          updateProjectV2Field(
+            input: {
+              fieldId: $fieldId
+              name: $name
+              singleSelectOptions: $options
+            }
+          ) {
+            projectV2Field {
+              ... on ProjectV2SingleSelectField {
+                id
+                options { id name }
+              }
+            }
+          }
+        }
+        """
+        self.graphql(
+            mutation,
+            {
+                "fieldId": field_id,
+                "name": field_name,
+                "options": options_input,
+            },
+        )
+        return missing
+
     def create_issue(
         self,
         owner: str,
@@ -506,11 +645,115 @@ class GitHubClient:
         title: str,
         body: str = "",
         labels: list[str] | None = None,
+        milestone_number: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"title": title, "body": body}
         if labels:
             payload["labels"] = labels
+        if milestone_number is not None:
+            payload["milestone"] = milestone_number
         return self._gh_json(["api", "-X", "POST", f"repos/{owner}/{repo}/issues"], payload=payload)
+
+    def update_issue(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        labels: list[str] | None = None,
+        milestone_number: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if title is not None:
+            payload["title"] = title
+        if body is not None:
+            payload["body"] = body
+        if labels is not None:
+            payload["labels"] = labels
+        if milestone_number is not None:
+            payload["milestone"] = milestone_number if milestone_number > 0 else None
+        if not payload:
+            return self.get_issue(owner, repo, number)
+        return self._gh_json(
+            ["api", "-X", "PATCH", f"repos/{owner}/{repo}/issues/{number}"],
+            payload=payload,
+        )
+
+    def list_labels(self, owner: str, repo: str) -> dict[str, dict[str, str]]:
+        raw = self._gh_json(["api", f"repos/{owner}/{repo}/labels?per_page=100"])
+        if not isinstance(raw, list):
+            return {}
+        return {
+            str(item["name"]): {
+                "name": str(item["name"]),
+                "color": str(item.get("color") or "").lower(),
+                "description": str(item.get("description") or ""),
+            }
+            for item in raw
+            if isinstance(item, dict) and item.get("name")
+        }
+
+    def upsert_label(
+        self,
+        owner: str,
+        repo: str,
+        name: str,
+        color: str,
+        description: str = "",
+        existing: dict[str, dict[str, str]] | None = None,
+    ) -> str:
+        clean_color = color.strip().lstrip("#").lower() or "ededed"
+        desc = description[:100]
+        known = existing if existing is not None else self.list_labels(owner, repo)
+        cur = known.get(name)
+        if cur is None:
+            self._gh_json(
+                ["api", "-X", "POST", f"repos/{owner}/{repo}/labels"],
+                payload={"name": name, "color": clean_color, "description": desc},
+            )
+            return "created"
+        if cur.get("color") != clean_color or (desc and cur.get("description") != desc):
+            self._gh_json(
+                ["api", "-X", "PATCH", f"repos/{owner}/{repo}/labels/{name}"],
+                payload={"new_name": name, "color": clean_color, "description": desc},
+            )
+            return "updated"
+        return "unchanged"
+
+    def list_milestones(self, owner: str, repo: str) -> dict[str, int]:
+        raw = self._gh_json(["api", f"repos/{owner}/{repo}/milestones?state=all&per_page=100"])
+        if not isinstance(raw, list):
+            return {}
+        out: dict[str, int] = {}
+        for item in raw:
+            if isinstance(item, dict) and item.get("title") and item.get("number"):
+                title = str(item["title"]).strip()
+                num = int(item["number"])
+                out[title.lower()] = num
+        return out
+
+    def ensure_milestone(
+        self,
+        owner: str,
+        repo: str,
+        title: str,
+        description: str = "",
+        existing: dict[str, int] | None = None,
+    ) -> tuple[int, str]:
+        known = existing if existing is not None else self.list_milestones(owner, repo)
+        key = title.strip().lower()
+        if key in known:
+            return known[key], "unchanged"
+        created = self._gh_json(
+            ["api", "-X", "POST", f"repos/{owner}/{repo}/milestones"],
+            payload={"title": title.strip(), "description": description},
+        )
+        num = int(created["number"])
+        if existing is not None:
+            existing[key] = num
+        return num, "created"
 
     def add_issue_to_project(self, project_id: str, issue_node_id: str) -> str:
         data = self.graphql(ADD_ITEM_MUTATION, {"projectId": project_id, "contentId": issue_node_id})

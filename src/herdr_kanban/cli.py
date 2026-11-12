@@ -279,9 +279,74 @@ def cmd_sync_repos(args: argparse.Namespace, engine: KanbanEngine) -> int:
     return EXIT_OK
 
 
+def cmd_sync_labels(args: argparse.Namespace, engine: KanbanEngine) -> int:
+    ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
+    res = engine.sync_labels(ctx)
+    if args.json:
+        return _emit_json(res)
+    print(f"Synchronized taxonomy in {res['issues_repo']}:")
+    for lbl in res["labels"]:
+        print(f"  [label:{lbl['status']:<9}] {lbl['name']} (#{lbl['color']})")
+    for ms in res["milestones"]:
+        print(f"  [milestone:{ms['status']:<5}] #{ms['number']} {ms['title']}")
+    if res["added_priorities"]:
+        print(f"  [priority:added]  {', '.join(res['added_priorities'])}")
+    return EXIT_OK
+
+
+def _filter_tickets(
+    ctx: Any,
+    engine: KanbanEngine,
+    tickets: list[Any],
+    *,
+    repo: str | None = None,
+    column: str | None = None,
+    unclaimed: bool = False,
+    unblocked: bool = False,
+    labels: list[str] | None = None,
+    priority: str | None = None,
+    milestone: str | None = None,
+) -> list[Any]:
+    out = list(tickets)
+    if repo:
+        entry = engine.resolve_repo_entry(ctx, repo)
+        key = (entry.owner.lower(), entry.repo.lower())
+        out = [
+            t
+            for t in out
+            if t.target_repo == entry.alias or t.repo_key() == key or t.repo_alias == entry.alias
+        ]
+    if column:
+        col = Column(column)
+        out = [t for t in out if t.column == col]
+    if unclaimed:
+        out = [t for t in out if not (t.claim and t.claim.state in ("active", "review_ready"))]
+    if unblocked:
+        out = [t for t in out if not t.unmet_deps]
+    if labels:
+        req_labels = set(engine.normalize_labels(ctx, labels))
+        out = [t for t in out if req_labels.issubset(set(t.labels))]
+    if priority:
+        p_lc = priority.strip().lower()
+        out = [t for t in out if t.priority.lower() == p_lc or t.priority.lower().startswith(p_lc)]
+    if milestone:
+        m_lc = milestone.strip().lower()
+        out = [t for t in out if m_lc in t.milestone.lower()]
+    return engine.sort_tickets_for_display(ctx, out)
+
+
 def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    schema, tickets = engine.refresh_board(ctx)
+    schema, all_tickets = engine.refresh_board(ctx)
+    tickets = _filter_tickets(
+        ctx,
+        engine,
+        all_tickets,
+        labels=getattr(args, "label", None),
+        priority=getattr(args, "priority", None),
+        milestone=getattr(args, "milestone", None),
+        unblocked=bool(getattr(args, "unblocked", False)),
+    )
     if args.json:
         payload: dict[str, Any] = {
             "repo": ctx.display_name if ctx.is_multi_repo else f"{ctx.repo_owner}/{ctx.repo_name}",
@@ -308,6 +373,19 @@ def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
             continue
         for t in col_tickets:
             tags: list[str] = []
+            if t.priority:
+                tags.append(t.priority)
+            if t.target_repo and t.target_repo != t.repo_alias:
+                tags.append(f"repo:{t.target_repo}")
+            if t.milestone:
+                tags.append(f"ms:{t.milestone}")
+            if t.unmet_deps:
+                deps_s = ",".join(f"#{d}" for d in t.unmet_deps)
+                tags.append(f"deps:{deps_s}")
+            elif col == Column.READY and (t.depends_on or t.blocks):
+                tags.append(f"wave:{t.wave}")
+            if t.labels:
+                tags.extend(t.labels)
             if t.claim and t.claim.state in ("active", "review_ready"):
                 tags.append(f"@{t.claim.owner}:{t.claim.agent_kind}")
             if t.stale:
@@ -322,22 +400,27 @@ def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
 def cmd_list(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    _, tickets = engine.refresh_board(ctx)
-    if args.repo:
-        entry = engine.resolve_repo_entry(ctx, args.repo)
-        key = (entry.owner.lower(), entry.repo.lower())
-        tickets = [t for t in tickets if t.repo_key() == key or t.repo_alias == entry.alias]
-    if args.column:
-        col = Column(args.column)
-        tickets = [t for t in tickets if t.column == col]
-    if args.unclaimed:
-        tickets = [t for t in tickets if not (t.claim and t.claim.state in ("active", "review_ready"))]
+    _, all_tickets = engine.refresh_board(ctx)
+    tickets = _filter_tickets(
+        ctx,
+        engine,
+        all_tickets,
+        repo=args.repo,
+        column=args.column,
+        unclaimed=args.unclaimed,
+        unblocked=getattr(args, "unblocked", False),
+        labels=getattr(args, "label", None),
+        priority=getattr(args, "priority", None),
+        milestone=getattr(args, "milestone", None),
+    )
     if args.json:
         return _emit_json({"tickets": [t.to_dict() for t in tickets]})
     for t in tickets:
         holder = f"@{t.claim.owner}" if t.claim and t.claim.state in ("active", "review_ready") else "-"
         ref_lbl = t.ref(ctx.is_multi_repo)
-        print(f"{ref_lbl:<10} [{t.column.value:<11}] {holder:<16} {t.title}")
+        prio_lbl = f"[{t.priority}]" if t.priority else "[-]"
+        wave_lbl = f"deps:{','.join(f'#{d}' for d in t.unmet_deps)}" if t.unmet_deps else f"wave:{t.wave}"
+        print(f"{ref_lbl:<14} [{t.column.value:<11}] {prio_lbl:<6} {wave_lbl:<10} {holder:<16} {t.title}")
     return EXIT_OK
 
 
@@ -367,6 +450,20 @@ def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
     print(f"{disp} {ticket.title}  [{ticket.column.value}]")
     if ticket.url:
         print(f"URL: {ticket.url}")
+    if ticket.priority:
+        print(f"Priority: {ticket.priority}")
+    if ticket.milestone:
+        print(f"Milestone: {ticket.milestone}")
+    if ticket.target_repo:
+        print(f"Target repository: {ticket.target_repo}")
+    if ticket.labels:
+        print(f"Labels: {', '.join(ticket.labels)}")
+    if ticket.depends_on:
+        unmet_set = set(ticket.unmet_deps)
+        dep_parts = [f"#{d} (OPEN)" if d in unmet_set else f"#{d} (done)" for d in ticket.depends_on]
+        print(f"Depends on: {', '.join(dep_parts)}  [wave {ticket.wave}]")
+    if ticket.blocks:
+        print(f"Blocks: {', '.join(f'#{b}' for b in ticket.blocks)}")
     if ticket.claim and ticket.claim.state in ("active", "review_ready"):
         stale_lbl = " (STALE)" if ticket.stale else ""
         print(
@@ -394,6 +491,8 @@ def cmd_claim(args: argparse.Namespace, engine: KanbanEngine) -> int:
         agent_kind=args.kind,
         risk_gate=args.risk_gate,
         takeover=args.takeover,
+        repo_selector=getattr(args, "repo", None),
+        force=bool(getattr(args, "force", False)),
     )
     if args.json:
         return _emit_json(
@@ -460,6 +559,12 @@ def cmd_deposit(args: argparse.Namespace, engine: KanbanEngine) -> int:
         file_line=args.file_line or "",
         ready=args.ready,
         repo_selector=args.repo,
+        labels=getattr(args, "label", None),
+        priority=getattr(args, "priority", "") or "",
+        milestone=getattr(args, "milestone", "") or "",
+        depends_on=getattr(args, "depends_on", None),
+        blocks=getattr(args, "blocks", None),
+        force=bool(getattr(args, "force", False)),
     )
     if args.json:
         return _emit_json({"ticket": ticket.to_dict()})
@@ -470,11 +575,61 @@ def cmd_deposit(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
 def cmd_triage(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    col = Column.READY if args.ready else Column(args.column)
-    ticket = engine.move_ticket(ctx, args.issue, col)
+    col: Column | None = None
+    if args.ready:
+        col = Column.READY
+    elif args.column:
+        col = Column(args.column)
+
+    has_mutation = any(
+        (
+            col is not None,
+            getattr(args, "label", None),
+            getattr(args, "rm_label", None),
+            getattr(args, "priority", None) is not None,
+            getattr(args, "milestone", None) is not None,
+            getattr(args, "repo", None) is not None,
+            getattr(args, "depends_on", None),
+            getattr(args, "rm_depends_on", None),
+            getattr(args, "blocks", None),
+            getattr(args, "rm_blocks", None),
+        )
+    )
+    if not has_mutation:
+        raise KanbanError(
+            "Pass at least one triage change (`--ready`, `--column`, `--label/-l`, "
+            "`--priority/-p`, `--milestone/-m`, `--repo`, `--depends-on`, or `--blocks`)."
+        )
+
+    ticket = engine.triage_ticket(
+        ctx,
+        args.issue,
+        column=col,
+        add_labels=getattr(args, "label", None),
+        rm_labels=getattr(args, "rm_label", None),
+        priority=getattr(args, "priority", None),
+        milestone=getattr(args, "milestone", None),
+        target_repo=getattr(args, "repo", None),
+        add_depends_on=getattr(args, "depends_on", None),
+        rm_depends_on=getattr(args, "rm_depends_on", None),
+        add_blocks=getattr(args, "blocks", None),
+        rm_blocks=getattr(args, "rm_blocks", None),
+        force=bool(getattr(args, "force", False)),
+    )
     if args.json:
         return _emit_json({"ticket": ticket.to_dict()})
-    print(f"Moved {ticket.ref(ctx.is_multi_repo)} to {ticket.column.value}.")
+    details: list[str] = [f"column={ticket.column.value}"]
+    if ticket.priority:
+        details.append(f"priority={ticket.priority}")
+    if ticket.milestone:
+        details.append(f"milestone='{ticket.milestone}'")
+    if ticket.target_repo:
+        details.append(f"target_repo={ticket.target_repo}")
+    if ticket.labels:
+        details.append(f"labels=[{', '.join(ticket.labels)}]")
+    if ticket.depends_on:
+        details.append(f"depends_on=[{', '.join(f'#{d}' for d in ticket.depends_on)}]")
+    print(f"Triaged {ticket.ref(ctx.is_multi_repo)}: {', '.join(details)}")
     return EXIT_OK
 
 
@@ -587,6 +742,7 @@ def cmd_done(args: argparse.Namespace, engine: KanbanEngine) -> int:
                 "commit_sha": res.commit_sha,
                 "closed_issue": res.closed_issue,
                 "worktree_removed": res.worktree_removed,
+                "unblocked_tickets": res.unblocked_tickets,
             }
         )
     disp = res.ref()
@@ -599,6 +755,9 @@ def cmd_done(args: argparse.Namespace, engine: KanbanEngine) -> int:
     else:
         closed_msg = ", GitHub Issue closed" if res.closed_issue else ""
         print(f"Landed {disp} (`{res.commit_sha[:8]}`) onto `{res.target_branch}`{closed_msg}.")
+        if res.unblocked_tickets:
+            unb = ", ".join(f"#{n}" for n in res.unblocked_tickets)
+            print(f"Newly unblocked downstream tickets (ready for parallel execution): {unb}")
     return EXIT_OK
 
 
@@ -815,17 +974,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--json", action="store_true", help="Output JSON")
     p_sync.add_argument("--wait", action="store_true", help=argparse.SUPPRESS)
 
+    # sync-labels
+    p_lbl = sub.add_parser(
+        "sync-labels",
+        help="Synchronize configured [taxonomy.facets.*] labels, milestones, and Project Priority options",
+    )
+    p_lbl.add_argument("--cwd", help="Umbrella or repository directory")
+    p_lbl.add_argument("--json", action="store_true", help="Output JSON")
+
     # board
     p_board = sub.add_parser("board", help="Show full Kanban board summary")
     p_board.add_argument("--cwd", help="Repository or umbrella directory")
+    p_board.add_argument("-l", "--label", action="append", help="Filter by label or facet=value (repeatable)")
+    p_board.add_argument("-p", "--priority", help="Filter by Project Priority")
+    p_board.add_argument("-m", "--milestone", help="Filter by Milestone title")
+    p_board.add_argument("--unblocked", action="store_true", help="Only tickets with zero open dependencies")
     p_board.add_argument("--json", action="store_true", help="Output JSON")
 
     # list
     p_list = sub.add_parser("list", help="List tickets on the board")
     p_list.add_argument("--cwd", help="Repository or umbrella directory")
-    p_list.add_argument("--repo", help="Filter by repository alias in multi-repo workspaces")
+    p_list.add_argument("--repo", help="Filter by target or issue repository alias")
     p_list.add_argument("--column", choices=[c.value for c in Column], help="Filter by logical column")
     p_list.add_argument("--unclaimed", action="store_true", help="Only unclaimed tickets")
+    p_list.add_argument("--unblocked", action="store_true", help="Only tickets with zero open dependencies")
+    p_list.add_argument("-l", "--label", action="append", help="Filter by label or facet=value (repeatable)")
+    p_list.add_argument("-p", "--priority", help="Filter by Project Priority")
+    p_list.add_argument("-m", "--milestone", help="Filter by Milestone title")
     p_list.add_argument("--json", action="store_true", help="Output JSON")
 
     # show
@@ -838,9 +1013,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_claim = sub.add_parser("claim", help="Claim a ticket and prepare an isolated local worktree")
     p_claim.add_argument("issue", help="Ticket reference (`42` or `repo#42`)")
     p_claim.add_argument("--cwd", help="Repository or umbrella directory")
+    p_claim.add_argument("--repo", help="Override target code repository for the worktree")
     p_claim.add_argument("--kind", help="Agent kind label")
     p_claim.add_argument("--risk-gate", action="store_true", help="Require human Review approval before push")
     p_claim.add_argument("--takeover", action="store_true", help="Explicitly reclaim a STALE lease")
+    p_claim.add_argument("--force", action="store_true", help="Bypass open dependency blocker guard")
     p_claim.add_argument("--json", action="store_true", help="Output JSON")
 
     # dispatch
@@ -864,20 +1041,51 @@ def build_parser() -> argparse.ArgumentParser:
     # deposit
     p_dep = sub.add_parser("deposit", help="Deposit a newly discovered bug or task into Triage")
     p_dep.add_argument("title", help="Issue title")
-    p_dep.add_argument("--repo", help="Target repository alias in multi-repo workspaces")
+    p_dep.add_argument("--repo", help="Target code repository alias in multi-repo workspaces")
     p_dep.add_argument("--body", help="Markdown description")
     p_dep.add_argument("--parent", help="Parent ticket (`42` or `repo#42`) where this was discovered")
     p_dep.add_argument("--file-line", help="Source location, e.g. `src/auth.py:42`")
+    p_dep.add_argument("-l", "--label", action="append", help="Label or facet=value (repeatable)")
+    p_dep.add_argument("-p", "--priority", help="Project Priority option (e.g. P0, P1, P2, P3)")
+    p_dep.add_argument("-m", "--milestone", help="Milestone title")
+    p_dep.add_argument("--depends-on", action="append", help="Upstream blocker ticket ref (repeatable)")
+    p_dep.add_argument(
+        "--blocks",
+        action="append",
+        help="Downstream ticket ref blocked by this ticket (repeatable)",
+    )
     p_dep.add_argument("--ready", action="store_true", help="Place directly in Ready instead of Triage")
+    p_dep.add_argument("--force", action="store_true", help="Bypass Ready-gate taxonomy check")
     p_dep.add_argument("--cwd", help="Repository or umbrella directory")
     p_dep.add_argument("--json", action="store_true", help="Output JSON")
 
     # triage
-    p_tri = sub.add_parser("triage", help="Move a ticket between columns (e.g. promote Triage -> Ready)")
+    p_tri = sub.add_parser(
+        "triage",
+        help="Update a ticket's column, labels, priority, milestone, target repo, or dependency DAG",
+    )
     p_tri.add_argument("issue", help="Ticket reference (`42` or `repo#42`)")
-    grp = p_tri.add_mutually_exclusive_group(required=True)
+    grp = p_tri.add_mutually_exclusive_group(required=False)
     grp.add_argument("--ready", action="store_true", help="Promote to Ready")
     grp.add_argument("--column", choices=[c.value for c in Column], help="Target column")
+    p_tri.add_argument("-l", "--label", action="append", help="Add/set label or facet=value (repeatable)")
+    p_tri.add_argument("--rm-label", action="append", help="Remove label (repeatable)")
+    p_tri.add_argument("-p", "--priority", help="Set Project Priority option (e.g. P0, P1, P2, P3)")
+    p_tri.add_argument("-m", "--milestone", help="Set Milestone title (pass '' to clear)")
+    p_tri.add_argument("--repo", help="Set target code repository alias")
+    p_tri.add_argument("--depends-on", action="append", help="Add upstream blocker ticket ref (repeatable)")
+    p_tri.add_argument(
+        "--rm-depends-on",
+        action="append",
+        help="Remove upstream blocker ticket ref (repeatable)",
+    )
+    p_tri.add_argument("--blocks", action="append", help="Add downstream blocked ticket ref (repeatable)")
+    p_tri.add_argument(
+        "--rm-blocks",
+        action="append",
+        help="Remove downstream blocked ticket ref (repeatable)",
+    )
+    p_tri.add_argument("--force", action="store_true", help="Bypass Ready-gate taxonomy validation")
     p_tri.add_argument("--cwd", help="Repository or umbrella directory")
     p_tri.add_argument("--json", action="store_true", help="Output JSON")
 
@@ -965,6 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
 HANDLERS = {
     "init": cmd_init,
     "sync-repos": cmd_sync_repos,
+    "sync-labels": cmd_sync_labels,
     "board": cmd_board,
     "list": cmd_list,
     "show": cmd_show,

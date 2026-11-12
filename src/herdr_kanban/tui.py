@@ -135,7 +135,10 @@ class BoardTUI:
 
     def group_tickets(self, idx: int) -> list[Ticket]:
         _, cols = UI_GROUPS[idx]
-        return [t for t in self.tickets if t.column in cols]
+        filtered = [t for t in self.tickets if t.column in cols]
+        if self.ctx:
+            return self.engine.sort_tickets_for_display(self.ctx, filtered)
+        return filtered
 
     def selected_ticket(self) -> Ticket | None:
         group = self.group_tickets(self.col_idx)
@@ -380,6 +383,13 @@ class BoardTUI:
 
         skey = self._state_key(ticket)
         badges: list[str] = []
+        if ticket.priority:
+            badges.append(terminal.yellow(ticket.priority))
+        if ticket.target_repo and ticket.target_repo != ticket.repo_alias:
+            badges.append(terminal.cyan(f"[{ticket.target_repo}]"))
+        if ticket.unmet_deps:
+            deps_str = ",".join(f"#{d}" for d in ticket.unmet_deps[:2])
+            badges.append(terminal.red(f"⏳{deps_str}"))
         if skey in self.local_claims:
             lc = self.local_claims[skey]
             badges.append(terminal.green(f"●local:{lc.agent_kind}"))
@@ -445,8 +455,23 @@ class BoardTUI:
         lines = [sep, hdr]
 
         meta_parts: list[str] = []
-        if self.ctx and self.ctx.is_multi_repo and ticket.repo_owner and ticket.repo_name:
+        if ticket.priority:
+            meta_parts.append(f"Prio: {terminal.yellow(ticket.priority)}")
+        if ticket.milestone:
+            meta_parts.append(f"Milestone: {terminal.cyan(ticket.milestone)}")
+        if ticket.target_repo:
+            meta_parts.append(f"Target: {terminal.green(ticket.target_repo)}")
+        elif self.ctx and self.ctx.is_multi_repo and ticket.repo_owner and ticket.repo_name:
             meta_parts.append(terminal.dim(f"{ticket.repo_owner}/{ticket.repo_name}"))
+        if ticket.depends_on:
+            unmet_set = set(ticket.unmet_deps)
+            dep_str = ", ".join(
+                terminal.red(f"#{d}") if d in unmet_set else terminal.green(f"#{d}")
+                for d in ticket.depends_on
+            )
+            meta_parts.append(f"Deps: {dep_str} (wave {ticket.wave})")
+        if ticket.blocks:
+            meta_parts.append("Blocks: " + ", ".join(f"#{b}" for b in ticket.blocks))
         if ticket.claim and ticket.claim.state in ("active", "review_ready"):
             holder = f"@{ticket.claim.owner} ({ticket.claim.agent_kind})"
             if skey in self.local_claims and self.local_claims[skey].pane_id:

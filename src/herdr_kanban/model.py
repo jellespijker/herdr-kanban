@@ -125,6 +125,7 @@ class ClaimMeta:
     pane_id: str = ""
     machine: str = ""
     branch: str = ""
+    target_repo: str = ""
     risk_gate: bool = False
     touched_files: list[str] = field(default_factory=list)
     checklist: list[str] = field(default_factory=list)
@@ -147,6 +148,7 @@ class ClaimMeta:
             "pane_id": self.pane_id,
             "machine": self.machine,
             "branch": self.branch,
+            "target_repo": self.target_repo,
             "risk_gate": self.risk_gate,
             "touched_files": list(self.touched_files),
             "checklist": list(self.checklist),
@@ -170,6 +172,7 @@ class ClaimMeta:
             pane_id=str(raw.get("pane_id") or ""),
             machine=str(raw.get("machine") or ""),
             branch=str(raw.get("branch") or ""),
+            target_repo=str(raw.get("target_repo") or ""),
             risk_gate=bool(raw.get("risk_gate", False)),
             touched_files=[str(p) for p in raw.get("touched_files") or []],
             checklist=[str(c) for c in raw.get("checklist") or []],
@@ -225,8 +228,11 @@ class DepositMeta:
     branch: str
     parent_issue: int | None = None
     parent_repo: str = ""
+    target_repo: str = ""
     file_line: str = ""
     commit_sha: str = ""
+    depends_on: list[int] = field(default_factory=list)
+    blocks: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -240,6 +246,12 @@ class DepositMeta:
         }
         if self.parent_repo:
             data["parent_repo"] = self.parent_repo
+        if self.target_repo:
+            data["target_repo"] = self.target_repo
+        if self.depends_on:
+            data["depends_on"] = sorted({int(x) for x in self.depends_on if int(x) >= 1})
+        if self.blocks:
+            data["blocks"] = sorted({int(x) for x in self.blocks if int(x) >= 1})
         return data
 
     @classmethod
@@ -249,8 +261,11 @@ class DepositMeta:
             branch=str(raw.get("branch") or ""),
             parent_issue=int(raw["parent_issue"]) if raw.get("parent_issue") is not None else None,
             parent_repo=str(raw.get("parent_repo") or ""),
+            target_repo=str(raw.get("target_repo") or ""),
             file_line=str(raw.get("file_line") or ""),
             commit_sha=str(raw.get("commit_sha") or ""),
+            depends_on=[int(x) for x in (raw.get("depends_on") or []) if int(x) >= 1],
+            blocks=[int(x) for x in (raw.get("blocks") or []) if int(x) >= 1],
         )
 
 
@@ -324,6 +339,8 @@ def render_relay_comment(relay: RelayMeta, message: str) -> str:
 def render_deposit_body(body: str, deposit: DepositMeta) -> str:
     parts = [body.strip()] if body.strip() else []
     context_lines = ["---", "**Deposited via `herdr-kanban`**"]
+    if deposit.target_repo:
+        context_lines.append(f"- Target repository: `{deposit.target_repo}`")
     if deposit.parent_issue:
         ref = (
             f"{deposit.parent_repo}#{deposit.parent_issue}"
@@ -331,6 +348,12 @@ def render_deposit_body(body: str, deposit: DepositMeta) -> str:
             else f"#{deposit.parent_issue}"
         )
         context_lines.append(f"- Discovered while working on: {ref}")
+    if deposit.depends_on:
+        deps_str = ", ".join(f"#{n}" for n in sorted(set(deposit.depends_on)))
+        context_lines.append(f"- Depends on: {deps_str}")
+    if deposit.blocks:
+        blocks_str = ", ".join(f"#{n}" for n in sorted(set(deposit.blocks)))
+        context_lines.append(f"- Blocks: {blocks_str}")
     if deposit.file_line:
         context_lines.append(f"- Location: `{deposit.file_line}`")
     if deposit.branch:
@@ -392,6 +415,13 @@ class Ticket:
     author: str = ""
     assignees: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
+    priority: str = ""
+    milestone: str = ""
+    target_repo: str = ""
+    depends_on: list[int] = field(default_factory=list)
+    blocks: list[int] = field(default_factory=list)
+    unmet_deps: list[int] = field(default_factory=list)
+    wave: int = 0
     column: Column = Column.TRIAGE
     status_name: str = ""
     project_item_id: str = ""
@@ -415,6 +445,15 @@ class Ticket:
     def repo_key(self) -> tuple[str, str]:
         return (self.repo_owner.lower(), self.repo_name.lower())
 
+    def code_scope_key(self) -> tuple[str, str]:
+        if self.target_repo:
+            return ("target", self.target_repo.lower())
+        if self.claim and self.claim.target_repo:
+            return ("target", self.claim.target_repo.lower())
+        if self.deposit and self.deposit.target_repo:
+            return ("target", self.deposit.target_repo.lower())
+        return self.repo_key()
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "number": self.number,
@@ -422,12 +461,19 @@ class Ticket:
             "repo_owner": self.repo_owner,
             "repo_name": self.repo_name,
             "repo_alias": self.repo_alias,
+            "target_repo": self.target_repo,
             "body": strip_meta(self.body),
             "state": self.state,
             "url": self.url,
             "author": self.author,
             "assignees": list(self.assignees),
             "labels": list(self.labels),
+            "priority": self.priority,
+            "milestone": self.milestone,
+            "depends_on": list(self.depends_on),
+            "blocks": list(self.blocks),
+            "unmet_deps": list(self.unmet_deps),
+            "wave": self.wave,
             "column": str(self.column),
             "status_name": self.status_name,
             "project_item_id": self.project_item_id,
@@ -441,8 +487,160 @@ class Ticket:
         }
 
 
+_DEPENDS_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:depends\s+on|blocked\s+by)\s*:\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_BLOCKS_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?blocks\s*:\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ISSUE_TOKEN_RE = re.compile(r"(?:[A-Za-z0-9_.-]+)?#(\d+)\b")
+
+
+def parse_body_dependencies(
+    body: str | None,
+    deposit: DepositMeta | None = None,
+) -> tuple[list[int], list[int]]:
+    """Extract `(depends_on, blocks)` issue numbers from DepositMeta and Markdown body lines."""
+    deps: set[int] = set(deposit.depends_on) if deposit else set()
+    blocks: set[int] = set(deposit.blocks) if deposit else set()
+    clean = strip_meta(body)
+    for match in _DEPENDS_LINE_RE.finditer(clean):
+        for tok in _ISSUE_TOKEN_RE.finditer(match.group(1)):
+            num = int(tok.group(1))
+            if num >= 1:
+                deps.add(num)
+    for match in _BLOCKS_LINE_RE.finditer(clean):
+        for tok in _ISSUE_TOKEN_RE.finditer(match.group(1)):
+            num = int(tok.group(1))
+            if num >= 1:
+                blocks.add(num)
+    return sorted(deps), sorted(blocks)
+
+
+def detect_dependency_cycle(edges: dict[int, set[int]]) -> list[int] | None:
+    """Return a cycle path `[a, b, ..., a]` if `edges` (`node -> depends_on_set`) has a cycle."""
+    state_map: dict[int, int] = {}  # 0=unvisited, 1=visiting, 2=done
+    stack: list[int] = []
+
+    def dfs(node: int) -> list[int] | None:
+        state_map[node] = 1
+        stack.append(node)
+        for nxt in sorted(edges.get(node, set())):
+            st = state_map.get(nxt, 0)
+            if st == 1:
+                idx = stack.index(nxt)
+                return [*stack[idx:], nxt]
+            if st == 0:
+                cyc = dfs(nxt)
+                if cyc is not None:
+                    return cyc
+        stack.pop()
+        state_map[node] = 2
+        return None
+
+    for n in sorted(edges):
+        if state_map.get(n, 0) == 0:
+            res = dfs(n)
+            if res is not None:
+                return res
+    return None
+
+
+def populate_dependency_waves(tickets: list[Ticket]) -> None:
+    """Synchronize bidirectional `depends_on` / `blocks`, compute `unmet_deps`, and topological `wave`."""
+    by_num: dict[int, Ticket] = {t.number: t for t in tickets}
+    deps_map: dict[int, set[int]] = {}
+    blocks_map: dict[int, set[int]] = {}
+
+    for t in tickets:
+        parsed_deps, parsed_blocks = parse_body_dependencies(t.body, t.deposit)
+        deps_map.setdefault(t.number, set()).update(d for d in parsed_deps if d != t.number)
+        blocks_map.setdefault(t.number, set()).update(b for b in parsed_blocks if b != t.number)
+
+    # Synchronize bidirectional edges: if A blocks B, then B depends_on A; if B depends_on A, A blocks B.
+    for num, b_set in list(blocks_map.items()):
+        for blocked_num in b_set:
+            if blocked_num != num:
+                deps_map.setdefault(blocked_num, set()).add(num)
+    for num, d_set in list(deps_map.items()):
+        for dep_num in d_set:
+            if dep_num != num:
+                blocks_map.setdefault(dep_num, set()).add(num)
+
+    def is_done(num: int) -> bool:
+        other = by_num.get(num)
+        if other is None:
+            return False
+        return other.column == Column.DONE or other.state.upper() == "CLOSED"
+
+    wave_cache: dict[int, int] = {}
+    visiting: set[int] = set()
+
+    def compute_wave(num: int) -> int:
+        if num in wave_cache:
+            return wave_cache[num]
+        if num in visiting:
+            return 0
+        visiting.add(num)
+        unmet = [d for d in sorted(deps_map.get(num, set())) if not is_done(d)]
+        if not unmet:
+            w = 0
+        else:
+            w = 1 + max(compute_wave(d) for d in unmet)
+        visiting.remove(num)
+        wave_cache[num] = w
+        return w
+
+    for t in tickets:
+        d_sorted = sorted(deps_map.get(t.number, set()))
+        b_sorted = sorted(blocks_map.get(t.number, set()))
+        t.depends_on = d_sorted
+        t.blocks = b_sorted
+        t.unmet_deps = [d for d in d_sorted if not is_done(d)]
+        t.wave = 0 if (t.column == Column.DONE or t.state.upper() == "CLOSED") else compute_wave(t.number)
+
+
+def validate_ready_gate(
+    ticket_labels: list[str],
+    priority: str,
+    facets: dict[str, Any],
+    require_priority: bool = False,
+) -> list[str]:
+    """Validate that a ticket satisfies all `required_for_ready` taxonomy facets and priority."""
+    errors: list[str] = []
+    if require_priority and not priority.strip():
+        errors.append("missing Project Priority (set via `--priority / -p`)")
+    for facet_name, spec in facets.items():
+        prefix = getattr(spec, "prefix", "") or ""
+        req = bool(getattr(spec, "required_for_ready", False))
+        multiple = bool(getattr(spec, "multiple", True))
+        allowed_values = list(getattr(spec, "values", []) or [])
+        if not prefix:
+            continue
+        matched = [lbl for lbl in ticket_labels if lbl.startswith(prefix)]
+        if req and not matched:
+            examples = ", ".join(f"{prefix}{v}" for v in allowed_values[:4])
+            hint = f" (e.g. {examples})" if examples else ""
+            errors.append(f"missing required `{prefix}*` label for facet '{facet_name}'{hint}")
+        if not multiple and len(matched) > 1:
+            errors.append(
+                f"facet '{facet_name}' allows only a single `{prefix}*` label, got: {', '.join(matched)}"
+            )
+        if allowed_values:
+            valid_full = {f"{prefix}{v}" for v in allowed_values}
+            invalid = [lbl for lbl in matched if lbl not in valid_full]
+            if invalid:
+                errors.append(
+                    f"invalid `{prefix}*` label(s) {', '.join(invalid)} "
+                    f"(allowed: {', '.join( sorted(valid_full) )})"
+                )
+    return errors
+
+
 def populate_file_overlaps(tickets: list[Ticket]) -> None:
-    """Populate `ticket.overlaps` in-place, scoped per repository."""
+    """Populate `ticket.overlaps` in-place, scoped per code repository."""
     active = [
         t
         for t in tickets
@@ -457,7 +655,11 @@ def populate_file_overlaps(tickets: list[Ticket]) -> None:
         mine = set(t_claim.claim.touched_files)
         hits: list[FileOverlap] = []
         for other in active:
-            if other.repo_key() != ticket.repo_key() or other.number == ticket.number or other.claim is None:
+            if (
+                other.code_scope_key() != ticket.code_scope_key()
+                or (other.repo_key() == ticket.repo_key() and other.number == ticket.number)
+                or other.claim is None
+            ):
                 continue
             shared = sorted(mine & set(other.claim.touched_files))
             if shared:

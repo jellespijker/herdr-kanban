@@ -12,6 +12,7 @@
         "repo_owner": { "type": "string" },
         "repo_name": { "type": "string" },
         "default_repo": { "type": "string" },
+        "issues_repo": { "type": "string" },
         "project_owner": { "type": "string", "minLength": 1 },
         "project_number": { "type": "integer", "minimum": 1 },
         "target_branch": { "type": "string", "minLength": 1 },
@@ -22,7 +23,33 @@
         "auto_ready_deposits": { "type": "boolean", "default": false },
         "close_issue_on_done": { "type": "boolean", "default": true },
         "label_filter": { "type": "string" },
+        "priority_field": { "type": "string", "default": "Priority" },
+        "priorities": { "type": "array", "items": { "type": "string" } },
+        "require_priority_for_ready": { "type": "boolean", "default": false },
+        "milestones": { "type": "array", "items": { "type": "string" } },
         "trusted_authors": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "taxonomy": {
+      "type": "object",
+      "properties": {
+        "facets": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["prefix", "values"],
+            "properties": {
+              "prefix": { "type": "string", "minLength": 1 },
+              "required_for_ready": { "type": "boolean", "default": false },
+              "multiple": { "type": "boolean", "default": true },
+              "color": { "type": "string" },
+              "description": { "type": "string" },
+              "values": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            },
+            "additionalProperties": false
+          }
+        }
       },
       "additionalProperties": false
     },
