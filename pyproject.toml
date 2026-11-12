@@ -1,0 +1,97 @@
+# Development tooling only. At runtime the plugin requires only Python 3.11+
+# standard library plus external `git`, `gh`, and `herdr` CLIs (ADR-0006).
+
+[project]
+name = "herdr-kanban"
+version = "0.1.0"
+description = "Herdr plugin: multi-colleague, multi-agent Kanban collaboration on a shared GitHub branch."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "import-linter>=2", "jsonschema>=4"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["SIM105", "SIM108"]
+
+[tool.importlinter]
+root_package = "herdr_kanban"
+
+[[tool.importlinter.contracts]]
+name = "Pure domain and config layers import no adapters or surfaces (spec §7)"
+type = "forbidden"
+source_modules = ["herdr_kanban.model", "herdr_kanban.config"]
+forbidden_modules = [
+    "herdr_kanban.github",
+    "herdr_kanban.git_ops",
+    "herdr_kanban.herdr",
+    "herdr_kanban.engine",
+    "herdr_kanban.daemon",
+    "herdr_kanban.tui",
+    "herdr_kanban.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "GitHub adapter is isolated from Git, Herdr, TUI, and daemon (ADR-0006)"
+type = "forbidden"
+source_modules = ["herdr_kanban.github"]
+forbidden_modules = [
+    "herdr_kanban.git_ops",
+    "herdr_kanban.herdr",
+    "herdr_kanban.engine",
+    "herdr_kanban.daemon",
+    "herdr_kanban.tui",
+    "herdr_kanban.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "Git adapter is isolated from GitHub, Herdr, TUI, and daemon (ADR-0006)"
+type = "forbidden"
+source_modules = ["herdr_kanban.git_ops"]
+forbidden_modules = [
+    "herdr_kanban.github",
+    "herdr_kanban.herdr",
+    "herdr_kanban.engine",
+    "herdr_kanban.daemon",
+    "herdr_kanban.tui",
+    "herdr_kanban.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "Herdr adapter is isolated from GitHub, Git, TUI, and daemon (ADR-0006)"
+type = "forbidden"
+source_modules = ["herdr_kanban.herdr"]
+forbidden_modules = [
+    "herdr_kanban.github",
+    "herdr_kanban.git_ops",
+    "herdr_kanban.engine",
+    "herdr_kanban.daemon",
+    "herdr_kanban.tui",
+    "herdr_kanban.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "Terminal primitives know nothing about GitHub, Git, or engine (spec §7)"
+type = "forbidden"
+source_modules = ["herdr_kanban.terminal"]
+forbidden_modules = [
+    "herdr_kanban.github",
+    "herdr_kanban.git_ops",
+    "herdr_kanban.engine",
+    "herdr_kanban.daemon",
+    "herdr_kanban.cli",
+]

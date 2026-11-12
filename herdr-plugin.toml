@@ -1,0 +1,135 @@
+# herdr-plugin.toml — manifest for herdr-kanban. See docs/spec.md.
+#
+# Multi-colleague, multi-agent Kanban workflow on a shared GitHub branch,
+# backed by GitHub Projects v2 and Issues with ephemeral per-ticket worktrees.
+
+id = "herdr-kanban"
+name = "Kanban"
+version = "0.1.0"
+description = "Collaborate with colleagues and multiple coding agents on one shared branch through GitHub Projects v2 and Issues."
+min_herdr_version = "0.9.3"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+[[actions]]
+id = "open"
+title = "Kanban: open board tab"
+contexts = ["workspace", "pane", "global"]
+command = ["bin/herdr-kanban", "open"]
+
+[[actions]]
+id = "open-popup"
+title = "Kanban: open quick popup board"
+contexts = ["workspace", "pane", "global"]
+command = ["bin/herdr-kanban", "popup", "board-popup"]
+
+[[actions]]
+id = "open-split"
+title = "Kanban: open board beside this pane"
+contexts = ["pane", "workspace"]
+command = ["bin/herdr-kanban", "open", "--placement", "split"]
+
+[[actions]]
+id = "init"
+title = "Kanban: connect branch to GitHub Project"
+contexts = ["workspace", "pane"]
+command = ["bin/herdr-kanban", "popup", "init"]
+
+[[actions]]
+id = "install-skill"
+title = "Kanban: install skill and CLI for all agents"
+contexts = ["workspace", "global"]
+command = ["bin/herdr-kanban", "install-skill", "--notify"]
+
+[[actions]]
+id = "uninstall-skill"
+title = "Kanban: remove skill and CLI links"
+contexts = ["workspace", "global"]
+command = ["bin/herdr-kanban", "install-skill", "--uninstall", "--notify"]
+
+[[actions]]
+id = "setup-keys"
+title = "Kanban: add keybinding (prefix+shift+k opens the board)"
+contexts = ["workspace", "global"]
+command = ["bin/herdr-kanban", "setup-keys", "--notify"]
+
+[[actions]]
+id = "remove-keys"
+title = "Kanban: remove keybinding"
+contexts = ["workspace", "global"]
+command = ["bin/herdr-kanban", "setup-keys", "--remove", "--notify"]
+
+[[actions]]
+id = "doctor"
+title = "Kanban: check setup"
+contexts = ["workspace", "global"]
+command = ["bin/herdr-kanban", "popup", "doctor"]
+
+[[panes]]
+id = "board"
+title = "Kanban"
+placement = "tab"
+command = ["bin/herdr-kanban", "tui"]
+
+[[panes]]
+id = "board-split"
+title = "Kanban"
+placement = "split"
+command = ["bin/herdr-kanban", "tui", "--compact"]
+
+[[panes]]
+id = "board-popup"
+title = "Kanban"
+placement = "popup"
+width = "90%"
+height = "85%"
+command = ["bin/herdr-kanban", "tui"]
+
+[[panes]]
+id = "init"
+title = "Kanban: init"
+placement = "popup"
+width = 110
+height = "80%"
+command = ["bin/herdr-kanban", "init", "--interactive", "--wait"]
+
+[[panes]]
+id = "doctor"
+title = "Kanban: doctor"
+placement = "popup"
+width = 100
+height = "80%"
+command = ["bin/herdr-kanban", "doctor", "--wait"]
+
+[[panes]]
+id = "install-skill"
+title = "Kanban: install skill"
+placement = "popup"
+width = 120
+height = 16
+command = ["bin/herdr-kanban", "install-skill", "--wait"]
+
+[[panes]]
+id = "uninstall-skill"
+title = "Kanban: remove skill"
+placement = "popup"
+width = 120
+height = 16
+command = ["bin/herdr-kanban", "install-skill", "--uninstall", "--wait"]
+
+[[events]]
+on = "pane.closed"
+command = ["bin/herdr-kanban", "event"]
+
+[[events]]
+on = "pane.moved"
+command = ["bin/herdr-kanban", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bin/herdr-kanban", "event"]
+
+[[startup]]
+command = ["bin/herdr-kanban", "event"]

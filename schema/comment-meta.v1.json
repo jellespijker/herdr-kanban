@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jellespijker/herdr-kanban/schema/comment-meta.v1.json",
+  "title": "herdr-kanban embedded GitHub comment metadata v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["v", "type", "issue_number", "owner", "agent_kind", "state", "started_at", "heartbeat_at", "lease_until"],
+      "properties": {
+        "v": { "const": 1 },
+        "type": { "const": "claim" },
+        "issue_number": { "type": "integer", "minimum": 1 },
+        "owner": { "type": "string", "minLength": 1 },
+        "agent_kind": { "type": "string", "minLength": 1 },
+        "agent_name": { "type": "string" },
+        "herdr_session": { "type": "string" },
+        "pane_id": { "type": "string" },
+        "machine": { "type": "string" },
+        "branch": { "type": "string" },
+        "state": { "enum": ["active", "review_ready", "released", "completed"] },
+        "risk_gate": { "type": "boolean" },
+        "started_at": { "type": "string" },
+        "heartbeat_at": { "type": "string" },
+        "lease_until": { "type": "string" },
+        "touched_files": { "type": "array", "items": { "type": "string" } },
+        "checklist": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" },
+        "takeover_of": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["v", "type", "from_owner", "to_issue", "created_at"],
+      "properties": {
+        "v": { "const": 1 },
+        "type": { "const": "relay" },
+        "from_owner": { "type": "string", "minLength": 1 },
+        "from_agent": { "type": "string" },
+        "from_issue": { "type": ["integer", "null"] },
+        "to_issue": { "type": "integer", "minimum": 1 },
+        "to_owner": { "type": "string" },
+        "created_at": { "type": "string" },
+        "urgent": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["v", "type", "deposited_by", "branch"],
+      "properties": {
+        "v": { "const": 1 },
+        "type": { "const": "deposit" },
+        "parent_issue": { "type": ["integer", "null"] },
+        "file_line": { "type": "string" },
+        "branch": { "type": "string" },
+        "commit_sha": { "type": "string" },
+        "deposited_by": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

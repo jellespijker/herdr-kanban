@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main, release]
+  pull_request:
+    branches: [main, release]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Lint & module boundaries
+        run: |
+          uv sync
+          uv run ruff check src tests
+          PYTHONPATH=src uv run lint-imports
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Build & test
+        run: |
+          sh scripts/build.sh
+          uv sync
+          uv run pytest -q -rs

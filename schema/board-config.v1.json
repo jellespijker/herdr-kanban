@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jellespijker/herdr-kanban/schema/board-config.v1.json",
+  "title": "herdr-kanban .herdr-kanban.toml configuration v1",
+  "type": "object",
+  "required": ["board"],
+  "properties": {
+    "board": {
+      "type": "object",
+      "required": ["project_owner", "project_number", "target_branch"],
+      "properties": {
+        "repo_owner": { "type": "string" },
+        "repo_name": { "type": "string" },
+        "project_owner": { "type": "string", "minLength": 1 },
+        "project_number": { "type": "integer", "minimum": 1 },
+        "target_branch": { "type": "string", "minLength": 1 },
+        "remote": { "type": "string", "default": "origin" },
+        "check_command": { "type": "string" },
+        "lease_ttl_minutes": { "type": "integer", "minimum": 5, "default": 30 },
+        "require_review": { "type": "boolean", "default": false },
+        "auto_ready_deposits": { "type": "boolean", "default": false },
+        "close_issue_on_done": { "type": "boolean", "default": true },
+        "label_filter": { "type": "string" },
+        "trusted_authors": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "columns": {
+      "type": "object",
+      "properties": {
+        "triage": { "type": "string" },
+        "ready": { "type": "string" },
+        "in_progress": { "type": "string" },
+        "blocked": { "type": "string" },
+        "review": { "type": "string" },
+        "done": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
