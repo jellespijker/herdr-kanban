@@ -7,7 +7,7 @@ import re
 import tomllib
 from pathlib import Path
 
-DEFAULT_KEY = "prefix+shift+k"
+DEFAULT_KEY = "prefix+m"
 BEGIN = "# >>> herdr-kanban keys (managed by `herdr-kanban setup-keys`) >>>"
 END = "# <<< herdr-kanban keys <<<"
 ACTION = "herdr-kanban.open"
@@ -46,7 +46,7 @@ BUILTIN = {
     "prefix+shift+w",
     "prefix+shift+x",
 }
-SUGGESTIONS = ("prefix+shift+k", "prefix+m", "prefix+u", "prefix+y", "prefix+shift+b")
+SUGGESTIONS = ("prefix+m", "prefix+u", "prefix+y", "prefix+shift+b", "prefix+shift+k")
 
 
 def config_path() -> Path:

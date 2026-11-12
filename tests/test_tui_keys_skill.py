@@ -92,11 +92,11 @@ def test_setup_keys_conflict_detection_and_removal(tmp_path: Path) -> None:
     assert changed is False
     assert "already used" in msg
 
-    # Default `prefix+shift+k` succeeds cleanly
+    # Default `prefix+m` succeeds cleanly
     changed, msg = keys.setup(None, path=cfg)
     assert changed is True
-    assert "prefix+shift+k" in msg
-    assert keys.installed_key(cfg.read_text(encoding="utf-8")) == "prefix+shift+k"
+    assert "prefix+m" in msg
+    assert keys.installed_key(cfg.read_text(encoding="utf-8")) == "prefix+m"
 
     # Idempotent second call
     changed2, _ = keys.setup(None, path=cfg)

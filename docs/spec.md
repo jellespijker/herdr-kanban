@@ -155,7 +155,7 @@ config discovery checks both the current worktree root and the main checkout roo
 
 ### 6.1 Herdr TUI (`src/herdr_kanban/tui.py`)
 
-- **Default placement**: Dedicated workspace `tab` (`prefix+shift+k` or action `Kanban: open board tab`).
+- **Default placement**: Dedicated workspace `tab` (`prefix+m` or action `Kanban: open board tab`).
 - **Responsive layout**:
   - Width >= 110 cols: 5-column Kanban grid (`Triage`, `Ready`, `In Progress`, `Blocked / Review`,
     `Done`) above a rich ticket inspector (lease status, agent identity, overlap alerts, touched

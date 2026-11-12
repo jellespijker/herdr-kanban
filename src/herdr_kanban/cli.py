@@ -713,8 +713,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sk.add_argument("--notify", action="store_true")
     p_sk.add_argument("--wait", action="store_true", help=argparse.SUPPRESS)
 
-    p_keys = sub.add_parser("setup-keys", help="Add or remove `prefix+shift+k` in herdr config.toml")
-    p_keys.add_argument("--key", help="Custom key chord (default: prefix+shift+k)")
+    p_keys = sub.add_parser("setup-keys", help="Add or remove `prefix+m` in herdr config.toml")
+    p_keys.add_argument("--key", help="Custom key chord (default: prefix+m)")
     p_keys.add_argument("--remove", action="store_true")
     p_keys.add_argument("--notify", action="store_true")
 

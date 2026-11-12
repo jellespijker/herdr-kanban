@@ -51,7 +51,7 @@ command = ["bin/herdr-kanban", "install-skill", "--uninstall", "--notify"]
 
 [[actions]]
 id = "setup-keys"
-title = "Kanban: add keybinding (prefix+shift+k opens the board)"
+title = "Kanban: add keybinding (prefix+m opens the board)"
 contexts = ["workspace", "global"]
 command = ["bin/herdr-kanban", "setup-keys", "--notify"]
 

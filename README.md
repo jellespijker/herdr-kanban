@@ -70,7 +70,7 @@ Then run two one-time setup commands (or trigger them from Herdr's plugin action
 
 ```bash
 bin/herdr-kanban install-skill   # links SKILL.md + ~/.local/bin/herdr-kanban for Claude, agy, Codex, OpenCode
-bin/herdr-kanban setup-keys      # binds prefix+shift+k to open the Kanban board tab
+bin/herdr-kanban setup-keys      # binds prefix+m to open the Kanban board tab
 ```
 
 ---
@@ -84,7 +84,7 @@ bin/herdr-kanban setup-keys      # binds prefix+shift+k to open the Kanban board
    ```
    When your colleagues pull the branch, their `herdr-kanban` connects automatically.
 
-2. Open the Kanban board inside Herdr (`prefix+shift+k` or `herdr-kanban open`):
+2. Open the Kanban board inside Herdr (`prefix+m` or `herdr-kanban open`):
    - `h` / `l`: switch columns (`Triage`, `Ready`, `In Progress`, `Blocked / Review`, `Done`)
    - `j` / `k`: select ticket
    - `Enter` / `s`: claim & dispatch default coding agent in a fresh worktree tab
