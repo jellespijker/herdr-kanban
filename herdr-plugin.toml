@@ -5,7 +5,7 @@
 
 id = "herdr-kanban"
 name = "Kanban"
-version = "0.4.2"
+version = "0.4.5"
 description = "Collaborate with colleagues and multiple coding agents on one shared branch (single-repo or multi-repo umbrella) through GitHub Projects v2 and Issues in both the Herdr desktop app and the herdr TUI."
 min_herdr_version = "0.9.3"
 platforms = ["linux", "macos"]

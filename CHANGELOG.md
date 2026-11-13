@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.5 (2026-11-14)
+
+- **Plugin Manifest, Lockfile & Changelog Synchronization**:
+  - Synchronize `herdr-plugin.toml`, `pyproject.toml`, `src/herdr_kanban/__init__.py`, `uv.lock`, and `CHANGELOG.md` for the `v0.4.5` release.
+
+## 0.4.4 (2026-11-13)
+
+- **State-Driven Agent Lifecycle Inspector (`/impeccable distill` + `clarify`)**:
+  - Replace the static 10-button Inspector bar with a state-driven orchestration action bar (`Done` → zero action bar row; `isDepBlocked` → `Locked by #X — Jump to Blocker`; `Triage` → `Promote to Ready (t)` + inline `P0 | P1 | P2 | P3` priority selector; `Ready` → `Dispatch (<agent>) (s)` + 4-agent selector; `In Progress` → `Jump to Agent (f)` when live or `Resume Agent (<agent>) (s)` / `Takeover (<agent>) (s)` when stopped + `Steer Agent (c)` + `Approve & Land (a)` + `Unclaim`; `Review` → `Approve & Land (a)` + `Steer Agent (c)` + `Unclaim`).
+  - Eliminate ambiguous human-Jira buttons (`Worktree (f)`, `Move (t)`, `Comment (c)`, `Release`, top-bar `Inspector` and `Compact` toggles, and What's New `Board (b)` / `Open Tab` duplicates). Clicking the column or priority badge in Row 1 of the Inspector header toggles the manual override bar.
+- **Fixed What's New Rendering & Split-Pane Briefing Layout**:
+  - Fix GPUI `'transparent' is not a color value` and `AGENT_KINDS` errors in `renderWhatsNewView`.
+  - Stack the What's New body vertically with the **AI Executive Briefing (Markdown)** at the top when rendered inside narrower side split panes (`panelW < 660`) so `#whats-new-feed-pane` never collapses `#whats-new-md-pane`.
+- **Adaptive Full-Width Markdown Inspector & Stacked Deposit Form (`/impeccable layout`)**:
+  - Collapse the Inspector's 44%/56% 2-column split into **100% full-width Markdown** with inline facet and milestone badges whenever a ticket has no active claim or dependencies (including all `Done` tickets).
+  - Stack the `+ Deposit` modal inputs vertically (`Title` on its own full-width row above `Description + Create Ticket + Cancel`).
+- **Quieter Contextual Footer & Smart Active Filter (`/impeccable quieter`)**:
+  - Reduce footer keycaps to 3 contextual shortcuts (`hjkl nav | w what's new | n deposit` on Board; `s summarize | b board | r refresh` on What's New) and hide them automatically whenever a status/busy/error message is active.
+  - Default the Board filter to `Active` when active tickets exist (`activeCount > 0`) and automatically expand to `All (N)` when all tickets are in `Done`.
+
+## 0.4.3 (2026-11-13)
+
+- **Fast Headless What's New Summarization (`_run_headless_whats_new_llm`)**:
+  - Fix `KeyError: 'agent_kind'` in `generate_whats_new_summary` when reading contributor velocity records.
+  - Execute headless `claude -p --model haiku --tools "" --strict-mcp-config --setting-sources ""` in an isolated temporary directory so project-level hooks and MCP servers do not block summarization.
+  - Fix interactive fallback (`run("tab.new", { folder: tgt.cwd, ... })`) and cache resolved workspace CWD per space (`resolvedCwdBySpace`).
+
 ## 0.4.2 (2026-11-13)
 
 - **Deterministic Non-Overlapping Pill Layout (`renderChunkedPillRows` & Card Header Budget)**:
