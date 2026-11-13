@@ -8,6 +8,7 @@ esac
 
 chmod +x bin/herdr-kanban
 python3 bin/herdr-kanban install-skill --refresh || true
+python3 bin/herdr-kanban install-app-mod || true
 
 echo "herdr-kanban installed. Checking this machine:"
 python3 bin/herdr-kanban doctor --brief || true

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.7 (2026-11-14)
+
+- **Plugin Build Hook & Release Artifacts (`scripts/build.sh`)**:
+  - Automatically install/update the Herdr-App GPUI Kanban mod (`herdr-kanban install-app-mod`) during `scripts/build.sh` alongside `install-skill --refresh`, and attach wheel/sdist artifacts to GitHub Releases.
+
 ## 0.4.6 (2026-11-14)
 
 - **Mouse-Draggable Resizable, Full-Expandable & Hideable Detail Pane (`renderInspector` & `startInspectorResize`)**:
