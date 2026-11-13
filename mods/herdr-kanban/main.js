@@ -600,6 +600,7 @@ export default class KanbanBoard extends View {
       overrideSpaceId: null,
       showDrawer: true,
       drawerTall: false,
+      drawerHeight: 268,
       modalMode: null,
       resolvedCwdBySpace: {},
     });
@@ -635,6 +636,7 @@ export default class KanbanBoard extends View {
     this.selectedRef = null;
     this.showDrawer = bus.showDrawer !== false;
     this.drawerTall = Boolean(bus.drawerTall);
+    this.drawerHeight = Number(bus.drawerHeight) || 268;
     if (this.board) {
       this.syncSelectionAfterLoad();
     }
@@ -766,6 +768,7 @@ export default class KanbanBoard extends View {
       if (patch.overrideSpaceId !== undefined) v.overrideSpaceId = patch.overrideSpaceId;
       if (patch.showDrawer !== undefined) v.showDrawer = patch.showDrawer;
       if (patch.drawerTall !== undefined) v.drawerTall = patch.drawerTall;
+      if (patch.drawerHeight !== undefined) v.drawerHeight = patch.drawerHeight;
       if (patch.modalMode !== undefined) v.modalMode = patch.modalMode;
     }
     if (cx) cx.notify();
@@ -1082,12 +1085,26 @@ export default class KanbanBoard extends View {
     }
   }
 
+  maxDrawerHeight() {
+    const totalH = this.size?.height ?? 740;
+    const chromeH = 74 + 24 + (this.modalMode ? 64 : 0);
+    return Math.max(220, totalH - chromeH);
+  }
+
+  effectiveDrawerHeight() {
+    if (!this.showDrawer) return 28;
+    const maxH = this.maxDrawerHeight();
+    if (this.drawerTall) return maxH;
+    const target = Number(this.drawerHeight) || 268;
+    return Math.max(116, Math.min(Math.max(140, maxH - 76), target));
+  }
+
   boardViewportDims() {
     const byCol = this.ticketsByColumn();
     const { widths, offsets, totalW, viewW } = this.computeColumnLayout(byCol);
-    const drawerH = this.showDrawer ? (this.drawerTall ? 410 : 268) : 0;
-    const chromeH = 128 + drawerH + (this.modalMode ? 64 : 0);
-    const viewH = Math.max(150, (this.size?.height ?? 740) - chromeH);
+    const drawerH = this.effectiveDrawerHeight();
+    const chromeH = 102 + drawerH + (this.modalMode ? 64 : 0);
+    const viewH = Math.max(120, (this.size?.height ?? 740) - chromeH);
     let maxCards = 1;
     for (const col of COLUMNS) {
       const len = (byCol[col.id] || []).length;
@@ -1180,16 +1197,54 @@ export default class KanbanBoard extends View {
     };
   }
 
+  startInspectorResize(e, cx) {
+    cx.stop_propagation();
+    this.handle.focus();
+    if (e.button === "left" && (e.click_count ?? 1) >= 2) {
+      if (!this.showDrawer) {
+        this.syncBus({ showDrawer: true, drawerTall: false }, cx);
+      } else {
+        this.syncBus({ showDrawer: true, drawerTall: !this.drawerTall }, cx);
+      }
+      return;
+    }
+    this.justDragged = false;
+    this.drag = {
+      kind: "inspector",
+      startX: e.position.x,
+      startY: e.position.y,
+      origHeight: this.effectiveDrawerHeight(),
+      wasHidden: !this.showDrawer,
+      moved: false,
+    };
+    cx.notify();
+  }
+
   moveDrag(e, cx) {
     if (!this.drag) return;
     const dx = e.position.x - this.drag.startX;
     const dy = e.position.y - this.drag.startY;
-    if (!this.drag.moved && Math.hypot(dx, dy) > 5) {
+    const threshold = this.drag.kind === "inspector" ? 3 : 5;
+    if (!this.drag.moved && Math.hypot(dx, dy) > threshold) {
       this.drag.moved = true;
       this.justDragged = true;
     }
     if (!this.drag.moved) return;
-    if (this.drag.kind === "filter") {
+    if (this.drag.kind === "inspector") {
+      const rawH = Math.round(this.drag.origHeight - dy);
+      const maxH = this.maxDrawerHeight();
+      if (rawH < 72) {
+        this.syncBus({ showDrawer: false, drawerTall: false }, cx);
+      } else if (rawH >= maxH - 32) {
+        this.syncBus({ showDrawer: true, drawerTall: true }, cx);
+      } else {
+        const clamped = Math.max(116, Math.min(Math.max(140, maxH - 76), rawH));
+        this.syncBus(
+          { showDrawer: true, drawerTall: false, drawerHeight: clamped },
+          cx
+        );
+      }
+    } else if (this.drag.kind === "filter") {
       this.filterPanX = Math.min(0, Math.round(this.drag.origPanX + dx));
       cx.notify();
     } else {
@@ -3538,11 +3593,136 @@ export default class KanbanBoard extends View {
   }
 
   renderInspector(ticket, t) {
-    if (!this.showDrawer) return null;
-
-    const drawerH = this.drawerTall ? 410 : 268;
     const panelW = this.size?.width ?? 840;
     const isSplit = panelW >= 540;
+    const isResizing = Boolean(this.drag && this.drag.kind === "inspector");
+
+    if (!this.showDrawer) {
+      const dispCollapsed = ticket ? ticket.ref || `#${ticket.number}` : "";
+      const cleanCollapsed = ticket
+        ? parseTicketTitle(ticket).cleanTitle
+        : "Detail pane hidden — drag up or click Show";
+      const colLabelCollapsed = ticket
+        ? COLUMN_TITLE_BY_ID[ticket.column] || ticket.column
+        : "";
+      const colColorCollapsed = ticket ? columnAccent(ticket.column, t) : t.dim;
+
+      return h_flex()
+        .id("inspector-collapsed-bar")
+        .w_full()
+        .h(28)
+        .flex_none()
+        .items_center()
+        .justify_between()
+        .gap(8)
+        .px(12)
+        .bg(t.chrome || t.surface)
+        .border_t(2)
+        .border_color(isResizing ? t.accent : t.border)
+        .cursor_ns_resize()
+        .hover((s) => s.bg(t.hover))
+        .on_mouse_down("left", (e, cx) => this.startInspectorResize(e, cx))
+        .on_click((_ev, cx) => {
+          if (this.justDragged) {
+            this.justDragged = false;
+            return;
+          }
+          this.syncBus({ showDrawer: true, drawerTall: false }, cx);
+        })
+        .child(
+          h_flex()
+            .items_center()
+            .gap(6)
+            .min_w(0)
+            .flex_1()
+            .overflow_hidden()
+            .child(
+              div()
+                .w(24)
+                .h(3)
+                .rounded(2)
+                .flex_none()
+                .bg(isResizing ? t.accent : t.muted)
+            )
+            .when(Boolean(ticket), (d) =>
+              d
+                .child(
+                  div()
+                    .flex_none()
+                    .text_size(11)
+                    .font_semibold()
+                    .text_color(t.accent)
+                    .child(dispCollapsed)
+                )
+                .child(
+                  h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(4)
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(colColorCollapsed, "18") || t.background)
+                    .child(div().size(5).rounded_full().bg(colColorCollapsed))
+                    .child(
+                      div()
+                        .text_size(10)
+                        .font_semibold()
+                        .text_color(colColorCollapsed)
+                        .child(colLabelCollapsed)
+                    )
+                )
+                .when(Boolean(ticket && ticket.priority), (p) =>
+                  p.child(
+                    div()
+                      .flex_none()
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .bg(withAlpha(priorityColor(ticket.priority, t), "18") || t.background)
+                      .text_size(10)
+                      .font_semibold()
+                      .text_color(priorityColor(ticket.priority, t))
+                      .child(ticket.priority)
+                  )
+                )
+            )
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .text_size(11.5)
+                .text_color(ticket ? t.foreground : t.dim)
+                .truncate()
+                .child(cleanCollapsed)
+            )
+        )
+        .child(
+          h_flex()
+            .flex_none()
+            .items_center()
+            .gap(5)
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .child(
+              btn("insp-collapsed-show", "Show", t, {
+                small: true,
+                onClick: (_ev, cx) => {
+                  this.syncBus({ showDrawer: true, drawerTall: false }, cx);
+                },
+              })
+            )
+            .child(
+              btn("insp-collapsed-full", "Full", t, {
+                small: true,
+                onClick: (_ev, cx) => {
+                  this.syncBus({ showDrawer: true, drawerTall: true }, cx);
+                },
+              })
+            )
+        );
+    }
+
+    const drawerH = this.effectiveDrawerHeight();
 
     if (!ticket) {
       return v_flex()
@@ -3828,17 +4008,42 @@ export default class KanbanBoard extends View {
     }
 
     const showActionRow = leftActions.length > 0 || rightActions.length > 0;
+    const topBorderColor = isResizing
+      ? t.accent
+      : agentVis
+      ? agentVis.color
+      : isDepBlocked
+      ? blockedCol
+      : t.border;
 
     return v_flex()
       .id("ticket-inspector")
       .w_full()
-      .h(drawerH)
-      .min_h(0)
-      .flex_none()
+      .when(this.drawerTall, (el) => el.flex_1().h_full().min_h(0))
+      .when(!this.drawerTall, (el) => el.h(drawerH).min_h(0).flex_none())
       .bg(t.surface)
       .border_t(2)
-      .border_color(
-        agentVis ? agentVis.color : isDepBlocked ? blockedCol : t.border
+      .border_color(topBorderColor)
+      .child(
+        // Interactive Drag Resize Handle (drag up/down to resize, double-click to toggle Full Expand)
+        h_flex()
+          .id("inspector-resize-handle")
+          .w_full()
+          .h(7)
+          .flex_none()
+          .items_center()
+          .justify_center()
+          .bg(t.chrome || t.surface)
+          .cursor_ns_resize()
+          .hover((s) => s.bg(t.hover))
+          .on_mouse_down("left", (e, cx) => this.startInspectorResize(e, cx))
+          .child(
+            div()
+              .w(38)
+              .h(3)
+              .rounded(2)
+              .bg(isResizing ? t.accent : t.muted)
+          )
       )
       .child(
         // Contextual Inspector Header (1 row for Done tickets, 2 rows for active orchestration)
@@ -3847,18 +4052,21 @@ export default class KanbanBoard extends View {
           .flex_none()
           .gap(6)
           .px(12)
-          .py(7)
+          .pb(7)
+          .pt(2)
           .bg(t.chrome || t.surface)
           .border_b(1)
           .border_color(t.border)
           .child(
-            // Row 1: Issue Ref + Clickable Column/Priority Override Pills + Clean Title + Status Badge + Expand / Close
+            // Row 1: Issue Ref + Clickable Column/Priority Override Pills + Clean Title + Status Badge + Full / Hide
             h_flex()
               .w_full()
               .items_center()
               .justify_between()
               .gap(8)
               .overflow_hidden()
+              .cursor_ns_resize()
+              .on_mouse_down("left", (e, cx) => this.startInspectorResize(e, cx))
               .child(
                 h_flex()
                   .items_center()
@@ -3888,6 +4096,7 @@ export default class KanbanBoard extends View {
                       .when(this.modalMode === "triage", (el) =>
                         el.border_1().border_color(t.accent)
                       )
+                      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                       .on_click((_ev, cx) => {
                         this.modalMode = this.modalMode === "triage" ? null : "triage";
                         cx.notify();
@@ -3914,6 +4123,7 @@ export default class KanbanBoard extends View {
                         .text_size(10.5)
                         .font_semibold()
                         .text_color(priorityColor(ticket.priority, t))
+                        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                         .on_click((_ev, cx) => {
                           this.modalMode = this.modalMode === "triage" ? null : "triage";
                           cx.notify();
@@ -3953,6 +4163,7 @@ export default class KanbanBoard extends View {
                   .flex_none()
                   .items_center()
                   .gap(5)
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                   .when(isDepBlocked, (d) =>
                     d.child(
                       h_flex()
@@ -4005,20 +4216,20 @@ export default class KanbanBoard extends View {
                     )
                   )
                   .child(
-                    btn("insp-tall-toggle", this.drawerTall ? "Compact" : "Expand", t, {
+                    btn("insp-tall-toggle", this.drawerTall ? "Split" : "Full", t, {
                       small: true,
                       selected: this.drawerTall,
                       onClick: (_ev, cx) => {
-                        this.syncBus({ drawerTall: !this.drawerTall }, cx);
+                        this.syncBus({ showDrawer: true, drawerTall: !this.drawerTall }, cx);
                       },
                     })
                   )
                   .child(
-                    btn("insp-close", "", t, {
+                    btn("insp-close", "Hide", t, {
                       small: true,
                       iconPath: "mods/workspace-chrome/x.svg",
                       onClick: (_ev, cx) => {
-                        this.syncBus({ showDrawer: false }, cx);
+                        this.syncBus({ showDrawer: false, drawerTall: false }, cx);
                       },
                     })
                   )
@@ -4604,6 +4815,7 @@ export default class KanbanBoard extends View {
       this.overrideSpaceId = this.bus.overrideSpaceId;
       this.showDrawer = this.bus.showDrawer !== false;
       this.drawerTall = Boolean(this.bus.drawerTall);
+      if (this.bus.drawerHeight !== undefined) this.drawerHeight = this.bus.drawerHeight;
       if (this.bus.modalMode !== undefined) this.modalMode = this.bus.modalMode;
     }
 
@@ -4719,8 +4931,10 @@ export default class KanbanBoard extends View {
           )
           .when(Boolean(this.board && this.viewMode !== "whats_new"), (d) =>
             d
-              .child(this.renderBoardCanvas(byCol, selectedRef, t))
-              .when(Boolean(this.showDrawer), (col) => col.child(this.renderInspector(selected, t)))
+              .when(!this.showDrawer || !this.drawerTall, (col) =>
+                col.child(this.renderBoardCanvas(byCol, selectedRef, t))
+              )
+              .child(this.renderInspector(selected, t))
           )
       )
       .child(this.renderFooter(t, tgt));

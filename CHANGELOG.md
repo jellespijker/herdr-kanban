@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.6 (2026-11-14)
+
+- **Mouse-Draggable Resizable, Full-Expandable & Hideable Detail Pane (`renderInspector` & `startInspectorResize`)**:
+  - Add an interactive north-south resize splitter handle (`#inspector-resize-handle`, `.cursor_ns_resize()`) and draggable header bar to the Ticket Inspector so dragging up or down with the mouse smoothly resizes the detail pane to any pixel height (`drawerHeight`).
+  - Dragging all the way up snaps into **Full Expand** (`drawerTall: true`, hiding the board columns above so the Inspector fills 100% of the viewport height); dragging all the way down snaps into **Hidden** (`showDrawer: false`); double-clicking the splitter toggles **Full Expand** vs. **Split**.
+  - Add explicit **`Full` / `Split`** (`#insp-tall-toggle`) and **`Hide`** (`#insp-close`) buttons in the Inspector header, plus a compact **28px Collapsed Detail Bar** (`#inspector-collapsed-bar`) when hidden that can be dragged upward with the mouse or clicked (`Show` / `Full`) to reopen the detail pane at any time.
+
 ## 0.4.5 (2026-11-14)
 
 - **Plugin Manifest, Lockfile & Changelog Synchronization**:
