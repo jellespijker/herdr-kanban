@@ -122,9 +122,8 @@ function parseFacetLabel(rawLabel, t) {
   }
   if (prefix === "release") {
     const shortRel = val
-      .replace(/^cura-/, "cura ")
-      .replace(/^ultimoco-/, "ultimoco ")
-      .replace(/\+unimotion$/, "");
+      .replace(/^([a-z0-9_]+)-/i, "$1 ")
+      .replace(/\+[A-Za-z0-9._-]+$/, "");
     const c = t.done || t.ansi2;
     return {
       prefix,
@@ -2605,7 +2604,7 @@ export default class KanbanBoard extends View {
     const contributors = Array.isArray(wn.contributors) ? wn.contributors : [];
     const recentLanded = Array.isArray(wn.recent_landed) ? wn.recent_landed : [];
     const byRepo = Array.isArray(wn.by_repo) ? wn.by_repo : [];
-    const defaultRepo = (this.board && this.board.default_repo) || "unimotion";
+    const defaultRepo = (this.board && this.board.default_repo) || "";
     const mdRaw = (saved && saved.markdown) || wn.auto_markdown || "No landed tickets recorded yet.";
     const mdLinked = linkifyKanbanRefs(mdRaw, defaultRepo);
     const panelW = this.size?.width ?? 840;
@@ -3051,7 +3050,7 @@ export default class KanbanBoard extends View {
         this.board.settings.supported_agents) ||
       DEFAULT_AGENTS;
 
-    const defaultRepo = (this.board && this.board.default_repo) || "unimotion";
+    const defaultRepo = (this.board && this.board.default_repo) || "";
     const cleanBody = stripKanbanMeta(ticket.body) || "*No description provided.*";
     const mdBody = linkifyKanbanRefs(cleanBody, defaultRepo);
     const mdClaimNote =

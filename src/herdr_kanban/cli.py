@@ -787,7 +787,9 @@ def cmd_whats_new(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
     saved = digest.get("saved_summary")
     if isinstance(saved, dict) and saved.get("markdown"):
-        print(f"=== What's New Briefing (by @{saved.get('author', 'agent')}:{saved.get('agent_kind', 'agent')}) ===")
+        author = saved.get("author", "agent")
+        ag_kind = saved.get("agent_kind", "agent")
+        print(f"=== What's New Briefing (by @{author}:{ag_kind}) ===")
         print(saved["markdown"])
         print()
     else:

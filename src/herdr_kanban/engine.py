@@ -922,10 +922,10 @@ class KanbanEngine:
     ) -> str:
         digest = self.build_whats_new_digest(ctx, tickets, limit=limit)
         lines = [
-            f"Synthesize a concise, high-signal 'What's New' Markdown briefing for teammates in {ctx.display_name}.",
+            f"Synthesize a concise 'What's New' Markdown briefing for teammates in {ctx.display_name}.",
             "Group the recently landed tickets and git commits by architectural theme / repository,",
-            "highlight what each colleague and coding agent accomplished, and call out any newly unblocked work.",
-            "Format ticket references as `[repo#num](kanban://issue/repo#num)` so they are clickable in Herdr-App.",
+            "highlight what each colleague and agent accomplished, and call out newly unblocked work.",
+            "Format ticket references as `[repo#num](kanban://issue/repo#num)` for clickable Herdr links.",
             "",
             "When ready, publish your Markdown briefing back to the Herdr Kanban board by running:",
             '  herdr-kanban whats-new --write-summary "<YOUR_MARKDOWN_SUMMARY>"',

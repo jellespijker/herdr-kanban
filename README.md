@@ -120,6 +120,7 @@ bin/herdr-kanban setup-keys      # binds prefix+m (TUI) and ctrl-shift-m (Herdr-
    - `a`: approve a `Review`-gated ticket and push to the shared branch
    - `c`: send a cross-agent message/comment to a ticket
    - `n`: create a new Ready ticket
+   - `w`: toggle the **What's New** colleague & agent landed work briefing (`s` to synthesize)
 
 ---
 
@@ -157,6 +158,7 @@ Installed coding agents receive the `herdr-kanban` skill automatically:
 
 ```bash
 herdr-kanban board
+herdr-kanban whats-new --generate
 herdr-kanban list --column ready --unclaimed --json
 herdr-kanban claim 42 --json
 herdr-kanban progress 42 --note "Parser implemented" --check "[x] Parser" --check "[ ] Tests"
