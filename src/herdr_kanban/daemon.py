@@ -44,7 +44,7 @@ def running() -> bool:
 
 def ensure() -> bool:
     """Spawn the session daemon if not already running (must run outside agent sandboxes)."""
-    if running() or not herdr.binary():
+    if running() or not herdr.any_binary():
         return False
     cli = config.ROOT / "bin" / "herdr-kanban"
     log_path = state.state_dir() / "daemon.log"
@@ -78,7 +78,7 @@ def run() -> int:
 
     while True:
         settings = config.load_user_settings()
-        if engine.herdr.call("pane", "list") is None:
+        if not engine.herdr.server_alive():
             misses += 1
             if misses >= MAX_SERVER_MISSES:
                 return 0

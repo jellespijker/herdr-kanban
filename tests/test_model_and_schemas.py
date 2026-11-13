@@ -186,7 +186,7 @@ def test_generic_taxonomy_ready_gate_and_dependency_waves() -> None:
         issues_repo="meta",
         priorities=["P0", "P1", "P2", "P3"],
         require_priority_for_ready=True,
-        milestones=["Onboard the teams", "Hand-over PoC to V&V"],
+        milestones=["v1.0 Launch", "v1.1 Hardening"],
         facets={
             "domain": config.FacetSpec(
                 name="domain",
@@ -194,7 +194,7 @@ def test_generic_taxonomy_ready_gate_and_dependency_waves() -> None:
                 required_for_ready=True,
                 multiple=True,
                 color="1d76db",
-                values=["slicing", "rt-control", "print-quality"],
+                values=["auth", "api", "storage"],
             ),
             "type": config.FacetSpec(
                 name="type",
@@ -202,15 +202,15 @@ def test_generic_taxonomy_ready_gate_and_dependency_waves() -> None:
                 required_for_ready=True,
                 multiple=False,
                 color="0e8a16",
-                values=["feature", "bug", "forensics", "spike", "proof", "doc", "chore"],
+                values=["feature", "bug", "refactor", "spike", "doc", "chore"],
             ),
-            "trl": config.FacetSpec(
-                name="trl",
-                prefix="trl:",
+            "stage": config.FacetSpec(
+                name="stage",
+                prefix="stage:",
                 required_for_ready=True,
                 multiple=False,
                 color="fbca04",
-                values=["concept", "experimental", "production"],
+                values=["alpha", "beta", "ga"],
             ),
         },
     )
@@ -220,13 +220,13 @@ def test_generic_taxonomy_ready_gate_and_dependency_waves() -> None:
     reloaded = config.BoardConfig.from_mapping(parsed)
     assert reloaded.issues_repo == "meta"
     assert reloaded.priorities == ["P0", "P1", "P2", "P3"]
-    assert "forensics" in reloaded.facets["type"].values
+    assert "refactor" in reloaded.facets["type"].values
 
-    errs = validate_ready_gate(["domain:slicing"], "", reloaded.facets, True)
-    assert len(errs) == 3  # missing priority, type:*, trl:*
+    errs = validate_ready_gate(["domain:auth"], "", reloaded.facets, True)
+    assert len(errs) == 3  # missing priority, type:*, stage:*
 
     ok_errs = validate_ready_gate(
-        ["domain:print-quality", "type:forensics", "trl:experimental"],
+        ["domain:storage", "type:refactor", "stage:beta"],
         "P1",
         reloaded.facets,
         True,

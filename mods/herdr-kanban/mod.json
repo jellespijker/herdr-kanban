@@ -1,0 +1,12 @@
+{
+  "place": "none",
+  "size": 680,
+  "title": "Herdr Kanban",
+  "focusable": true,
+  "overlay": {
+    "kind": "window",
+    "width": 1180,
+    "height": 740,
+    "key": "herdr-kanban"
+  }
+}

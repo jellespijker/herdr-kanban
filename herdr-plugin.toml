@@ -5,8 +5,8 @@
 
 id = "herdr-kanban"
 name = "Kanban"
-version = "0.2.0"
-description = "Collaborate with colleagues and multiple coding agents on one shared branch (single-repo or multi-repo umbrella) through GitHub Projects v2 and Issues."
+version = "0.3.0"
+description = "Collaborate with colleagues and multiple coding agents on one shared branch (single-repo or multi-repo umbrella) through GitHub Projects v2 and Issues in both the Herdr desktop app and the herdr TUI."
 min_herdr_version = "0.9.3"
 platforms = ["linux", "macos"]
 
@@ -18,6 +18,12 @@ id = "open"
 title = "Kanban: open board tab"
 contexts = ["workspace", "pane", "global"]
 command = ["bin/herdr-kanban", "open"]
+
+[[actions]]
+id = "install-app-mod"
+title = "Kanban: install Herdr-App GPUI mod"
+contexts = ["workspace", "global"]
+command = ["bin/herdr-kanban", "install-app-mod", "--notify"]
 
 [[actions]]
 id = "open-popup"

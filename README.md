@@ -1,8 +1,9 @@
 # herdr-kanban
 
 Collaborate with your colleagues—and combine all of your coding agents—on **one shared GitHub
-branch**, coordinated through **GitHub Projects v2** and **GitHub Issues** inside
-[Herdr](https://herdr.dev).
+branch**, coordinated through **GitHub Projects v2** and **GitHub Issues** inside both the
+**[Herdr desktop app](https://herdr.dev) (`herdr-app` + `herdr-core` / `hc`, as a native GPUI
+board mod)** and the **`herdr` TUI**.
 
 No custom backend server, no mutual SSH access between colleagues' laptops, and zero Python
 runtime dependencies beyond Python 3.11+, `git`, and `gh`.
@@ -54,6 +55,31 @@ runtime dependencies beyond Python 3.11+, `git`, and `gh`.
 
 ## Install
 
+### In the Herdr desktop app (`herdr-app` + `herdr-core`)
+
+Paste this prompt to any coding agent running in your Herdr window:
+
+```text
+Read ~/.config/herdr-app/AGENTS.md, then add this mod: https://github.com/jellespijker/herdr-kanban
+```
+
+Or install from a terminal:
+
+```bash
+git clone https://github.com/jellespijker/herdr-kanban.git ~/.local/share/herdr-kanban
+cd ~/.local/share/herdr-kanban
+./bin/herdr-kanban install-skill
+./bin/herdr-kanban install-app-mod
+./bin/herdr-kanban setup-keys
+herdr-app check ~/.config/herdr-app/mods/herdr-kanban
+```
+
+- Installed as `mods/herdr-kanban` (`~/.config/herdr-app/mods/herdr-kanban`) so it coexists cleanly alongside the built-in agent-status `mods/kanban` layout.
+- Open the native GPUI board with `Ctrl+Shift+M`, `herdr-kanban open --mod`, or `herdr-app do mod.open herdr-kanban`.
+- Supports remote `hc` spaces across connected peer machines automatically (`{ cwd, on }`).
+
+### In the `herdr` TUI (0.9.3+)
+
 From GitHub:
 
 ```bash
@@ -69,8 +95,8 @@ herdr plugin link /path/to/herdr-kanban
 Then run two one-time setup commands (or trigger them from Herdr's plugin action menu):
 
 ```bash
-bin/herdr-kanban install-skill   # links SKILL.md + ~/.local/bin/herdr-kanban for Claude, agy, Codex, OpenCode
-bin/herdr-kanban setup-keys      # binds prefix+m to open the Kanban board tab
+bin/herdr-kanban install-skill   # links SKILL.md + ~/.local/bin/herdr-kanban + Herdr-App GPUI mod
+bin/herdr-kanban setup-keys      # binds prefix+m (TUI) and ctrl-shift-m (Herdr-App) to open the board
 ```
 
 ---

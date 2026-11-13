@@ -19,10 +19,13 @@ workspaces (`[repos.<alias>]` in `.herdr-kanban.toml`), prefix tickets with the 
 
 ```bash
 herdr-kanban board                                     # overview of columns, priorities, waves, labels, and claims
+herdr-kanban board --json                              # full structured board payload for agents & Herdr-App GPUI mod
 herdr-kanban list --column ready --unblocked           # unblocked Ready tickets safe to claim in parallel now
-herdr-kanban list -l domain:rt-control -p P0           # filter by facet label and Project Priority
+herdr-kanban list -l domain:auth -p P0                 # filter by facet label and Project Priority
 herdr-kanban show 42                                   # inspect priority, milestone, labels, deps, and claim
 herdr-kanban inbox --ack                               # check & acknowledge messages from sibling/colleague agents
+herdr-kanban open                                      # open native Herdr-App GPUI Kanban mod (or terminal TUI)
+herdr-kanban install-app-mod --on <peer>               # install & sync native GPUI mod locally and to hc peers
 ```
 
 If `.herdr-kanban.toml` sets `issues_repo = "<repo>"`, all GitHub Issues, labels, priorities, and
@@ -61,8 +64,8 @@ herdr-kanban deposit "Fix race in token refresh" \
   --body "Observed unlocked read when refreshing expired session." \
   --parent 42 \
   --file-line "src/auth/refresh.py:88" \
-  -l domain:som -l type:bug -l trl:production -l access:internal \
-  -p P1 -m "Onboard the teams" \
+  -l domain:auth -l type:bug -l stage:ga \
+  -p P1 -m "v1.0 Launch" \
   --depends-on 41
 ```
 
@@ -70,8 +73,8 @@ Triage or update labels, Project `Priority`, `Milestone`, target repo, and depen
 
 ```bash
 herdr-kanban triage 42 \
-  -l domain:rt-control -l type:feature -l trl:experimental -l access:proprietary \
-  -p P0 -m "Onboard the teams" \
+  -l domain:api -l type:feature -l stage:beta \
+  -p P0 -m "v1.0 Launch" \
   --depends-on 40 --blocks 45 \
   --ready
 ```

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, config, daemon, keys, skill, state
+from . import __version__, config, daemon, herdr, keys, skill, state
 from .engine import (
     KanbanEngine,
     KanbanError,
@@ -348,18 +348,7 @@ def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
         unblocked=bool(getattr(args, "unblocked", False)),
     )
     if args.json:
-        payload: dict[str, Any] = {
-            "repo": ctx.display_name if ctx.is_multi_repo else f"{ctx.repo_owner}/{ctx.repo_name}",
-            "multi_repo": ctx.is_multi_repo,
-            "target_branch": ctx.board.target_branch,
-            "project": {"number": schema.number, "title": schema.title, "url": schema.url},
-            "tickets": [t.to_dict() for t in tickets],
-        }
-        if ctx.is_multi_repo:
-            payload["repos"] = {
-                alias: {"owner": e.owner, "repo": e.repo, "path": e.path} for alias, e in ctx.repos.items()
-            }
-        return _emit_json(payload)
+        return _emit_json(engine.build_board_payload(ctx, schema, tickets))
 
     print(
         f"{schema.title} (#{schema.number}) — {ctx.display_name} "
@@ -400,7 +389,7 @@ def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
 def cmd_list(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    _, all_tickets = engine.refresh_board(ctx)
+    schema, all_tickets = engine.refresh_board(ctx)
     tickets = _filter_tickets(
         ctx,
         engine,
@@ -414,7 +403,7 @@ def cmd_list(args: argparse.Namespace, engine: KanbanEngine) -> int:
         milestone=getattr(args, "milestone", None),
     )
     if args.json:
-        return _emit_json({"tickets": [t.to_dict() for t in tickets]})
+        return _emit_json(engine.build_board_payload(ctx, schema, tickets))
     for t in tickets:
         holder = f"@{t.claim.owner}" if t.claim and t.claim.state in ("active", "review_ready") else "-"
         ref_lbl = t.ref(ctx.is_multi_repo)
@@ -489,17 +478,22 @@ def cmd_claim(args: argparse.Namespace, engine: KanbanEngine) -> int:
         ctx,
         args.issue,
         agent_kind=args.kind,
+        agent_name=getattr(args, "agent_name", "") or "",
+        pane_id=getattr(args, "pane_id", "") or "",
         risk_gate=args.risk_gate,
         takeover=args.takeover,
         repo_selector=getattr(args, "repo", None),
         force=bool(getattr(args, "force", False)),
     )
     if args.json:
+        prompt = engine.build_agent_prompt(ctx, res.ticket, res.claim, res.overlaps)
         return _emit_json(
             {
                 "claim": res.claim.to_dict(),
-                "ticket": res.ticket.to_dict(),
+                "ticket": engine.serialize_ticket_for_board(ctx, res.ticket),
                 "reused": res.reused,
+                "prompt": prompt,
+                "agent_argv": herdr.resolve_agent_argv(res.claim.agent_kind),
             }
         )
     disp = res.ticket.ref(ctx.is_multi_repo)
@@ -764,17 +758,71 @@ def cmd_done(args: argparse.Namespace, engine: KanbanEngine) -> int:
 def cmd_open(args: argparse.Namespace, engine: KanbanEngine) -> int:
     daemon.ensure()
     cwd = engine.resolve_cwd(Path(args.cwd) if args.cwd else None)
+    prefer_tui = bool(getattr(args, "tui", False))
+    if not prefer_tui and skill.MOD_SRC.is_dir():
+        _, mod_state = skill.app_mod_status()
+        if mod_state != "installed" and (herdr.app_home_dir().is_dir() or getattr(args, "mod", False)):
+            try:
+                skill.install_app_mod()
+            except OSError:
+                pass
     res = engine.herdr.open_board_pane(
         placement=args.placement,
         cwd=cwd,
         focus=not args.no_focus,
+        prefer_app_mod=not prefer_tui,
     )
     if res is None:
         print(
-            "herdr-kanban open: could not open plugin pane (are you inside Herdr?)",
+            "herdr-kanban open: could not open board pane or Herdr-App mod (are you inside Herdr?)",
             file=sys.stderr,
         )
         return EXIT_RUNTIME
+    return EXIT_OK
+
+
+def cmd_install_app_mod(args: argparse.Namespace, engine: KanbanEngine) -> int:
+    app_home = Path(args.app_home).expanduser() if getattr(args, "app_home", None) else None
+    if getattr(args, "status", False):
+        dest, st = skill.app_mod_status(app_home=app_home)
+        if getattr(args, "json", False):
+            return _emit_json({"mod": skill.MOD_NAME, "path": str(dest), "status": st})
+        print(f"{st:<10} {skill.MOD_NAME:<8} {dest}  (Herdr-App GPUI Kanban mod)")
+        return EXIT_OK
+
+    machines = list(getattr(args, "on", None) or [])
+    report = skill.install_app_mod(
+        app_home=app_home,
+        uninstall=bool(getattr(args, "uninstall", False)),
+        machines=machines,
+    )
+    opened = False
+    if getattr(args, "open", False) and not getattr(args, "uninstall", False):
+        cwd = engine.resolve_cwd(Path(args.cwd) if getattr(args, "cwd", None) else None)
+        opened = (
+            engine.herdr.open_board_pane(
+                placement=getattr(args, "placement", "window") or "window",
+                cwd=cwd,
+                focus=True,
+                prefer_app_mod=True,
+            )
+            is not None
+        )
+    if getattr(args, "json", False):
+        dest, st = skill.app_mod_status(app_home=app_home)
+        return _emit_json(
+            {
+                "mod": skill.MOD_NAME,
+                "path": str(dest),
+                "status": st,
+                "report": report,
+                "opened": opened,
+            }
+        )
+    for line in report:
+        print(line)
+    if getattr(args, "open", False) and opened:
+        print("Opened Kanban GPUI mod in Herdr-App.")
     return EXIT_OK
 
 
@@ -855,7 +903,31 @@ def cmd_doctor(args: argparse.Namespace, engine: KanbanEngine) -> int:
             )
 
     herdr_ok = engine.herdr.available()
-    checks.append(("herdr", herdr_ok, "detected" if herdr_ok else "outside herdr or missing binary"))
+    bin_pairs = (
+        ("hc", herdr.hc_binary()),
+        ("herdr-app", herdr.app_binary()),
+        ("herdr", herdr.binary()),
+    )
+    bins = [name for name, b in bin_pairs if b]
+    checks.append(
+        (
+            "herdr",
+            herdr_ok,
+            f"detected ({', '.join(bins)})" if herdr_ok else "outside herdr or missing binary",
+        )
+    )
+
+    if herdr.app_home_dir().is_dir() or herdr.app_binary():
+        mod_dest, mod_st = skill.app_mod_status()
+        checks.append(
+            (
+                "herdr-app mod",
+                mod_st == "installed",
+                f"{mod_st} ({mod_dest})"
+                if mod_st == "installed"
+                else f"{mod_st} — run `herdr-kanban install-app-mod`",
+            )
+        )
 
     skill_rows = skill.status()
     cli_linked = any(name == "cli" and st == "installed" for name, _, _, st in skill_rows)
@@ -888,6 +960,9 @@ def cmd_install_skill(args: argparse.Namespace, engine: KanbanEngine) -> int:
     if args.status:
         for name, dest, readers, st in skill.status():
             print(f"{st:<10} {name:<8} {dest}  ({readers})")
+        if herdr.app_home_dir().is_dir() or skill.MOD_SRC.is_dir():
+            mod_dest, mod_st = skill.app_mod_status()
+            print(f"{mod_st:<10} {'app-mod':<8} {mod_dest}  (Herdr-App GPUI Kanban mod)")
         return EXIT_OK
     try:
         rows = skill.install(
@@ -895,6 +970,9 @@ def cmd_install_skill(args: argparse.Namespace, engine: KanbanEngine) -> int:
             uninstall=args.uninstall,
             refresh_only=args.refresh,
         )
+        machines = list(getattr(args, "on", None) or [])
+        if machines and not args.uninstall:
+            rows.extend(skill.install_app_mod(machines=machines))
         for line in rows:
             print(line)
         if args.notify and engine.herdr.available():
@@ -909,8 +987,19 @@ def cmd_install_skill(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
 
 def cmd_setup_keys(args: argparse.Namespace, engine: KanbanEngine) -> int:
+    if getattr(args, "app", False):
+        changed, message = keys.setup_app_keys(args.key, remove=args.remove)
+        print(message)
+        if args.notify and engine.herdr.available():
+            engine.herdr.notify("Kanban keybinding", message)
+        return EXIT_OK
+
     changed, message = keys.setup(args.key, remove=args.remove)
     print(message)
+    if args.key is None and herdr.app_home_dir().is_dir():
+        app_changed, app_msg = keys.setup_app_keys(None, remove=args.remove)
+        if app_changed:
+            print(app_msg)
     if changed and engine.herdr.available():
         reloaded, failed = engine.herdr.reload_config_everywhere()
         if reloaded:
@@ -928,6 +1017,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Collaborate with colleagues and coding agents on a shared GitHub branch.",
     )
     parser.add_argument("--version", action="version", version=f"herdr-kanban {__version__}")
+    parser.add_argument("--cwd", dest="_root_cwd", help="Repository or umbrella directory")
     sub = parser.add_subparsers(dest="command")
 
     # init
@@ -1015,6 +1105,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_claim.add_argument("--cwd", help="Repository or umbrella directory")
     p_claim.add_argument("--repo", help="Override target code repository for the worktree")
     p_claim.add_argument("--kind", help="Agent kind label")
+    p_claim.add_argument("--agent-name", help="Herdr agent or terminal label")
+    p_claim.add_argument("--pane-id", help="Herdr pane or hc terminal ID")
     p_claim.add_argument("--risk-gate", action="store_true", help="Require human Review approval before push")
     p_claim.add_argument("--takeover", action="store_true", help="Explicitly reclaim a STALE lease")
     p_claim.add_argument("--force", action="store_true", help="Bypass open dependency blocker guard")
@@ -1133,14 +1225,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_done.add_argument("--json", action="store_true", help="Output JSON")
 
     # open & tui
-    p_open = sub.add_parser("open", help="Open the Kanban TUI in a Herdr tab, split, or popup")
-    p_open.add_argument("--placement", choices=("tab", "split", "popup"), default="tab")
+    p_open = sub.add_parser(
+        "open", help="Open the Kanban board in Herdr-App (GPUI mod) or a Herdr terminal tab/split/popup"
+    )
+    p_open.add_argument(
+        "--placement",
+        choices=("tab", "split", "popup", "window", "overlay"),
+        default="split",
+    )
     p_open.add_argument("--cwd", help="Repository or umbrella directory")
+    p_open.add_argument("--tui", action="store_true", help="Force terminal TUI instead of GPUI mod")
+    p_open.add_argument("--mod", action="store_true", help="Ensure and prefer Herdr-App GPUI mod")
     p_open.add_argument("--no-focus", action="store_true")
 
     p_tui = sub.add_parser("tui", help="Run the interactive Kanban TUI directly in this terminal")
     p_tui.add_argument("--cwd", help="Repository or umbrella directory")
     p_tui.add_argument("--compact", action="store_true", help="Single-column compact layout")
+
+    p_mod = sub.add_parser(
+        "install-app-mod",
+        help="Install or sync the native Herdr-App GPUI Kanban mod (`~/.config/herdr-app/mods/herdr-kanban`)",
+    )
+    p_mod.add_argument("--app-home", help="Override Herdr-App config home directory")
+    p_mod.add_argument(
+        "--on",
+        action="append",
+        metavar="MACHINE",
+        help="Also sync mod files to a connected `hc` peer machine (repeatable, e.g. `--on peer-host`)",
+    )
+    p_mod.add_argument("--status", action="store_true", help="Check GPUI mod installation status")
+    p_mod.add_argument("--uninstall", action="store_true", help="Remove installed GPUI mod")
+    p_mod.add_argument("--open", action="store_true", help="Open the GPUI mod in Herdr-App after installing")
+    p_mod.add_argument(
+        "--placement",
+        choices=("tab", "split", "popup", "window", "overlay"),
+        default="split",
+    )
+    p_mod.add_argument("--cwd", help="Repository or umbrella directory when opening")
+    p_mod.add_argument("--json", action="store_true", help="Output JSON")
 
     # plugin plumbing
     p_pop = sub.add_parser("popup", help=argparse.SUPPRESS)
@@ -1154,16 +1276,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--notify", action="store_true")
     p_doc.add_argument("--wait", action="store_true", help=argparse.SUPPRESS)
 
-    p_sk = sub.add_parser("install-skill", help="Symlink SKILL.md and CLI for Claude, agy, Codex, OpenCode")
+    p_sk = sub.add_parser(
+        "install-skill",
+        help="Symlink SKILL.md, CLI, and Herdr-App GPUI mod for Claude, agy, Codex, OpenCode, Herdr-App",
+    )
     p_sk.add_argument("harness", nargs="*")
     p_sk.add_argument("--status", action="store_true")
     p_sk.add_argument("--uninstall", action="store_true")
     p_sk.add_argument("--refresh", action="store_true", help="Relink existing outdated herdr-kanban links")
+    p_sk.add_argument(
+        "--on",
+        action="append",
+        metavar="MACHINE",
+        help="Also sync GPUI mod to a connected `hc` peer machine (repeatable)",
+    )
     p_sk.add_argument("--notify", action="store_true")
     p_sk.add_argument("--wait", action="store_true", help=argparse.SUPPRESS)
 
-    p_keys = sub.add_parser("setup-keys", help="Add or remove `prefix+m` in herdr config.toml")
-    p_keys.add_argument("--key", help="Custom key chord (default: prefix+m)")
+    p_keys = sub.add_parser(
+        "setup-keys",
+        help="Add or remove Kanban keybinding in herdr config.toml and/or herdr-app keys.json",
+    )
+    p_keys.add_argument("--key", help="Custom key chord (default: prefix+m or ctrl-shift-m with --app)")
+    p_keys.add_argument("--app", action="store_true", help="Configure ~/.config/herdr-app/keys.json")
     p_keys.add_argument("--remove", action="store_true")
     p_keys.add_argument("--notify", action="store_true")
 
@@ -1189,6 +1324,7 @@ HANDLERS = {
     "done": cmd_done,
     "open": cmd_open,
     "tui": cmd_tui,
+    "install-app-mod": cmd_install_app_mod,
     "popup": cmd_popup,
     "event": cmd_event,
     "doctor": cmd_doctor,
@@ -1200,6 +1336,8 @@ HANDLERS = {
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "_root_cwd", None) and not getattr(args, "cwd", None):
+        args.cwd = args._root_cwd
     if not args.command:
         parser.print_help()
         return EXIT_USAGE

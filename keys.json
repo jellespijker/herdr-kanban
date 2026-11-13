@@ -1,0 +1,14 @@
+{
+  "global": {
+    "ctrl-shift-m": {
+      "command": "pane.split",
+      "args": {
+        "direction": "right",
+        "mod": "herdr-kanban"
+      }
+    }
+  },
+  "mod:herdr-kanban": {
+    "ctrl-shift-m": "pane.close"
+  }
+}

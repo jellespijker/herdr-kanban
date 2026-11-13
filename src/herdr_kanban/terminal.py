@@ -37,7 +37,57 @@ KEY_SEQUENCES: dict[bytes, str] = {
     b"\x1b[6~": "pagedown",
     b"\x1b[H": "home",
     b"\x1b[F": "end",
+    b"\x1b[13u": "enter",
+    b"\x1b[27u": "esc",
+    b"\x1b[9u": "tab",
+    b"\x1b[127u": "backspace",
 }
+
+
+def terminal_env_info() -> dict[str, str]:
+    """Return active Herdr / herdr-core (hc) / herdr-app environment variables."""
+    keys = (
+        "HC_TERMINAL_ID",
+        "HC_TERMINAL_SOCKET",
+        "HC_SCOPE",
+        "HERDR_PANE_ID",
+        "HERDR_ENV",
+        "HERDR_SESSION",
+        "HERDR_SOCKET_PATH",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_APP_HOME",
+    )
+    return {k: v for k in keys if (v := os.environ.get(k))}
+
+
+def is_herdr_terminal() -> bool:
+    """Return True when running inside Herdr 0.9.x, herdr-core (`hc`), or `herdr-app`."""
+    return bool(
+        os.environ.get("HC_TERMINAL_ID")
+        or os.environ.get("HC_TERMINAL_SOCKET")
+        or os.environ.get("HC_SCOPE")
+        or os.environ.get("HERDR_PANE_ID")
+        or os.environ.get("HERDR_ENV")
+    )
+
+
+def current_terminal_id() -> str:
+    """Return the current terminal or pane identifier (`HC_TERMINAL_ID` or `HERDR_PANE_ID`)."""
+    return os.environ.get("HC_TERMINAL_ID") or os.environ.get("HERDR_PANE_ID") or ""
+
+
+def format_osc7501_status(state: str, app: str = "herdr-kanban") -> str:
+    """Format an OSC 7501 status escape sequence recognized by `herdr-core` / `herdr-app`."""
+    return f"\x1b]7501;app={app};state={state}\x07"
+
+
+def emit_osc7501_status(state: str, app: str = "herdr-kanban", out_fd: int = 1) -> None:
+    """Emit an OSC 7501 status report when running inside a Herdr terminal."""
+    if not is_herdr_terminal():
+        return
+    with contextlib.suppress(OSError):
+        os.write(out_fd, format_osc7501_status(state, app=app).encode("utf-8"))
 
 
 @dataclass(slots=True)

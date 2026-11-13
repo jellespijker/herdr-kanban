@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from herdr_kanban import config, keys, skill, terminal
+import pytest
+
+from herdr_kanban import config, herdr, keys, skill, state, terminal
 from herdr_kanban.engine import KanbanEngine, RepoContext
+from herdr_kanban.github import ProjectSchema
 from herdr_kanban.model import ClaimMeta, Column, FileOverlap, Ticket
 from herdr_kanban.tui import BoardTUI
 
@@ -133,3 +136,90 @@ def test_skill_installer_never_overwrites_foreign_files(tmp_path: Path) -> None:
     uninstalled = skill.install(uninstall=True, home=fake_home)
     assert any("removed" in line for line in uninstalled)
     assert not (fake_home / ".local" / "bin" / "herdr-kanban").exists()
+
+
+def test_app_keys_setup_and_conflict_detection(tmp_path: Path) -> None:
+    keys_json = tmp_path / "keys.json"
+    keys_json.write_text('{\n  "ctrl-b": "mod.open:bar"\n}\n', encoding="utf-8")
+
+    # Conflict with existing ctrl-b binding
+    changed, msg = keys.setup_app_keys("ctrl-b", path=keys_json)
+    assert changed is False
+    assert "already bound" in msg
+
+    # Default ctrl-shift-m succeeds
+    changed, msg = keys.setup_app_keys(None, path=keys_json)
+    assert changed is True
+    assert "ctrl-shift-m" in msg
+
+    # Idempotent second call
+    changed2, _ = keys.setup_app_keys(None, path=keys_json)
+    assert changed2 is False
+
+    # Removal
+    removed, _ = keys.setup_app_keys(remove=True, path=keys_json)
+    assert removed is True
+
+
+def test_install_app_mod_and_status(tmp_path: Path) -> None:
+    app_home = tmp_path / "herdr-app"
+    dest, st = skill.app_mod_status(app_home=app_home)
+    assert st == "missing"
+
+    report = skill.install_app_mod(app_home=app_home)
+    assert any("installed" in line for line in report)
+    dest, st = skill.app_mod_status(app_home=app_home)
+    assert st == "installed"
+    assert (dest / "main.js").is_file()
+    assert (dest / "mod.json").is_file()
+    assert (dest / "RECIPE.md").is_file()
+
+    uninstalled = skill.install_app_mod(app_home=app_home, uninstall=True)
+    assert any("removed" in line for line in uninstalled)
+    assert skill.app_mod_status(app_home=app_home)[1] == "missing"
+
+
+def test_hc_env_detection_and_board_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+    monkeypatch.delenv("HERDR_SOCKET_PATH", raising=False)
+    monkeypatch.setenv("HC_TERMINAL_ID", "t42")
+    monkeypatch.setenv("HC_TERMINAL_SOCKET", "/tmp/hc-test.sock")
+    monkeypatch.setenv("HC_SCOPE", "scope-abc")
+
+    assert herdr.current_pane_id() == "t42"
+    assert herdr.current_socket_path() == "/tmp/hc-test.sock"
+    assert herdr.current_scope() == "scope-abc"
+    assert herdr.in_herdr_env() is True
+    assert state.herdr_session_key().startswith("hc-")
+    assert terminal.current_terminal_id() == "t42"
+    osc = terminal.format_osc7501_status("working")
+    assert osc == "\x1b]7501;app=herdr-kanban;state=working\x07"
+
+    # CSI-u enter key parsing
+    events = terminal.parse_input_bytes(b"\x1b[13u")
+    assert len(events) == 1 and events[0].key == "enter"
+
+    tui = _sample_tui()
+    try:
+        assert tui.ctx is not None
+        t3 = next(t for t in tui.tickets if t.number == 3)
+        assert t3.claim is not None
+        t3.claim.checklist = ["[x] Step 1", "[ ] Step 2"]
+        schema = ProjectSchema(
+            project_id="PVT_1",
+            number=3,
+            title="Team Kanban",
+            url="https://example.com",
+            status_field_id="PVTSSF_1",
+        )
+        payload = tui.engine.build_board_payload(tui.ctx, schema, tui.tickets)
+        assert payload["repo"] == "team/service"
+        assert payload["target_branch"] == "feat/shared"
+        assert len(payload["columns"]) == 6
+        card3 = next(row for row in payload["tickets"] if row["number"] == 3)
+        assert card3["ref"] == "#3"
+        assert card3["cli_ref"] == "3"
+        assert card3["checklist_done"] == 1
+        assert card3["checklist_total"] == 2
+    finally:
+        tui.close_pipes()

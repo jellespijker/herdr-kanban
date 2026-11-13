@@ -32,7 +32,12 @@ def state_dir() -> Path:
 
 
 def herdr_session_key() -> str:
-    sock = os.environ.get("HERDR_SOCKET_PATH") or "default"
+    sock = (
+        os.environ.get("HERDR_SOCKET_PATH")
+        or os.environ.get("HC_TERMINAL_SOCKET")
+        or os.environ.get("HC_SCOPE")
+        or "default"
+    )
     safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in Path(sock).stem)
     return safe or "default"
 

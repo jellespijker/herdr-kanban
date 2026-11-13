@@ -14,8 +14,9 @@ from typing import Any
 from . import config, state
 from .git_ops import GitClient, GitError
 from .github import GitHubClient, GitHubError, ProjectSchema
-from .herdr import HerdrClient
+from .herdr import HerdrClient, current_pane_id, current_scope
 from .model import (
+     COLUMN_TITLES,
     ClaimMeta,
     Column,
     DepositMeta,
@@ -501,6 +502,109 @@ class KanbanEngine:
             ),
         )
 
+    @staticmethod
+    def _checklist_counts(ticket: Ticket) -> tuple[int, int]:
+        if ticket.claim and ticket.claim.checklist:
+            items = [it.strip() for it in ticket.claim.checklist if it.strip()]
+            done = sum(1 for it in items if it.lower().startswith("[x]"))
+            return done, len(items)
+        body = strip_meta(ticket.body or "")
+        boxes = re.findall(r"(?m)^\s*[-*]\s*\[([ xX])\]", body)
+        if not boxes:
+            return 0, 0
+        done = sum(1 for b in boxes if b.lower() == "x")
+        return done, len(boxes)
+
+    def serialize_ticket_for_board(
+        self,
+        ctx: RepoContext,
+        ticket: Ticket,
+        local_by_key: dict[tuple[str, int], state.LocalClaim] | None = None,
+    ) -> dict[str, Any]:
+        row = ticket.to_dict()
+        row["ref"] = ticket.ref(ctx.is_multi_repo)
+        row["cli_ref"] = (
+            f"{ticket.repo_alias}#{ticket.number}"
+            if (ctx.is_multi_repo and ticket.repo_alias)
+            else str(ticket.number)
+        )
+        slug = config.repo_slug(ticket.repo_owner or ctx.repo_owner, ticket.repo_name or ctx.repo_name)
+        lc = (
+            local_by_key.get((slug, ticket.number))
+            if local_by_key is not None
+            else state.get_local_claim(slug, ticket.number)
+        )
+        row["local_claim"] = lc.to_dict() if lc is not None else None
+        done_cnt, total_cnt = self._checklist_counts(ticket)
+        row["checklist_done"] = done_cnt
+        row["checklist_total"] = total_cnt
+        return row
+
+    def build_board_payload(
+        self,
+        ctx: RepoContext,
+        schema: ProjectSchema,
+        tickets: list[Ticket],
+    ) -> dict[str, Any]:
+        slugs = {e.slug for e in ctx.repos.values()} | {ctx.slug}
+        all_local = [c for c in state.list_local_claims() if c.repo_slug in slugs]
+        local_by_key = {(c.repo_slug, c.issue_number): c for c in all_local}
+        repos_dict = {
+            alias: {
+                "alias": alias,
+                "owner": e.owner,
+                "repo": e.repo,
+                "path": e.path,
+                "slug": e.slug,
+                "target_branch": e.effective_branch(ctx.board),
+                "remote": e.effective_remote(ctx.board),
+            }
+            for alias, e in ctx.repos.items()
+        }
+        facets_dict = {
+            name: {
+                "name": f.name,
+                "prefix": f.prefix,
+                "color": f.color,
+                "required": f.required_for_ready,
+                "required_for_ready": f.required_for_ready,
+                "multiple": f.multiple,
+                "values": list(f.values),
+                "description": f.description,
+            }
+            for name, f in ctx.board.facets.items()
+        }
+        payload: dict[str, Any] = {
+            "repo": ctx.display_name if ctx.is_multi_repo else f"{ctx.repo_owner}/{ctx.repo_name}",
+            "repo_owner": ctx.repo_owner,
+            "repo_name": ctx.repo_name,
+            "slug": ctx.slug,
+            "worktree_cwd": str(ctx.worktree_cwd),
+            "main_repo_root": str(ctx.main_repo_root),
+            "umbrella_root": str(ctx.umbrella_root) if ctx.umbrella_root else "",
+            "multi_repo": ctx.is_multi_repo,
+            "default_repo": ctx.board.default_repo,
+            "issues_repo": ctx.board.issues_repo,
+            "active_repo_alias": ctx.active_repo_alias,
+            "remote": ctx.board.remote,
+            "target_branch": ctx.board.target_branch,
+            "require_review": ctx.board.require_review,
+            "require_priority_for_ready": ctx.board.require_priority_for_ready,
+            "priorities": list(ctx.board.priorities),
+            "milestones": list(ctx.board.milestones),
+            "facets": facets_dict,
+            "columns": [{"id": col.value, "title": COLUMN_TITLES[col]} for col in Column],
+            "settings": {
+                "default_agent_kind": ctx.settings.default_agent_kind,
+                "supported_agents": list(config.SUPPORTED_AGENTS),
+            },
+            "project": {"number": schema.number, "title": schema.title, "url": schema.url},
+            "repos": repos_dict,
+            "local_claims": [c.to_dict() for c in all_local],
+            "tickets": [self.serialize_ticket_for_board(ctx, t, local_by_key) for t in tickets],
+        }
+        return payload
+
     def sync_labels(self, ctx: RepoContext) -> dict[str, Any]:
         """Provision configured taxonomy labels, milestones, and Project v2 Priority options."""
         issues_entry = self.resolve_issues_entry(ctx)
@@ -694,7 +798,7 @@ class KanbanEngine:
 
         now_iso = utc_now_iso()
         lease_iso = lease_until_iso(ctx.board.lease_ttl_minutes)
-        caller_pane = pane_id or os.environ.get("HERDR_PANE_ID", "")
+        caller_pane = pane_id or current_pane_id()
         meta = ClaimMeta(
             issue_number=issue_number,
             owner=user,
@@ -759,7 +863,7 @@ class KanbanEngine:
             agent_kind=chosen_kind,
             agent_name=agent_name,
             pane_id=caller_pane,
-            workspace_id=os.environ.get("HERDR_WORKSPACE_ID", ""),
+            workspace_id=os.environ.get("HERDR_WORKSPACE_ID") or current_scope(),
             herdr_session=state.herdr_session_key(),
             risk_gate=meta.risk_gate,
             started_at=now_iso,
@@ -1789,6 +1893,15 @@ class KanbanEngine:
                     f"Check command `{check_command}` failed (exit {proc.returncode}). "
                     f"Fix the failure in {wt} and re-run `herdr-kanban done {cli_ref}`:\n{tail}"
                 )
+
+    def build_agent_prompt(
+        self,
+        ctx: RepoContext,
+        ticket: Ticket,
+        claim: state.LocalClaim,
+        overlaps: list[FileOverlap],
+    ) -> str:
+        return self._build_agent_prompt(ctx, ticket, claim, overlaps)
 
     def _build_agent_prompt(
         self,
