@@ -231,5 +231,15 @@ def test_hc_env_detection_and_board_payload(monkeypatch: pytest.MonkeyPatch) -> 
         assert "Shipped healthcheck" in wn["auto_markdown"]
         prompt = tui.engine.build_whats_new_agent_prompt(tui.ctx, tui.tickets)
         assert "herdr-kanban whats-new --write-summary" in prompt
+        gen = tui.engine.generate_whats_new_summary(
+            tui.ctx,
+            tui.tickets,
+            author="alice",
+            agent_kind="claude",
+            use_llm=False,
+        )
+        assert gen["saved_summary"]["author"] == "alice"
+        assert gen["saved_summary"]["agent_kind"] == "claude"
+        assert "Executive Briefing" in gen["saved_summary"]["markdown"]
     finally:
         tui.close_pipes()

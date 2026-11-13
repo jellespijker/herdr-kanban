@@ -766,8 +766,16 @@ def cmd_whats_new(args: argparse.Namespace, engine: KanbanEngine) -> int:
     limit = int(getattr(args, "limit", 25) or 25)
     if getattr(args, "prompt", False):
         prompt = engine.build_whats_new_agent_prompt(ctx, tickets, limit=limit)
+        kind = getattr(args, "agent", "") or ctx.settings.default_agent_kind or "claude"
         if getattr(args, "json", False):
-            return _emit_json({"prompt": prompt})
+            return _emit_json(
+                {
+                    "prompt": prompt,
+                    "agent_kind": kind,
+                    "agent_argv": herdr.resolve_agent_argv(kind),
+                    "cwd": str(ctx.root),
+                }
+            )
         print(prompt)
         return EXIT_OK
 
@@ -778,6 +786,7 @@ def cmd_whats_new(args: argparse.Namespace, engine: KanbanEngine) -> int:
             custom_markdown=getattr(args, "write_summary", None),
             author=getattr(args, "author", "") or "",
             agent_kind=getattr(args, "agent", "") or "",
+            use_llm=not bool(getattr(args, "no_llm", False)),
         )
     else:
         digest = engine.build_whats_new_digest(ctx, tickets, limit=limit)
@@ -1285,7 +1294,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save an agent-authored Markdown summary for the Herdr-App What's New view",
     )
     p_wn.add_argument("--author", help="Author handle for --write-summary")
-    p_wn.add_argument("--agent", help="Agent kind for --write-summary")
+    p_wn.add_argument("--agent", help="Agent kind for --generate or --write-summary")
+    p_wn.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Skip headless agent CLI synthesis and use deterministic ticket/git digest",
+    )
     p_wn.add_argument(
         "--prompt",
         action="store_true",

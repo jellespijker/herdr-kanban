@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -843,6 +845,87 @@ class KanbanEngine:
                         lines.append(f"  > {item['summary_note']}")
         return "\n".join(lines)
 
+    def _run_headless_whats_new_llm(
+        self,
+        ctx: RepoContext,
+        prompt: str,
+        preferred_kind: str,
+    ) -> tuple[str | None, str]:
+        """Invoke a local coding agent CLI non-interactively to author a What's New summary."""
+        candidates: list[str] = []
+        for k in (preferred_kind, "claude", "agy", "codex", "opencode"):
+            clean = (k or "").strip().lower()
+            if clean and clean not in candidates:
+                candidates.append(clean)
+
+        tmp_dir = tempfile.gettempdir()
+        for kind in candidates:
+            try:
+                if kind == "claude":
+                    exe = shutil.which("claude")
+                    if not exe:
+                        continue
+                    proc = subprocess.run(
+                        [
+                            exe,
+                            "-p",
+                            "--model",
+                            "haiku",
+                            "--tools",
+                            "",
+                            "--strict-mcp-config",
+                            "--setting-sources",
+                            "",
+                        ],
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        cwd=tmp_dir,
+                        timeout=30,
+                    )
+                elif kind == "agy":
+                    exe = shutil.which("agy")
+                    if not exe:
+                        continue
+                    proc = subprocess.run(
+                        [exe, "-p", "--effort", "low", "--disable-slash-commands", prompt],
+                        capture_output=True,
+                        text=True,
+                        cwd=tmp_dir,
+                        timeout=30,
+                    )
+                elif kind == "codex":
+                    exe = shutil.which("codex")
+                    if not exe:
+                        continue
+                    proc = subprocess.run(
+                        [exe, "exec", "--skip-git-repo-check", prompt],
+                        capture_output=True,
+                        text=True,
+                        cwd=tmp_dir,
+                        timeout=30,
+                    )
+                elif kind == "opencode":
+                    exe = shutil.which("opencode")
+                    if not exe:
+                        continue
+                    proc = subprocess.run(
+                        [exe, "run", "--prompt", prompt],
+                        capture_output=True,
+                        text=True,
+                        cwd=tmp_dir,
+                        timeout=30,
+                    )
+                else:
+                    continue
+
+                out = (proc.stdout or "").strip()
+                if proc.returncode == 0 and len(out) > 40:
+                    return out, kind
+            except Exception:
+                continue
+        return None, preferred_kind or "agent"
+
     def generate_whats_new_summary(
         self,
         ctx: RepoContext,
@@ -851,6 +934,7 @@ class KanbanEngine:
         custom_markdown: str | None = None,
         author: str = "",
         agent_kind: str = "",
+        use_llm: bool = True,
     ) -> dict[str, Any]:
         """Generate or store an executive Markdown briefing of landed work + recent Git commits."""
         digest = self.build_whats_new_digest(ctx, tickets)
@@ -860,17 +944,11 @@ class KanbanEngine:
                 who = self.github.current_user()
             except Exception:
                 who = "agent"
-        kind = agent_kind or ctx.settings.default_agent_kind or "agent"
+        kind = agent_kind or ctx.settings.default_agent_kind or "claude"
 
         if custom_markdown and custom_markdown.strip():
             md = custom_markdown.strip()
         else:
-            # Synthesize rich briefing combining board tickets + recent git commits across top repos
-            lines: list[str] = [
-                f"## Executive Briefing — {ctx.display_name}",
-                "",
-                digest["auto_markdown"],
-            ]
             git_sections: list[str] = []
             checked_repos = [r["repo"] for r in digest["by_repo"][:6]]
             if not checked_repos and ctx.repos:
@@ -899,9 +977,69 @@ class KanbanEngine:
                         git_sections.append(f"#### Recent commits in `{alias}`\n{proc.stdout.strip()}")
                 except Exception:
                     continue
-            if git_sections:
-                lines.append("\n### Recent Git Commits on Shared Branches\n" + "\n\n".join(git_sections))
-            md = "\n".join(lines)
+
+            llm_md: str | None = None
+            if use_llm and digest["recent_landed"]:
+                llm_prompt_lines = [
+                    f"You are summarizing recently landed work for teammates in `{ctx.display_name}`.",
+                    "Write a concise, high-signal Markdown executive briefing (no conversational preamble).",
+                    "Structure your response with:",
+                    f"1. `## Executive Summary — {ctx.display_name}`: 2-3 sentences on the biggest themes.",
+                    (
+                        "2. `### Key Landed Highlights by Theme`: group the most important work into 3-5 "
+                        "bullets, citing clickable ticket links as `[repo#num](kanban://issue/repo#num)`."
+                    ),
+                    (
+                        "3. `### Colleague & Agent Velocity`: briefly highlight what each teammate "
+                        "(`@owner:agent`) delivered across repositories."
+                    ),
+                    "",
+                    "## Contributor Stats",
+                ]
+                for c in digest["contributors"][:8]:
+                    repos_str = ", ".join(c.get("repos", [])[:4])
+                    agents_str = ", ".join(c.get("agents", [])) or "agent"
+                    landed_cnt = c.get("landed_count", 0)
+                    llm_prompt_lines.append(
+                        f"- @{c['owner']} ({agents_str}): {landed_cnt} landed across {repos_str}"
+                    )
+                llm_prompt_lines.append("\n## Recently Landed Tickets")
+                for item in digest["recent_landed"][:25]:
+                    cli_ref = item["cli_ref"]
+                    ref = item["ref"]
+                    llm_prompt_lines.append(
+                        f"- [{ref}](kanban://issue/{cli_ref}) [{item['target_repo']}] ({item['priority']}) "
+                        f"{item['clean_title']} — by @{item['owner']}:{item['agent_kind'] or 'agent'}"
+                    )
+                    if item["summary_note"]:
+                        llm_prompt_lines.append(f"  Note: {item['summary_note']}")
+                if git_sections:
+                    llm_prompt_lines.append("\n## Recent Git Commits\n" + "\n\n".join(git_sections))
+
+                llm_md, used_kind = self._run_headless_whats_new_llm(
+                    ctx, "\n".join(llm_prompt_lines), kind
+                )
+                if llm_md:
+                    kind = used_kind
+
+            if llm_md:
+                md_parts = [llm_md.strip()]
+                if git_sections and "Recent Git Commits" not in llm_md:
+                    md_parts.append(
+                        "\n### Recent Git Commits on Shared Branches\n" + "\n\n".join(git_sections)
+                    )
+                md = "\n".join(md_parts)
+            else:
+                lines: list[str] = [
+                    f"## Executive Briefing — {ctx.display_name}",
+                    "",
+                    digest["auto_markdown"],
+                ]
+                if git_sections:
+                    lines.append(
+                        "\n### Recent Git Commits on Shared Branches\n" + "\n\n".join(git_sections)
+                    )
+                md = "\n".join(lines)
 
         summary_obj = {
             "markdown": md,

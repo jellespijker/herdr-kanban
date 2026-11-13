@@ -702,8 +702,12 @@ export default class KanbanBoard extends View {
             cx.notify();
           } else if (cmd === "whats_new" || cmd?.action === "whats_new") {
             this.syncBus({ viewMode: "whats_new" }, cx);
+            this.refresh(cx, true);
           } else if (cmd === "board" || cmd?.action === "board") {
             this.syncBus({ viewMode: "board" }, cx);
+          } else if (cmd === "summarize" || cmd?.action === "summarize") {
+            this.syncBus({ viewMode: "whats_new" }, cx);
+            this.synthesizeWhatsNew(cx);
           }
         }
       } catch {}
@@ -711,7 +715,19 @@ export default class KanbanBoard extends View {
   }
 
   target() {
-    return resolveSpaceTarget(this.overrideSpaceId, this.bus?.resolvedCwdBySpace);
+    const t = resolveSpaceTarget(this.overrideSpaceId, this.bus?.resolvedCwdBySpace);
+    const cacheKey = t.spaceId || `machine:${t.on || "local"}`;
+    const cachedCwd =
+      (this.bus && this.bus.resolvedCwdBySpace && this.bus.resolvedCwdBySpace[cacheKey]) ||
+      this.activeCwd ||
+      (this.bus && this.bus.lastValidCwd);
+    if (cachedCwd) {
+      t.cwd = cachedCwd;
+      if (Array.isArray(t.candidates) && t.candidates[0] !== cachedCwd) {
+        t.candidates = [cachedCwd, ...t.candidates.filter((c) => c !== cachedCwd)];
+      }
+    }
+    return t;
   }
 
   syncBus(patch, cx) {
@@ -747,7 +763,11 @@ export default class KanbanBoard extends View {
 
   execKanban(args, targetOverride) {
     const tgt = targetOverride || this.target();
-    const cwd = tgt.cwd;
+    const cwd =
+      (targetOverride && targetOverride.cwd) ||
+      this.activeCwd ||
+      (this.bus && this.bus.lastValidCwd) ||
+      tgt.cwd;
     const fullArgs = args.length > 0 ? [args[0]] : [];
     if (cwd) {
       fullArgs.push("--cwd", cwd);
@@ -794,8 +814,12 @@ export default class KanbanBoard extends View {
           }
           lastRes = res;
           if (res && res.code === 0) {
-            if (tgt.spaceId && this.bus && this.bus.resolvedCwdBySpace) {
-              this.bus.resolvedCwdBySpace[tgt.spaceId] = candCwd;
+            const cacheKey = tgt.spaceId || `machine:${tgt.on || "local"}`;
+            if (this.bus && this.bus.resolvedCwdBySpace) {
+              this.bus.resolvedCwdBySpace[cacheKey] = candCwd;
+              if (tgt.spaceId) {
+                this.bus.resolvedCwdBySpace[tgt.spaceId] = candCwd;
+              }
             }
             break;
           }
@@ -827,6 +851,9 @@ export default class KanbanBoard extends View {
         const data = JSON.parse(res.stdout);
         this.board = data;
         this.activeCwd = chosenCwd;
+        if (this.bus && chosenCwd) {
+          this.bus.lastValidCwd = chosenCwd;
+        }
         this.error = "";
         this.loading = false;
 
@@ -1213,7 +1240,7 @@ export default class KanbanBoard extends View {
       run("tab.new", {
         name: `${ticket.ref || "#" + ticket.number} ${ticket.title.slice(0, 24)}`,
         space: tgt.spaceId,
-        cwd: lc.worktree_path,
+        folder: lc.worktree_path,
       });
       this.statusMessage = `Opened worktree tab for ${ticket.ref || "#" + ticket.number}`;
       cx.notify();
@@ -1231,6 +1258,7 @@ export default class KanbanBoard extends View {
     const disp = ticket.ref || `#${ticket.number}`;
     const kind = this.agentKind || "claude";
     const tgt = this.target();
+    const effectiveCwd = this.activeCwd || (this.bus && this.bus.lastValidCwd) || tgt.cwd;
 
     this.busyText = `Claiming & dispatching ${disp} (${kind})…`;
     this.error = "";
@@ -1240,7 +1268,7 @@ export default class KanbanBoard extends View {
       try {
         const claimArgs = ["claim", cliRef, "--kind", kind, "--json"];
         if (takeover || ticket.stale) claimArgs.push("--takeover");
-        const res = await this.execKanban(claimArgs, tgt);
+        const res = await this.execKanban(claimArgs, { ...tgt, cwd: effectiveCwd });
         if (!res || res.code !== 0) {
           let errText = (res && (res.stderr || res.stdout)) || "Claim failed";
           try {
@@ -1265,7 +1293,7 @@ export default class KanbanBoard extends View {
         run("tab.new", {
           name: tabName,
           space: tgt.spaceId,
-          cwd: claim.worktree_path || tgt.cwd,
+          folder: claim.worktree_path || effectiveCwd,
           argv,
           task: prompt,
         });
@@ -1284,15 +1312,17 @@ export default class KanbanBoard extends View {
   synthesizeWhatsNew(cx) {
     if (this.busyText) return;
     const tgt = this.target();
-    this.busyText = "Synthesizing landed work & recent Git commits…";
+    const kind = this.agentKind || "claude";
+    const effectiveCwd = this.activeCwd || (this.bus && this.bus.lastValidCwd) || tgt.cwd;
+    this.busyText = `Summarizing landed work with ${kind}…`;
     this.error = "";
     cx.notify();
 
     cx.spawn(async (cx) => {
       try {
         const res = await this.execKanban(
-          ["whats-new", "--generate", "--agent", this.agentKind || "agent", "--json"],
-          tgt
+          ["whats-new", "--generate", "--agent", kind, "--json"],
+          { ...tgt, cwd: effectiveCwd }
         );
         this.busyText = "";
         if (!res || res.code !== 0) {
@@ -1304,7 +1334,8 @@ export default class KanbanBoard extends View {
         if (this.board) {
           this.board.whats_new = digest;
         }
-        this.statusMessage = "Updated What's New executive briefing";
+        const usedAgent = (digest.saved_summary && digest.saved_summary.agent_kind) || kind;
+        this.statusMessage = `Summarized What's New briefing via ${usedAgent}`;
         cx.notify();
       } catch (err) {
         this.busyText = "";
@@ -1318,12 +1349,17 @@ export default class KanbanBoard extends View {
     if (this.busyText) return;
     const tgt = this.target();
     const kind = this.agentKind || "claude";
-    this.busyText = `Launching ${kind} to author team briefing…`;
+    const effectiveCwd = this.activeCwd || (this.bus && this.bus.lastValidCwd) || tgt.cwd;
+    this.busyText = `Opening ${kind} tab for What's New briefing…`;
+    this.error = "";
     cx.notify();
 
     cx.spawn(async (cx) => {
       try {
-        const res = await this.execKanban(["whats-new", "--prompt", "--json"], tgt);
+        const res = await this.execKanban(
+          ["whats-new", "--prompt", "--agent", kind, "--json"],
+          { ...tgt, cwd: effectiveCwd }
+        );
         this.busyText = "";
         if (!res || res.code !== 0) {
           this.error = ((res && (res.stderr || res.stdout)) || "Failed to build prompt").trim();
@@ -1331,14 +1367,18 @@ export default class KanbanBoard extends View {
           return;
         }
         const payload = JSON.parse(res.stdout);
+        const argv =
+          Array.isArray(payload.agent_argv) && payload.agent_argv.length > 0
+            ? payload.agent_argv
+            : [kind];
         run("tab.new", {
-          name: `What's New Briefing (${kind})`,
+          name: `What's New (${kind})`,
           space: tgt.spaceId,
-          cwd: this.activeCwd || tgt.cwd,
-          argv: [kind],
+          folder: payload.cwd || effectiveCwd,
+          argv,
           task: payload.prompt || "",
         });
-        this.statusMessage = `Dispatched ${kind} to write What's New briefing`;
+        this.statusMessage = `Opened ${kind} tab for What's New briefing`;
         cx.notify();
       } catch (err) {
         this.busyText = "";
@@ -3113,15 +3153,42 @@ export default class KanbanBoard extends View {
               .flex_none()
               .gap(5)
               .child(
-                btn("wn-synthesize", "Synthesize (s)", t, {
+                h_flex()
+                  .items_center()
+                  .gap(2)
+                  .px(3)
+                  .py(2)
+                  .rounded(5)
+                  .bg(t.background)
+                  .border_1()
+                  .border_color(t.border)
+                  .children(
+                    AGENT_KINDS.map((ag) => {
+                      const active = this.agentKind === ag;
+                      return Button.new(`wn-agent-${ag}`)
+                        .px(5)
+                        .py(1)
+                        .rounded(4)
+                        .cursor_pointer()
+                        .bg(active ? t.selected : "transparent")
+                        .text_size(10)
+                        .text_color(active ? t.accent : t.muted)
+                        .selected(active)
+                        .on_click((_e, cx) => this.syncBus({ agentKind: ag }, cx))
+                        .child(ag);
+                    })
+                  )
+              )
+              .child(
+                btn("wn-synthesize", `Summarize (${this.agentKind || "claude"})`, t, {
                   primary: true,
                   small: true,
-                  iconPath: "mods/herdr-kanban/refresh.svg",
+                  iconPath: "mods/herdr-kanban/sparkles.svg",
                   onClick: (_ev, cx) => this.synthesizeWhatsNew(cx),
                 })
               )
               .child(
-                btn("wn-dispatch-agent", `Summarize (${this.agentKind || "agent"})`, t, {
+                btn("wn-dispatch-agent", "Open Tab", t, {
                   small: true,
                   iconPath: "mods/workspace-chrome/terminal.svg",
                   onClick: (_ev, cx) => this.dispatchWhatsNewAgent(cx),
