@@ -593,7 +593,7 @@ export default class KanbanBoard extends View {
       views: new Set(),
       searchQuery: "",
       repoFilter: "",
-      quickFilter: "all", // "all" | "active" | "p0"
+      quickFilter: "active", // "active" | "all" | "p0"
       compactEmpty: true,
       viewMode: "board", // "board" | "whats_new"
       agentKind: "claude",
@@ -603,11 +603,18 @@ export default class KanbanBoard extends View {
       modalMode: null,
       resolvedCwdBySpace: {},
     });
+    if (!bus.quickFilterMigratedV044) {
+      bus.quickFilter = "active";
+      bus.quickFilterMigratedV044 = true;
+    }
+    if (props()?.view === "board" || props()?.view === "whats_new") {
+      bus.viewMode = props().view;
+    }
     bus.resolvedCwdBySpace ??= {};
     bus.views.add(this);
     this.bus = bus;
 
-    this.board = null;
+    this.board = bus.lastBoard || null;
     this.loading = false;
     this.busyText = "";
     this.error = "";
@@ -617,7 +624,7 @@ export default class KanbanBoard extends View {
     this.overrideSpaceId = bus.overrideSpaceId;
     this.lastTargetKey = "";
     this.repoFilter = bus.repoFilter;
-    this.quickFilter = bus.quickFilter || "all";
+    this.quickFilter = bus.quickFilter || "active";
     this.compactEmpty = bus.compactEmpty !== false;
     this.viewMode = bus.viewMode || "board";
     this.agentKind = bus.agentKind;
@@ -628,6 +635,9 @@ export default class KanbanBoard extends View {
     this.selectedRef = null;
     this.showDrawer = bus.showDrawer !== false;
     this.drawerTall = Boolean(bus.drawerTall);
+    if (this.board) {
+      this.syncSelectionAfterLoad();
+    }
 
     // 2D Board & Filter strip pan state
     this.panX = 0;
@@ -851,8 +861,9 @@ export default class KanbanBoard extends View {
         const data = JSON.parse(res.stdout);
         this.board = data;
         this.activeCwd = chosenCwd;
-        if (this.bus && chosenCwd) {
-          this.bus.lastValidCwd = chosenCwd;
+        if (this.bus) {
+          this.bus.lastBoard = data;
+          if (chosenCwd) this.bus.lastValidCwd = chosenCwd;
         }
         this.error = "";
         this.loading = false;
@@ -953,6 +964,16 @@ export default class KanbanBoard extends View {
   }
 
   syncSelectionAfterLoad() {
+    const allTickets =
+      (this.board && Array.isArray(this.board.tickets) && this.board.tickets) || [];
+    const activeCount = allTickets.filter((t) => t.column !== "done").length;
+    if (!this.bus?.userPickedQuickFilter) {
+      const autoFilter = activeCount > 0 ? "active" : "all";
+      if (this.quickFilter !== autoFilter) {
+        this.quickFilter = autoFilter;
+        if (this.bus) this.bus.quickFilter = autoFilter;
+      }
+    }
     const byCol = this.ticketsByColumn();
     if (this.selectedRef) {
       for (let c = 0; c < COLUMNS.length; c++) {
@@ -1617,15 +1638,25 @@ export default class KanbanBoard extends View {
 
     const repoCounts = {};
     for (const tk of allTickets) {
+      if (this.quickFilter === "active" && tk.column === "done") continue;
+      if (this.quickFilter === "p0" && tk.priority !== "P0") continue;
       const key = tk.target_repo || tk.repo_alias || tk.repo_name || "";
       if (key) repoCounts[key] = (repoCounts[key] || 0) + 1;
     }
-    const repoAliases = [...rawRepoAliases].sort((a, b) => {
-      const ca = repoCounts[a] || 0;
-      const cb = repoCounts[b] || 0;
-      if (cb !== ca) return cb - ca;
-      return a.localeCompare(b);
-    });
+    const repoAliases = [...rawRepoAliases]
+      .filter((a) => {
+        if (this.repoFilter === a) return true;
+        if (this.quickFilter === "active" && activeCount > 0) {
+          return (repoCounts[a] || 0) > 0;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const ca = repoCounts[a] || 0;
+        const cb = repoCounts[b] || 0;
+        if (cb !== ca) return cb - ca;
+        return a.localeCompare(b);
+      });
 
     const isPanned = this.panX !== 0 || this.panY !== 0;
 
@@ -1827,18 +1858,6 @@ export default class KanbanBoard extends View {
                   },
                 })
               )
-              .when(this.viewMode === "board", (el) =>
-                el.child(
-                  btn("btn-drawer", "Inspector", t, {
-                    small: true,
-                    selected: this.showDrawer,
-                    iconPath: "mods/workspace-chrome/panel-right.svg",
-                    onClick: (_ev, cx) => {
-                      this.syncBus({ showDrawer: !this.showDrawer }, cx);
-                    },
-                  })
-                )
-              )
               .child(
                 btn("btn-refresh", "", t, {
                   small: true,
@@ -1850,7 +1869,7 @@ export default class KanbanBoard extends View {
       )
       .when(Boolean(this.board && this.viewMode === "board"), (hdr) =>
         hdr.child(
-          // Row 2: Scope Filters + Adaptive Layout Toggle + Pannable Repository Filter Strip
+          // Row 2: Scope Filters + Pannable Repository Filter Strip
           h_flex()
             .id("kanban-subbar")
             .w_full()
@@ -1868,10 +1887,10 @@ export default class KanbanBoard extends View {
                 .items_center()
                 .flex_none()
                 .gap(4)
-                .children([
-                  ...[
-                    { id: "all", label: `All (${allTickets.length})` },
+                .children(
+                  [
                     { id: "active", label: `Active (${activeCount})` },
+                    { id: "all", label: `All (${allTickets.length})` },
                     { id: "p0", label: "P0" },
                   ].map((flt) => {
                     const on = this.quickFilter === flt.id;
@@ -1889,28 +1908,12 @@ export default class KanbanBoard extends View {
                       .text_color(on ? t.foreground : t.muted)
                       .hover((s) => s.bg(t.hover))
                       .on_click((_ev, cx) => {
+                        if (this.bus) this.bus.userPickedQuickFilter = true;
                         this.syncBus({ quickFilter: flt.id }, cx);
                       })
                       .child(flt.label);
-                  }),
-                  div()
-                    .id("toggle-compact-empty")
-                    .px(7)
-                    .py(2)
-                    .rounded(5)
-                    .cursor_pointer()
-                    .bg(this.compactEmpty ? t.selected : t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .text_size(10.5)
-                    .text_color(this.compactEmpty ? t.accent : t.dim)
-                    .hover((s) => s.bg(t.hover))
-                    .on_click((_ev, cx) => {
-                      this.syncBus({ compactEmpty: !this.compactEmpty }, cx);
-                      this.resetPan(cx);
-                    })
-                    .child(this.compactEmpty ? "Compact" : "Full Cols"),
-                ])
+                  })
+                )
                 .when(isPanned, (el) =>
                   el.child(
                     div()
@@ -2122,13 +2125,13 @@ export default class KanbanBoard extends View {
             )
         )
         .child(
-          h_flex()
-            .items_center()
-            .gap(8)
+          v_flex()
+            .w_full()
+            .gap(6)
             .child(
               div()
                 .id("dep-title-wrap")
-                .flex_1()
+                .w_full()
                 .h(28)
                 .px(8)
                 .flex()
@@ -2143,38 +2146,44 @@ export default class KanbanBoard extends View {
                 )
             )
             .child(
-              div()
-                .id("dep-body-wrap")
-                .flex_1()
-                .h(28)
-                .px(8)
-                .flex()
+              h_flex()
+                .w_full()
                 .items_center()
-                .rounded(6)
-                .bg(t.background)
-                .border_1()
-                .border_color(t.border)
-                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .gap(8)
                 .child(
-                  Input.new(this.depositBodyInput).h_full().text_size(12).text_color(t.foreground)
+                  div()
+                    .id("dep-body-wrap")
+                    .flex_1()
+                    .h(28)
+                    .px(8)
+                    .flex()
+                    .items_center()
+                    .rounded(6)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .child(
+                      Input.new(this.depositBodyInput).h_full().text_size(12).text_color(t.foreground)
+                    )
                 )
-            )
-            .child(
-              btn("dep-submit", "Create Ticket", t, {
-                primary: true,
-                small: true,
-                onClick: (_ev, cx) => this.submitDeposit(cx),
-              })
-            )
-            .child(
-              btn("dep-cancel", "Cancel", t, {
-                small: true,
-                onClick: (_ev, cx) => {
-                  this.modalMode = null;
-                  this.handle.focus();
-                  cx.notify();
-                },
-              })
+                .child(
+                  btn("dep-submit", "Create Ticket", t, {
+                    primary: true,
+                    small: true,
+                    onClick: (_ev, cx) => this.submitDeposit(cx),
+                  })
+                )
+                .child(
+                  btn("dep-cancel", "Cancel", t, {
+                    small: true,
+                    onClick: (_ev, cx) => {
+                      this.modalMode = null;
+                      this.handle.focus();
+                      cx.notify();
+                    },
+                  })
+                )
             )
         );
     }
@@ -2287,7 +2296,7 @@ export default class KanbanBoard extends View {
               )
             )
             .child(
-              btn("tri-close", "Done", t, {
+              btn("tri-close", "Close", t, {
                 small: true,
                 onClick: (_ev, cx) => {
                   this.modalMode = null;
@@ -2306,8 +2315,9 @@ export default class KanbanBoard extends View {
     const disp = ticket.ref || `#${ticket.number}`;
     const { cleanTitle, jiraKeys, scopes } = parseTicketTitle(ticket);
     const claim = ticket.claim || null;
+    const isDoneCol = ticket.column === "done";
     const hasActiveClaim =
-      claim && (claim.state === "active" || claim.state === "review_ready");
+      !isDoneCol && claim && (claim.state === "active" || claim.state === "review_ready");
     const overlaps = Array.isArray(ticket.overlaps) ? ticket.overlaps : [];
     const unmetDeps = Array.isArray(ticket.unmet_deps) ? ticket.unmet_deps : [];
     const blocks = Array.isArray(ticket.blocks) ? ticket.blocks : [];
@@ -2321,7 +2331,6 @@ export default class KanbanBoard extends View {
     const touchedCount =
       claim && Array.isArray(claim.touched_files) ? claim.touched_files.length : 0;
     const rt = findTicketRuntime(ticket);
-    const isDoneCol = ticket.column === "done";
     const isDepBlocked = !isDoneCol && unmetDeps.length > 0;
     const blockedCol = t.blocked || t.ansi1 || "#e05252";
     const allTickets = (this.board && Array.isArray(this.board.tickets) && this.board.tickets) || [];
@@ -2340,9 +2349,10 @@ export default class KanbanBoard extends View {
         ? ticket.target_repo
         : scopes[0] || "";
     const hasTopAlert =
-      overlaps.length > 0 ||
-      Boolean(ticket.stale) ||
-      (!isDepBlocked && !isDoneCol && blocks.length > 0);
+      !isDoneCol &&
+      (overlaps.length > 0 ||
+        Boolean(ticket.stale) ||
+        (!isDepBlocked && blocks.length > 0));
     const showRepoTopRight = !hasTopAlert && Boolean(repoTag);
     const showJiraTopRight = !hasTopAlert && !showRepoTopRight && jiraKeys.length > 0;
 
@@ -3091,6 +3101,13 @@ export default class KanbanBoard extends View {
     const mdLinked = linkifyKanbanRefs(mdRaw, defaultRepo);
     const panelW = this.size?.width ?? 840;
     const isSplit = panelW >= 660;
+    const agentChoices = (
+      (this.board &&
+        this.board.settings &&
+        Array.isArray(this.board.settings.supported_agents) &&
+        this.board.settings.supported_agents) ||
+      DEFAULT_AGENTS
+    ).slice(0, 4);
 
     return v_flex()
       .id("whats-new-root")
@@ -3163,17 +3180,17 @@ export default class KanbanBoard extends View {
                   .border_1()
                   .border_color(t.border)
                   .children(
-                    AGENT_KINDS.map((ag) => {
+                    agentChoices.slice(0, 4).map((ag) => {
                       const active = this.agentKind === ag;
-                      return Button.new(`wn-agent-${ag}`)
+                      return div()
+                        .id(`wn-agent-${ag}`)
                         .px(5)
                         .py(1)
                         .rounded(4)
                         .cursor_pointer()
-                        .bg(active ? t.selected : "transparent")
+                        .bg(active ? t.selected : t.background)
                         .text_size(10)
                         .text_color(active ? t.accent : t.muted)
-                        .selected(active)
                         .on_click((_e, cx) => this.syncBus({ agentKind: ag }, cx))
                         .child(ag);
                     })
@@ -3187,40 +3204,35 @@ export default class KanbanBoard extends View {
                   onClick: (_ev, cx) => this.synthesizeWhatsNew(cx),
                 })
               )
-              .child(
-                btn("wn-dispatch-agent", "Open Tab", t, {
-                  small: true,
-                  iconPath: "mods/workspace-chrome/terminal.svg",
-                  onClick: (_ev, cx) => this.dispatchWhatsNewAgent(cx),
-                })
-              )
-              .child(
-                btn("wn-back-board", "Board (b)", t, {
-                  small: true,
-                  onClick: (_ev, cx) => this.syncBus({ viewMode: "board" }, cx),
-                })
-              )
           )
       )
       .child(
-        // Split Body: Left = Markdown Executive Briefing, Right = Colleague Cards & Landed Feed
+        // Split Body on wide viewports (Left = Markdown Executive Briefing, Right = Colleague Cards & Landed Feed),
+        // or unified vertical scroll on narrower split panes so the Executive Briefing always leads at the top
         (isSplit ? h_flex() : v_flex())
+          .id("whats-new-body")
           .flex_1()
           .min_h(0)
           .w_full()
-          .overflow_hidden()
+          .when(isSplit, (el) => el.overflow_hidden())
+          .when(!isSplit, (el) => el.overflow_y_scrollbar())
           .child(
-            // Left: Rich Markdown Executive Briefing
+            // Left (or Top): Rich Markdown Executive Briefing
             v_flex()
               .id("whats-new-md-pane")
-              .flex_1()
-              .min_w(0)
-              .min_h(0)
-              .h_full()
+              .when(isSplit, (el) =>
+                el
+                  .flex_1()
+                  .min_w(0)
+                  .min_h(0)
+                  .h_full()
+                  .overflow_y_scrollbar()
+                  .border_r(1)
+                  .border_color(t.border)
+              )
+              .when(!isSplit, (el) => el.w_full().flex_none().pb(0))
               .p(14)
               .gap(10)
-              .overflow_y_scrollbar()
-              .when(isSplit, (el) => el.border_r(1).border_color(t.border))
               .child(
                 v_flex()
                   .w_full()
@@ -3238,16 +3250,14 @@ export default class KanbanBoard extends View {
               )
           )
           .child(
-            // Right: Colleagues & Recently Landed Cards
+            // Right (or Bottom): Colleagues & Recently Landed Cards
             v_flex()
               .id("whats-new-feed-pane")
               .w(isSplit ? Math.min(390, Math.round(panelW * 0.44)) : panelW)
               .flex_none()
-              .min_h(0)
-              .h_full()
+              .when(isSplit, (el) => el.min_h(0).h_full().overflow_y_scrollbar())
               .p(14)
               .gap(12)
-              .overflow_y_scrollbar()
               .when(contributors.length > 0, (el) =>
                 el.child(
                   v_flex()
@@ -3532,7 +3542,7 @@ export default class KanbanBoard extends View {
 
     const drawerH = this.drawerTall ? 410 : 268;
     const panelW = this.size?.width ?? 840;
-    const isSplit = panelW >= 620;
+    const isSplit = panelW >= 540;
 
     if (!ticket) {
       return v_flex()
@@ -3560,7 +3570,9 @@ export default class KanbanBoard extends View {
     const colColor = columnAccent(ticket.column, t);
     const claim = ticket.claim || null;
     const lc = ticket.local_claim || null;
-    const hasClaim = claim && (claim.state === "active" || claim.state === "review_ready");
+    const isDoneTicket = ticket.column === "done";
+    const hasClaim =
+      !isDoneTicket && claim && (claim.state === "active" || claim.state === "review_ready");
     const overlaps = Array.isArray(ticket.overlaps) ? ticket.overlaps : [];
     const deps = Array.isArray(ticket.depends_on) ? ticket.depends_on : [];
     const unmet = new Set(Array.isArray(ticket.unmet_deps) ? ticket.unmet_deps : []);
@@ -3574,6 +3586,10 @@ export default class KanbanBoard extends View {
         Array.isArray(this.board.settings.supported_agents) &&
         this.board.settings.supported_agents) ||
       DEFAULT_AGENTS;
+    const prios =
+      this.board && Array.isArray(this.board.priorities) && this.board.priorities.length
+        ? this.board.priorities
+        : DEFAULT_PRIORITIES;
 
     const defaultRepo = (this.board && this.board.default_repo) || "";
     const cleanBody = stripKanbanMeta(ticket.body) || "*No description provided.*";
@@ -3583,7 +3599,235 @@ export default class KanbanBoard extends View {
     const allTickets = (this.board && Array.isArray(this.board.tickets) && this.board.tickets) || [];
     const agentVis = resolveTicketAgentVisual(ticket, allTickets, rt, t);
     const blockedCol = t.blocked || t.ansi1 || "#e05252";
-    const isDepBlocked = ticket.column !== "done" && unmet.size > 0;
+    const isDepBlocked = !isDoneTicket && unmet.size > 0;
+    const firstBlocker = isDepBlocked ? Array.from(unmet)[0] : null;
+    const hasLeftPanel =
+      !isDoneTicket &&
+      Boolean(
+        overlaps.length > 0 ||
+          hasClaim ||
+          checklist.length > 0 ||
+          deps.length > 0 ||
+          blocks.length > 0 ||
+          touched.length > 0
+      );
+
+    const renderAgentSelector = () =>
+      h_flex()
+        .items_center()
+        .flex_none()
+        .gap(2)
+        .p(2)
+        .rounded(5)
+        .bg(t.background)
+        .border_1()
+        .border_color(t.border)
+        .children(
+          agentChoices.slice(0, 4).map((ag) => {
+            const active = this.agentKind === ag;
+            return div()
+              .id(`insp-agent-${ag}`)
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .cursor_pointer()
+              .bg(active ? t.selected : t.background)
+              .text_size(10)
+              .text_color(active ? t.accent : t.dim)
+              .child(ag)
+              .on_click((_ev, cx) => {
+                this.syncBus({ agentKind: ag }, cx);
+              });
+          })
+        );
+
+    const leftActions = [];
+    const rightActions = [];
+
+    if (isDoneTicket) {
+      // Done tickets are completed archive items — zero action bar clutter
+    } else if (isDepBlocked) {
+      leftActions.push(
+        btn(
+          "act-jump-blocker",
+          `Locked by #${firstBlocker} — Jump to Blocker`,
+          t,
+          {
+            small: true,
+            dangerOutline: true,
+            iconPath: "mods/herdr-kanban/lock.svg",
+            onClick: (_ev, cx) => this.selectTicketByRef(String(firstBlocker), cx),
+          }
+        )
+      );
+    } else if (ticket.column === "triage") {
+      leftActions.push(
+        btn("act-promote", "Promote to Ready (t)", t, {
+          primary: true,
+          small: true,
+          onClick: (_ev, cx) =>
+            this.runTicketAction(
+              `Promoted ${disp} to Ready`,
+              ["triage", cliRef, "--ready", "--force"],
+              cx
+            ),
+        }),
+        h_flex()
+          .items_center()
+          .flex_none()
+          .gap(2)
+          .p(2)
+          .rounded(5)
+          .bg(t.background)
+          .border_1()
+          .border_color(t.border)
+          .children(
+            prios.map((p) => {
+              const active = ticket.priority === p;
+              return div()
+                .id(`insp-prio-${p}`)
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .cursor_pointer()
+                .bg(active ? t.selected : t.background)
+                .text_size(10)
+                .font_semibold()
+                .text_color(active ? priorityColor(p, t) : t.dim)
+                .child(p)
+                .on_click((_ev, cx) =>
+                  this.runTicketAction(
+                    `Set ${disp} priority to ${p}`,
+                    ["triage", cliRef, "--priority", p],
+                    cx
+                  )
+                );
+            })
+          ),
+        btn("act-dispatch", `Dispatch (${this.agentKind}) (s)`, t, {
+          small: true,
+          iconPath: "mods/workspace-chrome/terminal.svg",
+          onClick: (_ev, cx) => this.claimAndDispatch(ticket, false, cx),
+        }),
+        renderAgentSelector()
+      );
+    } else if (ticket.column === "in_progress" || hasClaim) {
+      if (rt.active) {
+        leftActions.push(
+          btn("act-focus", "Jump to Agent (f)", t, {
+            primary: true,
+            small: true,
+            iconPath: "mods/workspace-chrome/terminal.svg",
+            onClick: (_ev, cx) => this.focusTicketAgent(ticket, cx),
+          })
+        );
+      } else {
+        leftActions.push(
+          btn(
+            "act-dispatch",
+            ticket.stale
+              ? `Takeover (${this.agentKind}) (s)`
+              : `Resume Agent (${this.agentKind}) (s)`,
+            t,
+            {
+              primary: true,
+              small: true,
+              iconPath: "mods/workspace-chrome/terminal.svg",
+              onClick: (_ev, cx) =>
+                this.claimAndDispatch(ticket, Boolean(ticket.stale), cx),
+            }
+          ),
+          renderAgentSelector()
+        );
+        if (lc && lc.worktree_path) {
+          leftActions.push(
+            btn("act-focus", "Open Shell (f)", t, {
+              small: true,
+              onClick: (_ev, cx) => this.focusTicketAgent(ticket, cx),
+            })
+          );
+        }
+      }
+      leftActions.push(
+        btn("act-ask", "Steer Agent (c)", t, {
+          small: true,
+          selected: this.modalMode === "ask",
+          onClick: (_ev, cx) => {
+            this.modalMode = this.modalMode === "ask" ? null : "ask";
+            if (this.modalMode === "ask") this.askInput.focus();
+            cx.notify();
+          },
+        }),
+        btn("act-approve", "Approve & Land (a)", t, {
+          small: true,
+          iconPath: "mods/workspace-chrome/check.svg",
+          onClick: (_ev, cx) =>
+            this.runTicketAction(`Landing ${disp}`, ["done", cliRef, "--approve"], cx),
+        })
+      );
+      if (hasClaim) {
+        rightActions.push(
+          btn("act-release", "Unclaim", t, {
+            dangerOutline: true,
+            small: true,
+            onClick: (_ev, cx) =>
+              this.runTicketAction(`Unclaimed ${disp}`, ["release", cliRef], cx),
+          })
+        );
+      }
+    } else if (ticket.column === "review") {
+      leftActions.push(
+        btn("act-approve", "Approve & Land (a)", t, {
+          primary: true,
+          small: true,
+          iconPath: "mods/workspace-chrome/check.svg",
+          onClick: (_ev, cx) =>
+            this.runTicketAction(`Landing ${disp}`, ["done", cliRef, "--approve"], cx),
+        })
+      );
+      if (rt.active || (lc && lc.worktree_path)) {
+        leftActions.push(
+          btn("act-focus", rt.active ? "Jump to Agent (f)" : "Open Shell (f)", t, {
+            small: true,
+            onClick: (_ev, cx) => this.focusTicketAgent(ticket, cx),
+          })
+        );
+      }
+      leftActions.push(
+        btn("act-ask", "Steer Agent (c)", t, {
+          small: true,
+          selected: this.modalMode === "ask",
+          onClick: (_ev, cx) => {
+            this.modalMode = this.modalMode === "ask" ? null : "ask";
+            if (this.modalMode === "ask") this.askInput.focus();
+            cx.notify();
+          },
+        })
+      );
+      if (hasClaim) {
+        rightActions.push(
+          btn("act-release", "Unclaim", t, {
+            dangerOutline: true,
+            small: true,
+            onClick: (_ev, cx) =>
+              this.runTicketAction(`Unclaimed ${disp}`, ["release", cliRef], cx),
+          })
+        );
+      }
+    } else {
+      // Ready or Blocked (manual)
+      leftActions.push(
+        btn("act-dispatch", `Dispatch (${this.agentKind}) (s)`, t, {
+          primary: true,
+          small: true,
+          iconPath: "mods/workspace-chrome/terminal.svg",
+          onClick: (_ev, cx) => this.claimAndDispatch(ticket, false, cx),
+        }),
+        renderAgentSelector()
+      );
+    }
+
+    const showActionRow = leftActions.length > 0 || rightActions.length > 0;
 
     return v_flex()
       .id("ticket-inspector")
@@ -3597,18 +3841,18 @@ export default class KanbanBoard extends View {
         agentVis ? agentVis.color : isDepBlocked ? blockedCol : t.border
       )
       .child(
-        // Compact 2-Row Inspector Header
+        // Contextual Inspector Header (1 row for Done tickets, 2 rows for active orchestration)
         v_flex()
           .w_full()
           .flex_none()
           .gap(6)
           .px(12)
-          .py(8)
+          .py(7)
           .bg(t.chrome || t.surface)
           .border_b(1)
           .border_color(t.border)
           .child(
-            // Row 1: Issue Ref + Column + Priority + Clean Title + Status Badge + Expand / Close
+            // Row 1: Issue Ref + Clickable Column/Priority Override Pills + Clean Title + Status Badge + Expand / Close
             h_flex()
               .w_full()
               .items_center()
@@ -3632,13 +3876,22 @@ export default class KanbanBoard extends View {
                   )
                   .child(
                     h_flex()
+                      .id("insp-col-pill")
                       .flex_none()
                       .items_center()
                       .gap(4)
                       .px(6)
                       .py(1)
                       .rounded(4)
+                      .cursor_pointer()
                       .bg(withAlpha(colColor, "18") || t.background)
+                      .when(this.modalMode === "triage", (el) =>
+                        el.border_1().border_color(t.accent)
+                      )
+                      .on_click((_ev, cx) => {
+                        this.modalMode = this.modalMode === "triage" ? null : "triage";
+                        cx.notify();
+                      })
                       .child(div().size(5).rounded_full().bg(colColor))
                       .child(
                         div()
@@ -3651,14 +3904,20 @@ export default class KanbanBoard extends View {
                   .when(Boolean(ticket.priority), (d) =>
                     d.child(
                       div()
+                        .id("insp-prio-pill")
                         .flex_none()
                         .px(5)
                         .py(1)
                         .rounded(4)
+                        .cursor_pointer()
                         .bg(withAlpha(priorityColor(ticket.priority, t), "18") || t.background)
                         .text_size(10.5)
                         .font_semibold()
                         .text_color(priorityColor(ticket.priority, t))
+                        .on_click((_ev, cx) => {
+                          this.modalMode = this.modalMode === "triage" ? null : "triage";
+                          cx.notify();
+                        })
                         .child(ticket.priority)
                     )
                   )
@@ -3765,570 +4024,436 @@ export default class KanbanBoard extends View {
                   )
               )
           )
-          .child(
-            // Row 2: Unified Single-Row Workflow Action Bar (bounded so left & right never collide)
-            h_flex()
-              .w_full()
-              .items_center()
-              .justify_between()
-              .gap(8)
-              .overflow_hidden()
-              .child(
-                h_flex()
-                  .items_center()
-                  .min_w(0)
-                  .flex_1()
-                  .overflow_hidden()
-                  .gap(5)
-                  .children([
-                    btn(
-                      "act-dispatch",
-                      ticket.stale
-                        ? `Takeover (${this.agentKind})`
-                        : hasClaim && lc
-                        ? `Re-dispatch`
-                        : `Dispatch (${this.agentKind})`,
-                      t,
-                      {
-                        primary: true,
-                        small: true,
-                        iconPath: "mods/workspace-chrome/terminal.svg",
-                        onClick: (_ev, cx) =>
-                          this.claimAndDispatch(ticket, Boolean(ticket.stale), cx),
-                      }
-                    ),
+          .when(showActionRow, (hdr) =>
+            hdr.child(
+              // Row 2: State-Driven Agent Orchestration Action Bar
+              h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(8)
+                .overflow_hidden()
+                .child(
+                  h_flex()
+                    .items_center()
+                    .min_w(0)
+                    .flex_1()
+                    .overflow_hidden()
+                    .gap(5)
+                    .children(leftActions)
+                )
+                .when(rightActions.length > 0, (r) =>
+                  r.child(
                     h_flex()
                       .items_center()
                       .flex_none()
-                      .gap(2)
-                      .p(2)
-                      .rounded(5)
-                      .bg(t.background)
-                      .border_1()
-                      .border_color(t.border)
-                      .children(
-                        agentChoices.slice(0, 4).map((ag) => {
-                          const active = this.agentKind === ag;
-                          return div()
-                            .id(`insp-agent-${ag}`)
-                            .px(5)
-                            .py(1)
-                            .rounded(4)
-                            .cursor_pointer()
-                            .bg(active ? t.selected : t.background)
-                            .text_size(10)
-                            .text_color(active ? t.accent : t.dim)
-                            .child(ag)
-                            .on_click((_ev, cx) => {
-                              this.syncBus({ agentKind: ag }, cx);
-                            });
-                        })
-                      ),
-                    ...(rt.active || (lc && lc.worktree_path)
-                      ? [
-                          btn("act-focus", rt.active ? "Focus (f)" : "Worktree (f)", t, {
-                            small: true,
-                            onClick: (_ev, cx) => this.focusTicketAgent(ticket, cx),
-                          }),
-                        ]
-                      : []),
-                    ...(ticket.column === "triage"
-                      ? [
-                          btn("act-promote", "Ready (t)", t, {
-                            small: true,
-                            onClick: (_ev, cx) =>
-                              this.runTicketAction(
-                                `Promoted ${disp} to Ready`,
-                                ["triage", cliRef, "--ready", "--force"],
-                                cx
-                              ),
-                          }),
-                        ]
-                      : []),
-                    ...(ticket.column === "review" || ticket.column === "in_progress"
-                      ? [
-                          btn(
-                            "act-approve",
-                            ticket.column === "review" ? "Approve (a)" : "Land (a)",
-                            t,
-                            {
-                              small: true,
-                              iconPath: "mods/workspace-chrome/check.svg",
-                              onClick: (_ev, cx) =>
-                                this.runTicketAction(
-                                  `Landing ${disp}`,
-                                  ["done", cliRef, "--approve"],
-                                  cx
-                                ),
-                            }
-                          ),
-                        ]
-                      : []),
-                  ])
-              )
-              .child(
-                h_flex()
-                  .items_center()
-                  .flex_none()
-                  .gap(5)
-                  .children([
-                    btn("act-triage", "Move (t)", t, {
-                      small: true,
-                      selected: this.modalMode === "triage",
-                      onClick: (_ev, cx) => {
-                        this.modalMode = this.modalMode === "triage" ? null : "triage";
-                        cx.notify();
-                      },
-                    }),
-                    btn("act-ask", hasClaim ? "Ask (c)" : "Comment (c)", t, {
-                      small: true,
-                      selected: this.modalMode === "ask",
-                      onClick: (_ev, cx) => {
-                        this.modalMode = this.modalMode === "ask" ? null : "ask";
-                        if (this.modalMode === "ask") this.askInput.focus();
-                        cx.notify();
-                      },
-                    }),
-                    ...(hasClaim
-                      ? [
-                          btn("act-release", "Release", t, {
-                            dangerOutline: true,
-                            small: true,
-                            onClick: (_ev, cx) =>
-                              this.runTicketAction(`Released ${disp}`, ["release", cliRef], cx),
-                          }),
-                        ]
-                      : []),
-                  ])
-              )
+                      .gap(5)
+                      .children(rightActions)
+                  )
+                )
+            )
           )
       )
       .child(
-        // Split 2-Column Inspector Body (or stacked on narrow)
-        (isSplit ? h_flex() : v_flex())
+        // Adaptive Inspector Body: 2-Column when active agent/dependency state exists, Full-Width Markdown otherwise
+        (isSplit && hasLeftPanel ? h_flex() : v_flex())
           .flex_1()
           .min_h(0)
           .w_full()
-          .overflow_hidden()
-          .child(
-            // Left Column: Claim Status, Checklist, Dependencies, Overlaps & Touched Files
-            v_flex()
-              .id("inspector-left-scroll")
-              .w(isSplit ? Math.min(380, Math.round(panelW * 0.44)) : panelW)
-              .flex_none()
-              .min_h(0)
-              .h_full()
-              .gap(8)
-              .p(11)
-              .overflow_y_scrollbar()
-              .when(isSplit, (el) => el.border_r(1).border_color(t.border))
-              .when(overlaps.length > 0, (d) =>
-                d.child(
-                  v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap(4)
-                    .p(9)
-                    .rounded(7)
-                    .bg(withAlpha(t.blocked || t.ansi1, "14") || t.background)
-                    .border_1()
-                    .border_color(t.blocked || t.ansi1)
-                    .child(
-                      div()
-                        .text_size(11)
-                        .font_semibold()
-                        .text_color(t.blocked || t.ansi1)
-                        .child("Touched-File Overlap Detected")
-                    )
-                    .children(
-                      overlaps.map((ov) =>
+          .when(isSplit || !hasLeftPanel, (el) => el.overflow_hidden())
+          .when(!isSplit && hasLeftPanel, (el) => el.overflow_y_scrollbar())
+          .when(hasLeftPanel, (body) =>
+            body.child(
+              // Left Column: Claim Status, Checklist, Dependencies, Overlaps & Touched Files
+              v_flex()
+                .id("inspector-left-scroll")
+                .w(isSplit ? Math.min(360, Math.round(panelW * 0.42)) : panelW)
+                .flex_none()
+                .when(isSplit, (el) =>
+                  el.min_h(0).h_full().overflow_y_scrollbar().border_r(1).border_color(t.border)
+                )
+                .gap(8)
+                .p(11)
+                .when(overlaps.length > 0, (d) =>
+                  d.child(
+                    v_flex()
+                      .w_full()
+                      .flex_none()
+                      .gap(4)
+                      .p(9)
+                      .rounded(7)
+                      .bg(withAlpha(t.blocked || t.ansi1, "14") || t.background)
+                      .border_1()
+                      .border_color(t.blocked || t.ansi1)
+                      .child(
                         div()
                           .text_size(11)
-                          .whitespace_normal()
-                          .text_color(t.foreground)
-                          .child(
-                            `#${ov.other_issue} (@${ov.other_owner}, ${ov.other_agent}): ${(
-                              ov.files || []
-                            ).join(", ")}`
-                          )
+                          .font_semibold()
+                          .text_color(t.blocked || t.ansi1)
+                          .child("Touched-File Overlap Detected")
                       )
-                    )
-                )
-              )
-              .when(Boolean(hasClaim), (d) =>
-                d.child(
-                  v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap(6)
-                    .p(9)
-                    .rounded(7)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(ticket.stale ? t.working || t.ansi3 : t.border)
-                    .child(
-                      h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                          h_flex()
-                            .items_center()
-                            .gap(6)
-                            .child(
-                              div()
-                                .size(7)
-                                .rounded_full()
-                                .bg(rt.active ? t.working || t.ansi3 : t.accent)
-                            )
-                            .child(
-                              div()
-                                .text_size(11.5)
-                                .font_semibold()
-                                .text_color(t.foreground)
-                                .child(`Claimed by @${claim.owner} (${claim.agent_kind})`)
-                            )
-                        )
-                        .child(
-                          div()
-                            .px(5)
-                            .py(1)
-                            .rounded(4)
-                            .bg(t.surface)
-                            .text_size(9.5)
-                            .font_semibold()
-                            .text_color(ticket.stale ? t.working || t.ansi3 : t.done || t.ansi2)
-                            .child(ticket.stale ? "STALE LEASE" : String(claim.state).toUpperCase())
-                        )
-                    )
-                    .when(Boolean(mdClaimNote), (c) =>
-                      c.child(
-                        div()
-                          .w_full()
-                          .p(7)
-                          .rounded(5)
-                          .bg(t.surface)
-                          .child(
-                            TextView.markdown(`claim-note-md-${ticket.number}`, mdClaimNote)
-                              .selectable(true)
-                              .on_link_click((url, cx) => this.handleLinkClick(url, cx))
-                          )
-                      )
-                    )
-                    .when(Boolean(lc && lc.worktree_path), (c) =>
-                      c.child(
-                        h_flex()
-                          .items_center()
-                          .gap(5)
-                          .child(svg("mods/workspace-chrome/folder.svg").size(10).text_color(t.dim))
-                          .child(
-                            div()
-                              .flex_1()
-                              .min_w(0)
-                              .text_size(10)
-                              .text_color(t.dim)
-                              .truncate()
-                              .child(lc.worktree_path)
-                          )
-                      )
-                    )
-                )
-              )
-              .when(checklist.length > 0, (d) =>
-                d.child(
-                  v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap(6)
-                    .p(9)
-                    .rounded(7)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .child(
-                      h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .child(
+                      .children(
+                        overlaps.map((ov) =>
                           div()
                             .text_size(11)
-                            .font_semibold()
+                            .whitespace_normal()
                             .text_color(t.foreground)
                             .child(
-                              `Agent Checklist (${ticket.checklist_done || 0}/${
-                                ticket.checklist_total || checklist.length
-                              })`
+                              `#${ov.other_issue} (@${ov.other_owner}, ${ov.other_agent}): ${(
+                                ov.files || []
+                              ).join(", ")}`
                             )
                         )
-                        .child(
-                          div()
-                            .w(48)
-                            .h(5)
-                            .rounded(3)
-                            .bg(t.surface)
-                            .overflow_hidden()
-                            .child(
-                              div()
-                                .w(
-                                  Math.round(
-                                    ((ticket.checklist_done || 0) /
-                                      Math.max(1, ticket.checklist_total || checklist.length)) *
-                                      48
-                                  )
-                                )
-                                .h_full()
-                                .bg(
-                                  (ticket.checklist_done || 0) ===
-                                    (ticket.checklist_total || checklist.length)
-                                    ? t.done || t.ansi2
-                                    : t.accent
-                                )
-                            )
-                        )
-                    )
-                    .children(
-                      checklist.map((item, cIdx) => {
-                        const rawItem = String(item).trim();
-                        const done = rawItem.toLowerCase().startsWith("[x]");
-                        const cleanText = rawItem.replace(/^\[[ xX]\]\s*/, "");
-                        return h_flex()
-                          .id(`chk-${ticket.number}-${cIdx}`)
-                          .w_full()
-                          .items_start()
-                          .gap(6)
+                      )
+                  )
+                )
+                .when(Boolean(hasClaim), (d) =>
+                  d.child(
+                    v_flex()
+                      .w_full()
+                      .flex_none()
+                      .gap(6)
+                      .p(9)
+                      .rounded(7)
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(ticket.stale ? t.working || t.ansi3 : t.border)
+                      .child(
+                        h_flex()
+                          .items_center()
+                          .justify_between()
                           .child(
-                            div()
-                              .pt(2)
-                              .flex_none()
+                            h_flex()
+                              .items_center()
+                              .gap(6)
                               .child(
-                                svg(
-                                  done
-                                    ? "mods/workspace-chrome/circle-check.svg"
-                                    : "mods/workspace-chrome/square.svg"
-                                )
-                                  .size(11)
-                                  .text_color(done ? t.done || t.ansi2 : t.dim)
+                                div()
+                                  .size(7)
+                                  .rounded_full()
+                                  .bg(rt.active ? t.working || t.ansi3 : t.accent)
+                              )
+                              .child(
+                                div()
+                                  .text_size(11.5)
+                                  .font_semibold()
+                                  .text_color(t.foreground)
+                                  .child(`Claimed by @${claim.owner} (${claim.agent_kind})`)
                               )
                           )
                           .child(
                             div()
-                              .flex_1()
-                              .min_w(0)
-                              .whitespace_normal()
-                              .line_height(1.35)
+                              .px(5)
+                              .py(1)
+                              .rounded(4)
+                              .bg(t.surface)
+                              .text_size(9.5)
+                              .font_semibold()
+                              .text_color(ticket.stale ? t.working || t.ansi3 : t.done || t.ansi2)
+                              .child(ticket.stale ? "STALE LEASE" : String(claim.state).toUpperCase())
+                          )
+                      )
+                      .when(Boolean(mdClaimNote), (c) =>
+                        c.child(
+                          div()
+                            .w_full()
+                            .p(7)
+                            .rounded(5)
+                            .bg(t.surface)
+                            .child(
+                              TextView.markdown(`claim-note-md-${ticket.number}`, mdClaimNote)
+                                .selectable(true)
+                                .on_link_click((url, cx) => this.handleLinkClick(url, cx))
+                            )
+                        )
+                      )
+                      .when(Boolean(lc && lc.worktree_path), (c) =>
+                        c.child(
+                          h_flex()
+                            .items_center()
+                            .gap(5)
+                            .child(svg("mods/workspace-chrome/folder.svg").size(10).text_color(t.dim))
+                            .child(
+                              div()
+                                .flex_1()
+                                .min_w(0)
+                                .text_size(10)
+                                .text_color(t.dim)
+                                .truncate()
+                                .child(lc.worktree_path)
+                            )
+                        )
+                      )
+                  )
+                )
+                .when(checklist.length > 0, (d) =>
+                  d.child(
+                    v_flex()
+                      .w_full()
+                      .flex_none()
+                      .gap(6)
+                      .p(9)
+                      .rounded(7)
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(t.border)
+                      .child(
+                        h_flex()
+                          .w_full()
+                          .items_center()
+                          .justify_between()
+                          .child(
+                            div()
                               .text_size(11)
-                              .text_color(done ? t.muted : t.foreground)
-                              .child(cleanText)
-                          );
-                      })
-                    )
-                )
-              )
-              .when(deps.length > 0 || blocks.length > 0, (d) =>
-                d.child(
-                  v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap(5)
-                    .p(9)
-                    .rounded(7)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .child(
-                      div()
-                        .text_size(11)
-                        .font_semibold()
-                        .text_color(t.foreground)
-                        .child(`Dependency Graph (Wave ${ticket.wave || 0})`)
-                    )
-                    .when(deps.length > 0, (c) =>
-                      c.child(
-                        renderChunkedPillRows(
-                          [
-                            {
-                              chars: 11,
-                              el: div()
+                              .font_semibold()
+                              .text_color(t.foreground)
+                              .child(
+                                `Agent Checklist (${ticket.checklist_done || 0}/${
+                                  ticket.checklist_total || checklist.length
+                                })`
+                              )
+                          )
+                          .child(
+                            div()
+                              .w(48)
+                              .h(5)
+                              .rounded(3)
+                              .bg(t.surface)
+                              .overflow_hidden()
+                              .child(
+                                div()
+                                  .w(
+                                    Math.round(
+                                      ((ticket.checklist_done || 0) /
+                                        Math.max(1, ticket.checklist_total || checklist.length)) *
+                                        48
+                                    )
+                                  )
+                                  .h_full()
+                                  .bg(
+                                    (ticket.checklist_done || 0) ===
+                                      (ticket.checklist_total || checklist.length)
+                                      ? t.done || t.ansi2
+                                      : t.accent
+                                  )
+                              )
+                          )
+                      )
+                      .children(
+                        checklist.map((item, cIdx) => {
+                          const rawItem = String(item).trim();
+                          const done = rawItem.toLowerCase().startsWith("[x]");
+                          const cleanText = rawItem.replace(/^\[[ xX]\]\s*/, "");
+                          return h_flex()
+                            .id(`chk-${ticket.number}-${cIdx}`)
+                            .w_full()
+                            .items_start()
+                            .gap(6)
+                            .child(
+                              div()
+                                .pt(2)
                                 .flex_none()
-                                .text_size(10.5)
-                                .text_color(t.muted)
-                                .child("Depends on:"),
-                            },
-                            ...deps.map((n) => {
-                              const isUnmet = unmet.has(n);
-                              const txt = `#${n}${isUnmet ? " (open)" : " ✓"}`;
-                              return {
-                                chars: txt.length,
-                                el: div()
-                                  .id(`dep-link-${n}`)
-                                  .flex_none()
-                                  .px(5)
-                                  .py(1)
-                                  .rounded(4)
-                                  .cursor_pointer()
-                                  .bg(t.surface)
-                                  .border_1()
-                                  .border_color(isUnmet ? t.blocked || t.ansi1 : t.border)
-                                  .text_size(10)
-                                  .text_color(isUnmet ? t.blocked || t.ansi1 : t.done || t.ansi2)
-                                  .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
-                                  .child(txt),
-                              };
-                            }),
-                          ],
-                          38,
-                          5,
-                          5
-                        )
+                                .child(
+                                  svg(
+                                    done
+                                      ? "mods/workspace-chrome/circle-check.svg"
+                                      : "mods/workspace-chrome/square.svg"
+                                  )
+                                    .size(11)
+                                    .text_color(done ? t.done || t.ansi2 : t.dim)
+                                )
+                            )
+                            .child(
+                              div()
+                                .flex_1()
+                                .min_w(0)
+                                .whitespace_normal()
+                                .line_height(1.35)
+                                .text_size(11)
+                                .text_color(done ? t.muted : t.foreground)
+                                .child(cleanText)
+                            );
+                        })
                       )
-                    )
-                    .when(blocks.length > 0, (c) =>
-                      c.child(
-                        renderChunkedPillRows(
-                          [
-                            {
-                              chars: 7,
-                              el: div()
-                                .flex_none()
-                                .text_size(10.5)
-                                .text_color(t.muted)
-                                .child("Blocks:"),
-                            },
-                            ...blocks.map((n) => {
-                              const txt = `#${n}`;
-                              return {
-                                chars: txt.length,
-                                el: div()
-                                  .id(`blk-link-${n}`)
-                                  .flex_none()
-                                  .px(5)
-                                  .py(1)
-                                  .rounded(4)
-                                  .cursor_pointer()
-                                  .bg(t.surface)
-                                  .border_1()
-                                  .border_color(t.border)
-                                  .text_size(10)
-                                  .text_color(t.accent)
-                                  .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
-                                  .child(txt),
-                              };
-                            }),
-                          ],
-                          38,
-                          5,
-                          5
-                        )
-                      )
-                    )
+                  )
                 )
-              )
-              .when(touched.length > 0, (d) =>
-                d.child(
-                  v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap(4)
-                    .p(9)
-                    .rounded(7)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .child(
-                      div()
-                        .text_size(11)
-                        .font_semibold()
-                        .text_color(t.foreground)
-                        .child(`Touched Files (${touched.length})`)
-                    )
-                    .children(
-                      touched.slice(0, 12).map((fp) =>
-                        div().text_size(10.5).text_color(t.muted).truncate().child(fp)
-                      )
-                    )
-                )
-              )
-              .when(!hasClaim && checklist.length === 0 && deps.length === 0, (d) =>
-                d.child(
-                  v_flex()
-                    .w_full()
-                    .flex_none()
-                    .gap(6)
-                    .p(9)
-                    .rounded(7)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .child(
-                      div()
-                        .text_size(11)
-                        .font_semibold()
-                        .text_color(t.muted)
-                        .child("Ticket Metadata")
-                    )
-                    .when(Boolean(ticket.milestone), (m) =>
-                      m.child(
+                .when(deps.length > 0 || blocks.length > 0, (d) =>
+                  d.child(
+                    v_flex()
+                      .w_full()
+                      .flex_none()
+                      .gap(5)
+                      .p(9)
+                      .rounded(7)
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(t.border)
+                      .child(
                         div()
                           .text_size(11)
+                          .font_semibold()
                           .text_color(t.foreground)
-                          .child(`Milestone: ${ticket.milestone}`)
+                          .child(`Dependency Graph (Wave ${ticket.wave || 0})`)
                       )
-                    )
-                    .when(Array.isArray(ticket.labels) && ticket.labels.length > 0, (l) =>
-                      l.child(
-                        renderChunkedPillRows(
-                          ticket.labels.map((lbl, idx) => {
-                            const fc = parseFacetLabel(lbl, t);
-                            const txt = truncStr(lbl, 22);
-                            return {
-                              chars: txt.length,
-                              el: div()
-                                .id(`meta-lbl-${idx}`)
-                                .flex_none()
-                                .px(6)
-                                .py(2)
-                                .rounded(4)
-                                .bg(fc.bg)
-                                .text_size(10)
-                                .text_color(fc.color)
-                                .child(txt),
-                            };
-                          }),
-                          36,
-                          5,
-                          5
+                      .when(deps.length > 0, (c) =>
+                        c.child(
+                          renderChunkedPillRows(
+                            [
+                              {
+                                chars: 11,
+                                el: div()
+                                  .flex_none()
+                                  .text_size(10.5)
+                                  .text_color(t.muted)
+                                  .child("Depends on:"),
+                              },
+                              ...deps.map((n) => {
+                                const isUnmet = unmet.has(n);
+                                const txt = `#${n}${isUnmet ? " (open)" : " ✓"}`;
+                                return {
+                                  chars: txt.length,
+                                  el: div()
+                                    .id(`dep-link-${n}`)
+                                    .flex_none()
+                                    .px(5)
+                                    .py(1)
+                                    .rounded(4)
+                                    .cursor_pointer()
+                                    .bg(t.surface)
+                                    .border_1()
+                                    .border_color(isUnmet ? t.blocked || t.ansi1 : t.border)
+                                    .text_size(10)
+                                    .text_color(isUnmet ? t.blocked || t.ansi1 : t.done || t.ansi2)
+                                    .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
+                                    .child(txt),
+                                };
+                              }),
+                            ],
+                            38,
+                            5,
+                            5
+                          )
                         )
                       )
-                    )
+                      .when(blocks.length > 0, (c) =>
+                        c.child(
+                          renderChunkedPillRows(
+                            [
+                              {
+                                chars: 7,
+                                el: div()
+                                  .flex_none()
+                                  .text_size(10.5)
+                                  .text_color(t.muted)
+                                  .child("Blocks:"),
+                              },
+                              ...blocks.map((n) => {
+                                const txt = `#${n}`;
+                                return {
+                                  chars: txt.length,
+                                  el: div()
+                                    .id(`blk-link-${n}`)
+                                    .flex_none()
+                                    .px(5)
+                                    .py(1)
+                                    .rounded(4)
+                                    .cursor_pointer()
+                                    .bg(t.surface)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .text_size(10)
+                                    .text_color(t.accent)
+                                    .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
+                                    .child(txt),
+                                };
+                              }),
+                            ],
+                            38,
+                            5,
+                            5
+                          )
+                        )
+                      )
+                  )
                 )
-              )
+                .when(touched.length > 0, (d) =>
+                  d.child(
+                    v_flex()
+                      .w_full()
+                      .flex_none()
+                      .gap(4)
+                      .p(9)
+                      .rounded(7)
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(t.border)
+                      .child(
+                        div()
+                          .text_size(11)
+                          .font_semibold()
+                          .text_color(t.foreground)
+                          .child(`Touched Files (${touched.length})`)
+                      )
+                      .children(
+                        touched.slice(0, 12).map((fp) =>
+                          div().text_size(10.5).text_color(t.muted).truncate().child(fp)
+                        )
+                      )
+                  )
+                )
+            )
           )
           .child(
-            // Right Column: Full Markdown Description
+            // Right Column (or Full-Width when no active left panel): Full Markdown Description
             v_flex()
               .id("inspector-right-scroll")
-              .flex_1()
-              .min_w(0)
-              .min_h(0)
-              .h_full()
+              .when(isSplit || !hasLeftPanel, (el) =>
+                el.flex_1().min_w(0).min_h(0).h_full().overflow_y_scrollbar()
+              )
+              .when(!isSplit && hasLeftPanel, (el) => el.w_full().flex_none())
               .gap(6)
               .p(11)
-              .overflow_y_scrollbar()
               .child(
                 h_flex()
                   .w_full()
                   .items_center()
                   .justify_between()
+                  .gap(8)
                   .child(
-                    div()
-                      .text_size(11)
-                      .font_semibold()
-                      .text_color(t.muted)
-                      .child("Description (Markdown)")
+                    h_flex()
+                      .items_center()
+                      .gap(5)
+                      .min_w(0)
+                      .overflow_hidden()
+                      .child(
+                        div()
+                          .flex_none()
+                          .text_size(11)
+                          .font_semibold()
+                          .text_color(t.muted)
+                          .child("Specification & Notes")
+                      )
+                      .when(Array.isArray(ticket.labels) && ticket.labels.length > 0, (l) =>
+                        l.children(
+                          ticket.labels.slice(0, 5).map((lbl, idx) => {
+                            const fc = parseFacetLabel(lbl, t);
+                            return div()
+                              .id(`desc-lbl-${idx}`)
+                              .flex_none()
+                              .px(5)
+                              .py(1)
+                              .rounded(4)
+                              .bg(fc.bg)
+                              .text_size(9.5)
+                              .text_color(fc.color)
+                              .child(truncStr(lbl, 20));
+                          })
+                        )
+                      )
                   )
                   .when(Boolean(ticket.milestone), (m) =>
                     m.child(
                       div()
+                        .flex_none()
                         .px(5)
                         .py(1)
                         .rounded(4)
@@ -4359,26 +4484,23 @@ export default class KanbanBoard extends View {
   }
 
   renderFooter(t, tgt) {
+    const hasActiveMessage = Boolean(this.busyText || this.error || this.statusMessage);
     const shortcuts =
       this.viewMode === "whats_new"
         ? [
-            ["s", "synthesize"],
+            ["s", "summarize"],
             ["b", "board"],
             ["r", "refresh"],
           ]
         : [
             ["hjkl", "nav"],
-            ["1-6", "col"],
-            ["Enter", "detail"],
             ["w", "what's new"],
-            ["s", "dispatch"],
-            ["f", "focus"],
             ["n", "deposit"],
           ];
 
     return h_flex()
       .w_full()
-      .h(26)
+      .h(24)
       .flex_none()
       .items_center()
       .justify_between()
@@ -4432,30 +4554,32 @@ export default class KanbanBoard extends View {
               )
           )
       )
-      .child(
-        h_flex()
-          .flex_none()
-          .items_center()
-          .gap(8)
-          .children(
-            shortcuts.map(([k, lbl]) =>
-              h_flex()
-                .items_center()
-                .gap(3)
-                .child(
-                  div()
-                    .px(4)
-                    .rounded(3)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .text_size(9.5)
-                    .text_color(t.muted)
-                    .child(k)
-                )
-                .child(div().text_size(10).text_color(t.dim).child(lbl))
+      .when(!hasActiveMessage, (f) =>
+        f.child(
+          h_flex()
+            .flex_none()
+            .items_center()
+            .gap(8)
+            .children(
+              shortcuts.map(([k, lbl]) =>
+                h_flex()
+                  .items_center()
+                  .gap(3)
+                  .child(
+                    div()
+                      .px(4)
+                      .rounded(3)
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(t.border)
+                      .text_size(9.5)
+                      .text_color(t.muted)
+                      .child(k)
+                  )
+                  .child(div().text_size(10).text_color(t.dim).child(lbl))
+              )
             )
-          )
+        )
       );
   }
 
@@ -4473,7 +4597,7 @@ export default class KanbanBoard extends View {
     if (this.bus) {
       this.searchQuery = this.bus.searchQuery;
       this.repoFilter = this.bus.repoFilter;
-      this.quickFilter = this.bus.quickFilter || "all";
+      this.quickFilter = this.bus.quickFilter || "active";
       this.compactEmpty = this.bus.compactEmpty !== false;
       this.viewMode = this.bus.viewMode || "board";
       this.agentKind = this.bus.agentKind;
