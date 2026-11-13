@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1 (2026-11-13)
+
+- **Agent-Colored Active Ticket Cards (`resolveTicketAgentVisual`)**:
+  - Color active claimed cards by the working coding agent (`claude` `#e07a5f` + `icons/claude.svg`, `agy` `#4c8bf5` + `icons/antigravity.svg`, `codex` `#7c6ff6` + `icons/codex.svg`, `opencode` `#10b981` + `icons/opencode.svg`, `gemini` `#06b6d4` + `icons/gemini.svg`, `copilot` `#ec4899` + `icons/copilot.svg`) with a 4px left accent stripe, tinted card surface & border, spinning `spinner.svg` while working, and distinct worker colors (`AGENT_WORKER_PALETTE`, `agy #1`, `agy #2`) when multiple agents of the same harness work in parallel.
+- **Dependency-Blocked Card Lock Callout Banner (`isDepBlocked` + `lock.svg`)**:
+  - Give cards with unmet upstream dependencies (`unmet_deps`) a clear visual treatment beyond a pill: 4px left blocked bar, dashed border (`border_dashed()`), recessed tinted background, dimmed title text, and a full-width **`BLOCKED BY #71 · Wave N`** callout banner (`lock.svg`) with clickable blocker chips that jump directly to the blocking ticket.
+  - Show a green `Unblocks #69` pill on unblocked upstream tickets (`blocks.length > 0`).
+- **Non-Overlapping Bounded Pill Layout & Multi-Space Fallback**:
+  - Enforce bounded truncation (`max_w`, `min_w(0)`, `overflow_hidden()`) across card headers, facet rows, agent footers, subbars, and inspector headers so pills never overlap at any split-pane width.
+  - Automatically fall back across sibling spaces on the same Herdr machine when opening the Kanban overlay from a non-Git scratch directory.
+
 ## 0.4.0 (2026-11-13)
 
 - **What's New — Landed Work & Colleague Digest (`herdr-kanban whats-new` + `w` view)**:

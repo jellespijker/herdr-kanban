@@ -176,6 +176,7 @@ def test_install_app_mod_and_status(tmp_path: Path) -> None:
     assert (dest / "kanban.svg").is_file()
     assert (dest / "refresh.svg").is_file()
     assert (dest / "sparkles.svg").is_file()
+    assert (dest / "lock.svg").is_file()
 
     uninstalled = skill.install_app_mod(app_home=app_home, uninstall=True)
     assert any("removed" in line for line in uninstalled)

@@ -14,7 +14,7 @@ SKILL_SRC = ROOT / "skills" / SKILL_NAME
 CLI_SRC = ROOT / "bin" / "herdr-kanban"
 MOD_NAME = "herdr-kanban"
 MOD_SRC = ROOT / "mods" / MOD_NAME
-MOD_FILES = ("main.js", "mod.json", "RECIPE.md", "kanban.svg", "refresh.svg", "sparkles.svg")
+MOD_FILES = ("main.js", "mod.json", "RECIPE.md", "kanban.svg", "refresh.svg", "sparkles.svg", "lock.svg")
 
 ALIASES = {
     "codex": "agents",

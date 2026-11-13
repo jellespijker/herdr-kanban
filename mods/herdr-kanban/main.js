@@ -1,4 +1,4 @@
-import { View, div, svg } from "gpui-kit";
+import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Button, Input, InputState, TextView } from "gpui-base";
 import {
   spaces,
@@ -63,6 +63,147 @@ function columnAccent(colId, t) {
   if (colId === "review") return t.accent;
   if (colId === "done") return t.done || t.ansi2;
   return t.muted;
+}
+
+const AGENT_WORKER_PALETTE = [
+  "#4c8bf5", // Cobalt Blue (Antigravity / primary)
+  "#e07a5f", // Terracotta Coral (Claude)
+  "#a855f7", // Electric Violet
+  "#10b981", // Emerald Green (Codex / OpenCode)
+  "#06b6d4", // Sky Cyan (Gemini)
+  "#ec4899", // Rose Pink (Copilot)
+  "#f59e0b", // Warm Amber
+];
+
+function agentBrandSpec(agentKind, rt, t) {
+  const prog = rt && rt.agent && rt.agent.program ? rt.agent.program : null;
+  const raw = String(
+    agentKind || (rt && rt.agent && (rt.agent.app || prog?.key)) || "agent"
+  ).toLowerCase();
+
+  if (raw.includes("claude")) {
+    return {
+      key: "claude",
+      label: "claude",
+      icon: (prog && prog.icon) || "icons/claude.svg",
+      tint: prog ? Boolean(prog.tint) : false,
+      baseColor: "#e07a5f",
+    };
+  }
+  if (raw.includes("agy") || raw.includes("antigravity")) {
+    return {
+      key: "agy",
+      label: "agy",
+      icon: (prog && prog.icon) || "icons/antigravity.svg",
+      tint: prog ? Boolean(prog.tint) : false,
+      baseColor: "#4c8bf5",
+    };
+  }
+  if (raw.includes("codex")) {
+    return {
+      key: "codex",
+      label: "codex",
+      icon: (prog && prog.icon) || "icons/codex.svg",
+      tint: prog ? Boolean(prog.tint) : false,
+      baseColor: "#7c6ff6",
+    };
+  }
+  if (raw.includes("opencode")) {
+    return {
+      key: "opencode",
+      label: "opencode",
+      icon: (prog && prog.icon) || "icons/opencode.svg",
+      tint: prog ? Boolean(prog.tint) : true,
+      baseColor: "#10b981",
+    };
+  }
+  if (raw.includes("gemini")) {
+    return {
+      key: "gemini",
+      label: "gemini",
+      icon: (prog && prog.icon) || "icons/gemini.svg",
+      tint: prog ? Boolean(prog.tint) : true,
+      baseColor: "#06b6d4",
+    };
+  }
+  if (raw.includes("copilot")) {
+    return {
+      key: "copilot",
+      label: "copilot",
+      icon: (prog && prog.icon) || "icons/copilot.svg",
+      tint: prog ? Boolean(prog.tint) : true,
+      baseColor: "#ec4899",
+    };
+  }
+  return {
+    key: raw || "agent",
+    label: raw || "agent",
+    icon: (prog && prog.icon) || "icons/agent.svg",
+    tint: prog ? Boolean(prog.tint) : true,
+    baseColor: t.accent || "#4c8bf5",
+  };
+}
+
+function renderAgentIcon(spec, size, color) {
+  if (!spec || !spec.icon) return null;
+  if (spec.tint) {
+    return svg(spec.icon).size(size).flex_none().text_color(color);
+  }
+  return image(spec.icon).w(size).h(size).flex_none();
+}
+
+function resolveTicketAgentVisual(ticket, allTickets, rt, t) {
+  const claim = ticket && ticket.claim ? ticket.claim : null;
+  const isDoneCol = ticket && ticket.column === "done";
+  const hasActiveClaim =
+    !isDoneCol &&
+    claim &&
+    (claim.state === "active" || claim.state === "review_ready");
+
+  if (!hasActiveClaim && !(rt && rt.active && !isDoneCol)) {
+    return null;
+  }
+
+  const kind = (claim && claim.agent_kind) || (rt && rt.agent && rt.agent.app) || "agent";
+  const spec = agentBrandSpec(kind, rt, t);
+
+  // If multiple active tickets share the same agent harness, give each active worker
+  // a distinct hue after the primary brand color so parallel agents are easy to distinguish.
+  const activeSameKind = (allTickets || []).filter((tk) => {
+    if (!tk || tk.column === "done") return false;
+    const cl = tk.claim;
+    if (!cl || (cl.state !== "active" && cl.state !== "review_ready")) return false;
+    return String(cl.agent_kind || "").toLowerCase() === String(kind || "").toLowerCase();
+  });
+
+  let color = spec.baseColor;
+  let workerIndex = 0;
+  if (activeSameKind.length > 1) {
+    const idx = activeSameKind.findIndex((tk) => tk.number === ticket.number);
+    workerIndex = idx >= 0 ? idx : 0;
+    if (workerIndex > 0) {
+      const altPalette = AGENT_WORKER_PALETTE.filter(
+        (c) => c.toLowerCase() !== spec.baseColor.toLowerCase()
+      );
+      color = altPalette[(workerIndex - 1) % altPalette.length] || spec.baseColor;
+    }
+  }
+
+  const tabLabel =
+    (rt && rt.agent && rt.agent.tab_name) ||
+    (rt && rt.terminal && rt.terminal.name) ||
+    (claim && claim.pane_id) ||
+    "";
+
+  return {
+    ...spec,
+    color,
+    owner: (claim && claim.owner) || "local",
+    tabLabel,
+    workerIndex,
+    totalSameKind: activeSameKind.length,
+    isWorking: Boolean(rt && rt.agent && rt.agent.status === "working"),
+  };
 }
 
 function parseTicketTitle(ticket) {
@@ -308,6 +449,32 @@ function resolveSpaceTarget(overrideSpaceId, resolvedCwdBySpace) {
   if (targetSpace?.folder) {
     addUniqueCwd(candidates, targetSpace.folder);
   }
+  for (const pn of allPanes) {
+    if (!pn.cwd) continue;
+    const pnSpace = allSpaces.find((s) => s.id === pn.space);
+    const pnMachine = cleanTarget(
+      pnSpace?.machine || (pn.space && pn.space.includes("/") ? pn.space.split("/")[0] : null)
+    );
+    if (pnMachine === on) {
+      addUniqueCwd(candidates, pn.cwd);
+    }
+  }
+  const baseCands = [...candidates];
+  for (const sp of allSpaces) {
+    if (cleanTarget(sp.machine) === on) {
+      if (sp.name && sp.name !== "~") {
+        for (const bc of baseCands) {
+          const idx = bc.lastIndexOf("/");
+          if (idx > 0) {
+            addUniqueCwd(candidates, `${bc.slice(0, idx)}/${sp.name}`);
+          }
+        }
+      }
+      if (sp.folder) {
+        addUniqueCwd(candidates, sp.folder);
+      }
+    }
+  }
 
   const cwd = (spaceId && cache[spaceId]) || candidates[0] || null;
   return {
@@ -491,7 +658,14 @@ export default class KanbanBoard extends View {
             this.handle.focus();
             cx.notify();
           } else if (cmd === "refresh" || cmd?.action === "refresh") {
+            this.panX = 0;
+            this.panY = 0;
             this.refresh(cx, false);
+          } else if (cmd === "center" || cmd?.action === "center") {
+            this.panX = 0;
+            this.panY = 0;
+            this.zoom = 1;
+            cx.notify();
           } else if (cmd === "whats_new" || cmd?.action === "whats_new") {
             this.syncBus({ viewMode: "whats_new" }, cx);
           } else if (cmd === "board" || cmd?.action === "board") {
@@ -578,7 +752,12 @@ export default class KanbanBoard extends View {
         let chosenCwd = candidates[0];
         for (const candCwd of candidates) {
           chosenCwd = candCwd;
-          const res = await this.execKanban(["board", "--json"], { ...tgt, cwd: candCwd });
+          let res = null;
+          try {
+            res = await this.execKanban(["board", "--json"], { ...tgt, cwd: candCwd });
+          } catch {
+            continue;
+          }
           lastRes = res;
           if (res && res.code === 0) {
             if (tgt.spaceId && this.bus && this.bus.resolvedCwdBySpace) {
@@ -587,7 +766,10 @@ export default class KanbanBoard extends View {
             break;
           }
           const errOut = ((res && (res.stderr || res.stdout)) || "").toLowerCase();
-          if (!errOut.includes(".herdr-kanban.toml")) {
+          if (
+            !errOut.includes(".herdr-kanban.toml") &&
+            !errOut.includes("not inside a git repository")
+          ) {
             break;
           }
         }
@@ -1645,7 +1827,7 @@ export default class KanbanBoard extends View {
                     .cursor_pointer()
                     .bg(this.compactEmpty ? t.selected : t.background)
                     .border_1()
-                    .border_color(this.compactEmpty ? t.border : t.border)
+                    .border_color(t.border)
                     .text_size(10.5)
                     .text_color(this.compactEmpty ? t.accent : t.dim)
                     .hover((s) => s.bg(t.hover))
@@ -1653,13 +1835,13 @@ export default class KanbanBoard extends View {
                       this.syncBus({ compactEmpty: !this.compactEmpty }, cx);
                       this.resetPan(cx);
                     })
-                    .child(this.compactEmpty ? "Compact Empty: On" : "Compact Empty: Off"),
+                    .child(this.compactEmpty ? "Compact" : "Full Cols"),
                 ])
                 .when(isPanned, (el) =>
                   el.child(
                     div()
                       .id("btn-reset-pan")
-                      .px(7)
+                      .px(6)
                       .py(2)
                       .rounded(5)
                       .cursor_pointer()
@@ -1669,7 +1851,7 @@ export default class KanbanBoard extends View {
                       .text_size(10.5)
                       .text_color(t.accent)
                       .on_click((_ev, cx) => this.resetPan(cx))
-                      .child("Center (0)")
+                      .child("0 Center")
                   )
                 )
             )
@@ -2054,10 +2236,11 @@ export default class KanbanBoard extends View {
       claim && (claim.state === "active" || claim.state === "review_ready");
     const overlaps = Array.isArray(ticket.overlaps) ? ticket.overlaps : [];
     const unmetDeps = Array.isArray(ticket.unmet_deps) ? ticket.unmet_deps : [];
+    const blocks = Array.isArray(ticket.blocks) ? ticket.blocks : [];
     const rawLabels = Array.isArray(ticket.labels) ? ticket.labels : [];
     const visibleFacets = rawLabels
       .filter((l) => !l.startsWith("trl:") && !l.startsWith("access:"))
-      .slice(0, 4)
+      .slice(0, 2)
       .map((l) => parseFacetLabel(l, t));
     const checkDone = ticket.checklist_done || 0;
     const checkTotal = ticket.checklist_total || 0;
@@ -2065,12 +2248,15 @@ export default class KanbanBoard extends View {
       claim && Array.isArray(claim.touched_files) ? claim.touched_files.length : 0;
     const rt = findTicketRuntime(ticket);
     const isDoneCol = ticket.column === "done";
+    const isDepBlocked = !isDoneCol && unmetDeps.length > 0;
+    const blockedCol = t.blocked || t.ansi1 || "#e05252";
+    const allTickets = (this.board && Array.isArray(this.board.tickets) && this.board.tickets) || [];
+    const agentVis = resolveTicketAgentVisual(ticket, allTickets, rt, t);
 
-    let agentStateColor = t.accent;
+    let agentStateColor = agentVis ? agentVis.color : t.accent;
     if (rt.agent) {
       const st = rt.agent.status || "idle";
-      if (st === "working") agentStateColor = t.working || t.ansi3;
-      else if (st === "blocked") agentStateColor = t.blocked || t.ansi1;
+      if (st === "blocked") agentStateColor = blockedCol;
       else if (st === "done") agentStateColor = t.done || t.ansi2;
     }
 
@@ -2080,24 +2266,52 @@ export default class KanbanBoard extends View {
         ? ticket.target_repo
         : scopes[0] || "";
 
+    // Card surface, border, and left stripe color based on agent working or dependency lock
+    let cardBg = isSelected ? t.selected : t.surface;
+    let cardBorder = isSelected ? t.accent : t.border;
+    let leftStripeColor = null;
+
+    if (overlaps.length > 0) {
+      cardBg = withAlpha(blockedCol, isSelected ? "24" : "14") || cardBg;
+      cardBorder = blockedCol;
+      leftStripeColor = blockedCol;
+    } else if (agentVis) {
+      cardBg = withAlpha(agentVis.color, isSelected ? "28" : "15") || cardBg;
+      cardBorder = isSelected ? agentVis.color : withAlpha(agentVis.color, "88") || agentVis.color;
+      leftStripeColor = agentVis.color;
+    } else if (isDepBlocked) {
+      cardBg = withAlpha(blockedCol, isSelected ? "20" : "0E") || t.background;
+      cardBorder = isSelected ? blockedCol : withAlpha(blockedCol, "80") || blockedCol;
+      leftStripeColor = withAlpha(blockedCol, "CC") || blockedCol;
+    }
+
     return v_flex()
       .id(`card-${colIdx}-${ticket.cli_ref || ticket.number}`)
+      .relative()
       .w_full()
       .flex_none()
       .gap(7)
-      .p(11)
+      .py(11)
+      .pr(11)
+      .pl(leftStripeColor ? 14 : 11)
       .rounded(8)
+      .overflow_hidden()
       .cursor_pointer()
-      .bg(isSelected ? t.selected : t.surface)
+      .bg(cardBg)
       .border_1()
-      .border_color(
-        overlaps.length > 0
-          ? t.blocked || t.ansi1
-          : isSelected
-          ? t.accent
-          : t.border
+      .when(isDepBlocked && !agentVis, (el) => el.border_dashed())
+      .border_color(cardBorder)
+      .hover((s) =>
+        s.bg(
+          agentVis
+            ? withAlpha(agentVis.color, "24") || t.hover
+            : isDepBlocked
+            ? withAlpha(blockedCol, "18") || t.hover
+            : isSelected
+            ? t.selected
+            : t.hover
+        )
       )
-      .hover((s) => s.bg(isSelected ? t.selected : t.hover))
       .on_mouse_down("left", (e, cx) => this.startBoardDrag({ ...e, _fromCard: true }, cx))
       .on_mouse_down("middle", (e, cx) => this.startBoardDrag({ ...e, _fromCard: true }, cx))
       .on_click((_ev, cx) => {
@@ -2108,25 +2322,47 @@ export default class KanbanBoard extends View {
         this.selectColumnRow(colIdx, rowIdx, cx, false);
         this.syncBus({ showDrawer: true }, cx);
       })
+      .when(Boolean(leftStripeColor), (el) =>
+        el.child(
+          div()
+            .id(`stripe-${ticket.number}`)
+            .absolute()
+            .left(0)
+            .top(0)
+            .bottom(0)
+            .w(4)
+            .bg(leftStripeColor)
+        )
+      )
       .child(
-        // Top row: Issue Ref, Priority, Repo/Scope badge, Jira keys, and Wave/Alert badges
+        // Top row: Issue Ref, Priority, Repo/Scope badge, and Alert/Unblocks badge (strictly bounded)
         h_flex()
           .w_full()
           .items_center()
           .justify_between()
           .gap(4)
+          .overflow_hidden()
           .child(
             h_flex()
               .items_center()
               .gap(5)
               .min_w(0)
               .flex_1()
+              .overflow_hidden()
               .child(
                 div()
                   .flex_none()
                   .text_size(11)
                   .font_semibold()
-                  .text_color(isSelected ? t.accent : t.muted)
+                  .text_color(
+                    agentVis
+                      ? agentVis.color
+                      : isDepBlocked
+                      ? blockedCol
+                      : isSelected
+                      ? t.accent
+                      : t.muted
+                  )
                   .child(disp)
               )
               .when(Boolean(ticket.priority), (d) =>
@@ -2146,6 +2382,7 @@ export default class KanbanBoard extends View {
               .when(Boolean(repoTag), (d) =>
                 d.child(
                   div()
+                    .max_w(88)
                     .px(5)
                     .py(1)
                     .rounded(4)
@@ -2153,22 +2390,9 @@ export default class KanbanBoard extends View {
                     .border_1()
                     .border_color(t.border)
                     .text_size(10)
-                    .text_color(t.accent)
+                    .text_color(agentVis ? agentVis.color : t.accent)
                     .truncate()
                     .child(repoTag)
-                )
-              )
-              .when(jiraKeys.length > 0, (d) =>
-                d.child(
-                  div()
-                    .flex_none()
-                    .px(5)
-                    .py(1)
-                    .rounded(4)
-                    .bg(t.background)
-                    .text_size(9.5)
-                    .text_color(t.dim)
-                    .child(jiraKeys.slice(0, 2).join("·"))
                 )
               )
           )
@@ -2177,38 +2401,41 @@ export default class KanbanBoard extends View {
               .items_center()
               .flex_none()
               .gap(4)
-              .when(unmetDeps.length > 0, (d) =>
-                d.child(
-                  div()
-                    .px(5)
-                    .py(1)
-                    .rounded(4)
-                    .bg(withAlpha(t.blocked || t.ansi1, "18") || t.background)
-                    .text_size(10)
-                    .text_color(t.blocked || t.ansi1)
-                    .child(`deps:${unmetDeps.map((n) => "#" + n).join(",")}`)
-                )
-              )
               .when(
-                unmetDeps.length === 0 &&
-                  !isDoneCol &&
-                  ((Array.isArray(ticket.depends_on) && ticket.depends_on.length > 0) ||
-                    (Array.isArray(ticket.blocks) && ticket.blocks.length > 0)),
+                overlaps.length === 0 && !ticket.stale && (isDepBlocked || isDoneCol || blocks.length === 0) && jiraKeys.length > 0,
                 (d) =>
                   d.child(
                     div()
+                      .flex_none()
                       .px(5)
                       .py(1)
                       .rounded(4)
-                      .bg(withAlpha(t.done || t.ansi2, "16") || t.background)
-                      .text_size(10)
-                      .text_color(t.done || t.ansi2)
-                      .child(`W${ticket.wave || 0}`)
+                      .bg(t.background)
+                      .text_size(9.5)
+                      .text_color(t.dim)
+                      .child(jiraKeys[0])
                   )
+              )
+              .when(!isDepBlocked && !isDoneCol && blocks.length > 0, (d) =>
+                d.child(
+                  div()
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(t.done || t.ansi2, "18") || t.background)
+                    .border_1()
+                    .border_color(withAlpha(t.done || t.ansi2, "50") || t.border)
+                    .text_size(9.5)
+                    .font_semibold()
+                    .text_color(t.done || t.ansi2)
+                    .child(`Unblocks ${blocks.slice(0, 2).map((n) => "#" + n).join(",")}`)
+                )
               )
               .when(Boolean(ticket.stale), (d) =>
                 d.child(
                   div()
+                    .flex_none()
                     .px(5)
                     .py(1)
                     .rounded(4)
@@ -2222,20 +2449,91 @@ export default class KanbanBoard extends View {
               .when(overlaps.length > 0, (d) =>
                 d.child(
                   div()
+                    .flex_none()
                     .px(5)
                     .py(1)
                     .rounded(4)
-                    .bg(withAlpha(t.blocked || t.ansi1, "22") || t.background)
+                    .bg(withAlpha(blockedCol, "22") || t.background)
                     .text_size(9.5)
                     .font_semibold()
-                    .text_color(t.blocked || t.ansi1)
+                    .text_color(blockedCol)
                     .child("OVERLAP")
                 )
               )
           )
       )
+      .when(isDepBlocked, (d) =>
+        // Full-width Dependency Lock Callout Banner (much stronger than a tiny pill!)
+        d.child(
+          h_flex()
+            .id(`dep-lock-banner-${ticket.number}`)
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap(6)
+            .px(8)
+            .py(5)
+            .rounded(6)
+            .overflow_hidden()
+            .bg(withAlpha(blockedCol, "1E") || t.background)
+            .border_1()
+            .border_color(withAlpha(blockedCol, "60") || blockedCol)
+            .child(
+              h_flex()
+                .items_center()
+                .min_w(0)
+                .flex_1()
+                .overflow_hidden()
+                .gap(5)
+                .child(svg("mods/herdr-kanban/lock.svg").size(11).flex_none().text_color(blockedCol))
+                .child(
+                  div()
+                    .flex_none()
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color(blockedCol)
+                    .child("BLOCKED BY")
+                )
+                .children(
+                  unmetDeps.slice(0, 3).map((depNum) =>
+                    div()
+                      .id(`card-dep-chip-${ticket.number}-${depNum}`)
+                      .flex_none()
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .cursor_pointer()
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(withAlpha(blockedCol, "75") || blockedCol)
+                      .text_size(10)
+                      .font_semibold()
+                      .text_color(t.foreground)
+                      .hover((s) => s.bg(t.hover))
+                      .on_click((ev, cx) => {
+                        if (ev && ev.stop_propagation) ev.stop_propagation();
+                        this.selectTicketByRef(String(depNum), cx);
+                      })
+                      .child(`#${depNum}`)
+                  )
+                )
+            )
+            .child(
+              div()
+                .flex_none()
+                .px(4)
+                .py(1)
+                .rounded(3)
+                .bg(withAlpha(blockedCol, "18") || t.surface)
+                .text_size(9.5)
+                .font_medium()
+                .text_color(blockedCol)
+                .child(`Wave ${ticket.wave || 1}`)
+            )
+        )
+      )
       .child(
-        // Multi-line wrapped clean human title (never truncated to 3 words!)
+        // Multi-line wrapped clean human title (dimmed when blocked by dependencies)
         div()
           .w_full()
           .max_h(isDoneCol ? 38 : 54)
@@ -2244,34 +2542,34 @@ export default class KanbanBoard extends View {
           .line_height(1.38)
           .text_size(12)
           .font_medium()
-          .text_color(t.foreground)
+          .text_color(isDepBlocked && !isSelected ? t.muted : t.foreground)
           .child(cleanTitle)
       )
       .when(visibleFacets.length > 0, (d) =>
         d.child(
           h_flex()
             .w_full()
-            .flex_wrap()
-            .max_h(20)
+            .items_center()
             .gap(4)
             .overflow_hidden()
             .children(
               visibleFacets.map((fc, i) =>
                 div()
                   .id(`fc-${ticket.number}-${i}`)
-                  .flex_none()
+                  .max_w(108)
                   .px(5)
                   .py(1)
                   .rounded(4)
                   .bg(fc.bg)
                   .text_size(10)
                   .text_color(fc.color)
+                  .truncate()
                   .child(fc.text)
               )
             )
         )
       )
-      .when(checkTotal > 0 || touchedCount > 0 || hasActiveClaim, (d) =>
+      .when(checkTotal > 0 || touchedCount > 0 || hasActiveClaim || Boolean(agentVis), (d) =>
         d.child(
           h_flex()
             .w_full()
@@ -2279,14 +2577,82 @@ export default class KanbanBoard extends View {
             .items_center()
             .justify_between()
             .gap(6)
+            .overflow_hidden()
             .child(
               h_flex()
                 .items_center()
+                .min_w(0)
+                .flex_1()
+                .overflow_hidden()
                 .gap(5)
-                .when(hasActiveClaim, (c) =>
+                .when(Boolean(agentVis), (c) =>
                   c.child(
                     h_flex()
                       .items_center()
+                      .min_w(0)
+                      .overflow_hidden()
+                      .gap(4)
+                      .px(6)
+                      .py(2.5)
+                      .rounded(5)
+                      .bg(withAlpha(agentVis.color, "22") || t.background)
+                      .border_1()
+                      .border_color(withAlpha(agentVis.color, "70") || t.border)
+                      .when(Boolean(renderAgentIcon(agentVis, 12, agentVis.color)), (ic) =>
+                        ic.child(renderAgentIcon(agentVis, 12, agentVis.color))
+                      )
+                      .child(
+                        div()
+                          .max_w(72)
+                          .truncate()
+                          .text_size(10.5)
+                          .font_semibold()
+                          .text_color(t.foreground)
+                          .child(`@${agentVis.owner}`)
+                      )
+                      .child(
+                        div()
+                          .flex_none()
+                          .px(4)
+                          .py(0.5)
+                          .rounded(3)
+                          .bg(withAlpha(agentVis.color, "30") || t.surface)
+                          .text_size(9.5)
+                          .font_semibold()
+                          .text_color(agentVis.color)
+                          .child(
+                            agentVis.totalSameKind > 1
+                              ? `${agentVis.label} #${agentVis.workerIndex + 1}`
+                              : agentVis.label
+                          )
+                      )
+                      .when(Boolean(agentVis.tabLabel && checkTotal === 0), (tb) =>
+                        tb.child(
+                          div()
+                            .max_w(52)
+                            .truncate()
+                            .text_size(9.5)
+                            .text_color(t.muted)
+                            .child(`· ${agentVis.tabLabel}`)
+                        )
+                      )
+                      .when(agentVis.isWorking, (sp) =>
+                        sp.child(
+                          svg("mods/workspace-chrome/spinner.svg")
+                            .size(10)
+                            .flex_none()
+                            .text_color(agentVis.color)
+                            .spin(900)
+                        )
+                      )
+                  )
+                )
+                .when(!agentVis && hasActiveClaim, (c) =>
+                  c.child(
+                    h_flex()
+                      .items_center()
+                      .min_w(0)
+                      .overflow_hidden()
                       .gap(5)
                       .px(6)
                       .py(2)
@@ -2297,11 +2663,14 @@ export default class KanbanBoard extends View {
                       .child(
                         div()
                           .size(6)
+                          .flex_none()
                           .rounded_full()
                           .bg(rt.active ? agentStateColor : t.accent)
                       )
                       .child(
                         div()
+                          .max_w(82)
+                          .truncate()
                           .text_size(10.5)
                           .text_color(t.foreground)
                           .child(`@${claim.owner}`)
@@ -2309,6 +2678,7 @@ export default class KanbanBoard extends View {
                       .when(Boolean(claim.agent_kind), (ag) =>
                         ag.child(
                           div()
+                            .flex_none()
                             .px(4)
                             .rounded(3)
                             .bg(t.surface)
@@ -2323,7 +2693,8 @@ export default class KanbanBoard extends View {
             .child(
               h_flex()
                 .items_center()
-                .gap(6)
+                .flex_none()
+                .gap(5)
                 .when(checkTotal > 0, (c) =>
                   c.child(
                     h_flex()
@@ -2331,27 +2702,39 @@ export default class KanbanBoard extends View {
                       .gap(4)
                       .child(
                         div()
-                          .w(28)
+                          .w(24)
                           .h(4)
                           .rounded(2)
                           .bg(t.background)
                           .overflow_hidden()
                           .child(
                             div()
-                              .w(Math.round((checkDone / Math.max(1, checkTotal)) * 28))
+                              .w(Math.round((checkDone / Math.max(1, checkTotal)) * 24))
                               .h_full()
-                              .bg(checkDone === checkTotal ? t.done || t.ansi2 : t.accent)
+                              .bg(
+                                checkDone === checkTotal
+                                  ? t.done || t.ansi2
+                                  : agentVis
+                                  ? agentVis.color
+                                  : t.accent
+                              )
                           )
                       )
                       .child(
                         div()
                           .text_size(10)
-                          .text_color(checkDone === checkTotal ? t.done || t.ansi2 : t.muted)
+                          .text_color(
+                            checkDone === checkTotal
+                              ? t.done || t.ansi2
+                              : agentVis
+                              ? agentVis.color
+                              : t.muted
+                          )
                           .child(`${checkDone}/${checkTotal}`)
                       )
                   )
                 )
-                .when(touchedCount > 0, (c) =>
+                .when(touchedCount > 0 && checkTotal === 0, (c) =>
                   c.child(
                     h_flex()
                       .items_center()
@@ -2360,7 +2743,7 @@ export default class KanbanBoard extends View {
                       .child(
                         div()
                           .text_size(10)
-                          .text_color(overlaps.length > 0 ? t.blocked || t.ansi1 : t.dim)
+                          .text_color(overlaps.length > 0 ? blockedCol : t.dim)
                           .child(`${touchedCount}`)
                       )
                   )
@@ -2625,25 +3008,32 @@ export default class KanbanBoard extends View {
           .flex_none()
           .items_center()
           .justify_between()
+          .gap(8)
           .px(14)
+          .overflow_hidden()
           .bg(t.surface)
           .border_b(1)
           .border_color(t.border)
           .child(
             h_flex()
               .items_center()
+              .min_w(0)
+              .flex_1()
+              .overflow_hidden()
               .gap(8)
-              .child(svg("mods/herdr-kanban/sparkles.svg").size(13).text_color(t.done || t.ansi2))
+              .child(svg("mods/herdr-kanban/sparkles.svg").size(13).flex_none().text_color(t.done || t.ansi2))
               .child(
                 div()
                   .text_size(12.5)
                   .font_semibold()
                   .text_color(t.foreground)
+                  .truncate()
                   .child("What's New — Landed Work & Colleague Digest")
               )
               .when(Boolean(saved && saved.author), (el) =>
                 el.child(
                   div()
+                    .flex_none()
                     .px(6)
                     .py(1)
                     .rounded(4)
@@ -2653,7 +3043,7 @@ export default class KanbanBoard extends View {
                     .text_size(10)
                     .text_color(t.muted)
                     .child(
-                      `synthesized by @${saved.author}${saved.agent_kind ? ":" + saved.agent_kind : ""}`
+                      `by @${saved.author}${saved.agent_kind ? ":" + saved.agent_kind : ""}`
                     )
                 )
               )
@@ -2661,9 +3051,10 @@ export default class KanbanBoard extends View {
           .child(
             h_flex()
               .items_center()
-              .gap(6)
+              .flex_none()
+              .gap(5)
               .child(
-                btn("wn-synthesize", "Synthesize Briefing (s)", t, {
+                btn("wn-synthesize", "Synthesize (s)", t, {
                   primary: true,
                   small: true,
                   iconPath: "mods/herdr-kanban/refresh.svg",
@@ -2671,14 +3062,14 @@ export default class KanbanBoard extends View {
                 })
               )
               .child(
-                btn("wn-dispatch-agent", `Ask ${this.agentKind || "agent"} to Summarize`, t, {
+                btn("wn-dispatch-agent", `Summarize (${this.agentKind || "agent"})`, t, {
                   small: true,
                   iconPath: "mods/workspace-chrome/terminal.svg",
                   onClick: (_ev, cx) => this.dispatchWhatsNewAgent(cx),
                 })
               )
               .child(
-                btn("wn-back-board", "Back to Board (b)", t, {
+                btn("wn-back-board", "Board (b)", t, {
                   small: true,
                   onClick: (_ev, cx) => this.syncBus({ viewMode: "board" }, cx),
                 })
@@ -3055,6 +3446,10 @@ export default class KanbanBoard extends View {
     const mdBody = linkifyKanbanRefs(cleanBody, defaultRepo);
     const mdClaimNote =
       claim && claim.note ? linkifyKanbanRefs(String(claim.note), defaultRepo) : "";
+    const allTickets = (this.board && Array.isArray(this.board.tickets) && this.board.tickets) || [];
+    const agentVis = resolveTicketAgentVisual(ticket, allTickets, rt, t);
+    const blockedCol = t.blocked || t.ansi1 || "#e05252";
+    const isDepBlocked = ticket.column !== "done" && unmet.size > 0;
 
     return v_flex()
       .id("ticket-inspector")
@@ -3063,8 +3458,10 @@ export default class KanbanBoard extends View {
       .min_h(0)
       .flex_none()
       .bg(t.surface)
-      .border_t(1)
-      .border_color(t.border)
+      .border_t(2)
+      .border_color(
+        agentVis ? agentVis.color : isDepBlocked ? blockedCol : t.border
+      )
       .child(
         // Compact 2-Row Inspector Header
         v_flex()
@@ -3077,20 +3474,27 @@ export default class KanbanBoard extends View {
           .border_b(1)
           .border_color(t.border)
           .child(
-            // Row 1: Badges + Clean Title + Expand / Close Controls
+            // Row 1: Issue Ref + Column + Priority + Clean Title + Status Badge + Expand / Close
             h_flex()
               .w_full()
               .items_center()
               .justify_between()
               .gap(8)
+              .overflow_hidden()
               .child(
                 h_flex()
                   .items_center()
                   .gap(6)
                   .min_w(0)
                   .flex_1()
+                  .overflow_hidden()
                   .child(
-                    div().flex_none().text_size(12).font_semibold().text_color(t.accent).child(disp)
+                    div()
+                      .flex_none()
+                      .text_size(12)
+                      .font_semibold()
+                      .text_color(agentVis ? agentVis.color : isDepBlocked ? blockedCol : t.accent)
+                      .child(disp)
                   )
                   .child(
                     h_flex()
@@ -3127,7 +3531,7 @@ export default class KanbanBoard extends View {
                   .when(Boolean(ticket.target_repo), (d) =>
                     d.child(
                       div()
-                        .flex_none()
+                        .max_w(110)
                         .px(6)
                         .py(1)
                         .rounded(4)
@@ -3136,20 +3540,8 @@ export default class KanbanBoard extends View {
                         .border_color(t.border)
                         .text_size(10.5)
                         .text_color(t.accent)
+                        .truncate()
                         .child(ticket.target_repo)
-                    )
-                  )
-                  .when(jiraKeys.length > 0, (d) =>
-                    d.child(
-                      div()
-                        .flex_none()
-                        .px(5)
-                        .py(1)
-                        .rounded(4)
-                        .bg(t.background)
-                        .text_size(10)
-                        .text_color(t.muted)
-                        .child(jiraKeys.join(" · "))
                     )
                   )
                   .child(
@@ -3167,7 +3559,58 @@ export default class KanbanBoard extends View {
                 h_flex()
                   .flex_none()
                   .items_center()
-                  .gap(4)
+                  .gap(5)
+                  .when(isDepBlocked, (d) =>
+                    d.child(
+                      h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(4)
+                        .px(6)
+                        .py(1)
+                        .rounded(4)
+                        .bg(withAlpha(blockedCol, "20") || t.background)
+                        .border_1()
+                        .border_color(withAlpha(blockedCol, "70") || blockedCol)
+                        .child(svg("mods/herdr-kanban/lock.svg").size(10).text_color(blockedCol))
+                        .child(
+                          div()
+                            .text_size(10)
+                            .font_semibold()
+                            .text_color(blockedCol)
+                            .child(
+                              `Blocked by ${Array.from(unmet)
+                                .slice(0, 3)
+                                .map((n) => "#" + n)
+                                .join(", ")}`
+                            )
+                        )
+                    )
+                  )
+                  .when(Boolean(agentVis), (d) =>
+                    d.child(
+                      h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(4)
+                        .px(6)
+                        .py(1)
+                        .rounded(4)
+                        .bg(withAlpha(agentVis.color, "22") || t.background)
+                        .border_1()
+                        .border_color(withAlpha(agentVis.color, "70") || agentVis.color)
+                        .when(Boolean(renderAgentIcon(agentVis, 11, agentVis.color)), (ic) =>
+                          ic.child(renderAgentIcon(agentVis, 11, agentVis.color))
+                        )
+                        .child(
+                          div()
+                            .text_size(10)
+                            .font_semibold()
+                            .text_color(agentVis.color)
+                            .child(`@${agentVis.owner}:${agentVis.label}`)
+                        )
+                    )
+                  )
                   .child(
                     btn("insp-tall-toggle", this.drawerTall ? "Compact" : "Expand", t, {
                       small: true,
@@ -3189,23 +3632,27 @@ export default class KanbanBoard extends View {
               )
           )
           .child(
-            // Row 2: Unified Single-Row Workflow Action Bar
+            // Row 2: Unified Single-Row Workflow Action Bar (bounded so left & right never collide)
             h_flex()
               .w_full()
               .items_center()
               .justify_between()
               .gap(8)
+              .overflow_hidden()
               .child(
                 h_flex()
                   .items_center()
-                  .gap(6)
+                  .min_w(0)
+                  .flex_1()
+                  .overflow_hidden()
+                  .gap(5)
                   .children([
                     btn(
                       "act-dispatch",
                       ticket.stale
                         ? `Takeover (${this.agentKind})`
                         : hasClaim && lc
-                        ? `Re-dispatch (${this.agentKind})`
+                        ? `Re-dispatch`
                         : `Dispatch (${this.agentKind})`,
                       t,
                       {
@@ -3218,6 +3665,7 @@ export default class KanbanBoard extends View {
                     ),
                     h_flex()
                       .items_center()
+                      .flex_none()
                       .gap(2)
                       .p(2)
                       .rounded(5)
@@ -3252,7 +3700,7 @@ export default class KanbanBoard extends View {
                       : []),
                     ...(ticket.column === "triage"
                       ? [
-                          btn("act-promote", "Promote to Ready (t)", t, {
+                          btn("act-promote", "Ready (t)", t, {
                             small: true,
                             onClick: (_ev, cx) =>
                               this.runTicketAction(
@@ -3287,9 +3735,10 @@ export default class KanbanBoard extends View {
               .child(
                 h_flex()
                   .items_center()
-                  .gap(6)
+                  .flex_none()
+                  .gap(5)
                   .children([
-                    btn("act-triage", "Move / Priority", t, {
+                    btn("act-triage", "Move (t)", t, {
                       small: true,
                       selected: this.modalMode === "triage",
                       onClick: (_ev, cx) => {
@@ -3297,7 +3746,7 @@ export default class KanbanBoard extends View {
                         cx.notify();
                       },
                     }),
-                    btn("act-ask", hasClaim ? "Ask Agent (c)" : "Comment (c)", t, {
+                    btn("act-ask", hasClaim ? "Ask (c)" : "Comment (c)", t, {
                       small: true,
                       selected: this.modalMode === "ask",
                       onClick: (_ev, cx) => {
