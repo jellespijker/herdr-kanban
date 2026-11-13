@@ -23,6 +23,9 @@ herdr-kanban board --json                              # full structured board p
 herdr-kanban list --column ready --unblocked           # unblocked Ready tickets safe to claim in parallel now
 herdr-kanban list -l domain:auth -p P0                 # filter by facet label and Project Priority
 herdr-kanban show 42                                   # inspect priority, milestone, labels, deps, and claim
+herdr-kanban whats-new                                 # view Executive Briefing of landed work by colleagues & agents
+herdr-kanban whats-new --generate                      # synthesize & save What's New briefing from Done tickets + Git log
+herdr-kanban whats-new --write-summary "## Highlights..." --author jelle --agent claude
 herdr-kanban inbox --ack                               # check & acknowledge messages from sibling/colleague agents
 herdr-kanban open                                      # open native Herdr-App GPUI Kanban mod (or terminal TUI)
 herdr-kanban install-app-mod --on <peer>               # install & sync native GPUI mod locally and to hc peers

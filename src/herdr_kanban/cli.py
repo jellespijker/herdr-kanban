@@ -755,6 +755,47 @@ def cmd_done(args: argparse.Namespace, engine: KanbanEngine) -> int:
     return EXIT_OK
 
 
+def cmd_whats_new(args: argparse.Namespace, engine: KanbanEngine) -> int:
+    ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
+    cached = engine.load_cached_tickets(ctx)
+    if cached is not None and not getattr(args, "refresh", False):
+        _, tickets = cached
+    else:
+        _, tickets = engine.refresh_board(ctx)
+
+    limit = int(getattr(args, "limit", 25) or 25)
+    if getattr(args, "prompt", False):
+        prompt = engine.build_whats_new_agent_prompt(ctx, tickets, limit=limit)
+        if getattr(args, "json", False):
+            return _emit_json({"prompt": prompt})
+        print(prompt)
+        return EXIT_OK
+
+    if getattr(args, "write_summary", None) or getattr(args, "generate", False):
+        digest = engine.generate_whats_new_summary(
+            ctx,
+            tickets,
+            custom_markdown=getattr(args, "write_summary", None),
+            author=getattr(args, "author", "") or "",
+            agent_kind=getattr(args, "agent", "") or "",
+        )
+    else:
+        digest = engine.build_whats_new_digest(ctx, tickets, limit=limit)
+
+    if getattr(args, "json", False):
+        return _emit_json(digest)
+
+    saved = digest.get("saved_summary")
+    if isinstance(saved, dict) and saved.get("markdown"):
+        print(f"=== What's New Briefing (by @{saved.get('author', 'agent')}:{saved.get('agent_kind', 'agent')}) ===")
+        print(saved["markdown"])
+        print()
+    else:
+        print(digest.get("auto_markdown") or "No landed tickets yet.")
+    return EXIT_OK
+
+
+
 def cmd_open(args: argparse.Namespace, engine: KanbanEngine) -> int:
     daemon.ensure()
     cwd = engine.resolve_cwd(Path(args.cwd) if args.cwd else None)
@@ -1224,6 +1265,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_done.add_argument("--cwd", help="Repository or umbrella directory")
     p_done.add_argument("--json", action="store_true", help="Output JSON")
 
+    # whats-new
+    p_wn = sub.add_parser(
+        "whats-new",
+        help="Summarize recently landed work across colleagues, coding agents, and repositories",
+    )
+    p_wn.add_argument("--limit", type=int, default=25, help="Max landed tickets to include")
+    p_wn.add_argument("--refresh", action="store_true", help="Force live GitHub refresh before summarizing")
+    p_wn.add_argument(
+        "--generate",
+        action="store_true",
+        help="Synthesize & save an executive Markdown briefing combining landed tickets and git log",
+    )
+    p_wn.add_argument(
+        "--write-summary",
+        metavar="MARKDOWN",
+        help="Save an agent-authored Markdown summary for the Herdr-App What's New view",
+    )
+    p_wn.add_argument("--author", help="Author handle for --write-summary")
+    p_wn.add_argument("--agent", help="Agent kind for --write-summary")
+    p_wn.add_argument(
+        "--prompt",
+        action="store_true",
+        help="Print an agent prompt to synthesize recently landed team work",
+    )
+    p_wn.add_argument("--cwd", help="Repository or umbrella directory")
+    p_wn.add_argument("--json", action="store_true", help="Output JSON")
+
+
     # open & tui
     p_open = sub.add_parser(
         "open", help="Open the Kanban board in Herdr-App (GPUI mod) or a Herdr terminal tab/split/popup"
@@ -1322,6 +1391,7 @@ HANDLERS = {
     "ask": cmd_ask,
     "inbox": cmd_inbox,
     "done": cmd_done,
+    "whats-new": cmd_whats_new,
     "open": cmd_open,
     "tui": cmd_tui,
     "install-app-mod": cmd_install_app_mod,

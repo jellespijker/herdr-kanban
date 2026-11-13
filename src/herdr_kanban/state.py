@@ -302,3 +302,23 @@ def load_board_cache(slug: str, project_number: int) -> tuple[float, list[dict[s
     if not isinstance(raw, dict) or not isinstance(raw.get("tickets"), list):
         return None
     return float(raw.get("fetched_at") or 0.0), raw["tickets"]
+
+
+# --- What's New Digest State ---
+
+
+def _whats_new_path(slug: str, project_number: int) -> Path:
+    return state_dir() / "whats-new" / f"{slug}-p{project_number}.json"
+
+
+def save_whats_new_summary(slug: str, project_number: int, summary: dict[str, Any]) -> None:
+    with _locked(state_dir() / "whats-new" / ".lock"):
+        _atomic_write_json(_whats_new_path(slug, project_number), summary)
+
+
+def load_whats_new_summary(slug: str, project_number: int) -> dict[str, Any] | None:
+    raw = _read_json(_whats_new_path(slug, project_number), None)
+    if not isinstance(raw, dict) or not raw.get("markdown"):
+        return None
+    return raw
+

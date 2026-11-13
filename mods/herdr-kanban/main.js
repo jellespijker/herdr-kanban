@@ -1,5 +1,5 @@
-import { View, div } from "gpui-kit";
-import { v_flex, h_flex, Button, Input, InputState } from "gpui-base";
+import { View, div, svg } from "gpui-kit";
+import { v_flex, h_flex, Button, Input, InputState, TextView } from "gpui-base";
 import {
   spaces,
   panes,
@@ -7,7 +7,6 @@ import {
   terminals,
   focused,
   exec,
-  hc,
   run,
   theme,
   closeOverlay,
@@ -25,16 +24,34 @@ const COLUMNS = [
   { id: "done", title: "Done", short: "Done", key: "6" },
 ];
 
-const COL_WIDTH = 228;
-const CARD_EST_HEIGHT = 104;
+const COLUMN_TITLE_BY_ID = Object.fromEntries(COLUMNS.map((c) => [c.id, c.title]));
+const ACTIVE_COL_MIN_WIDTH = 276;
+const ACTIVE_COL_MAX_WIDTH = 360;
+const EMPTY_COL_COMPACT_WIDTH = 104;
+const UNIFORM_COL_WIDTH = 248;
+const CARD_EST_HEIGHT = 116;
 const DEFAULT_PRIORITIES = ["P0", "P1", "P2", "P3"];
 const DEFAULT_AGENTS = ["claude", "agy", "codex", "opencode", "gemini", "copilot"];
 
+function withAlpha(hexColor, alphaHex) {
+  const c = String(hexColor || "").trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(c)) {
+    return `${c}${alphaHex}`;
+  }
+  if (/^#[0-9a-fA-F]{3}$/.test(c)) {
+    const r = c[1];
+    const g = c[2];
+    const b = c[3];
+    return `#${r}${r}${g}${g}${b}${b}${alphaHex}`;
+  }
+  return c;
+}
+
 function priorityColor(prio, t) {
   const p = String(prio || "").toUpperCase();
-  if (p.startsWith("P0") || p.startsWith("CRIT")) return t.blocked || t.ansi1;
-  if (p.startsWith("P1") || p.startsWith("HIGH")) return t.working || t.ansi3;
-  if (p.startsWith("P2") || p.startsWith("MED")) return t.accent;
+  if (p.startsWith("P0") || p.startsWith("CRIT")) return t.blocked || t.ansi1 || "#e05252";
+  if (p.startsWith("P1") || p.startsWith("HIGH")) return t.working || t.ansi3 || "#d97736";
+  if (p.startsWith("P2") || p.startsWith("MED")) return t.accent || "#4574c4";
   return t.muted;
 }
 
@@ -48,8 +65,121 @@ function columnAccent(colId, t) {
   return t.muted;
 }
 
+function parseTicketTitle(ticket) {
+  const raw = String(ticket?.title || "").trim();
+  let rest = raw;
+  const jiraKeys = [];
+  const scopes = [];
+  const tagRe = /^\[([^\[\]]+)\]\s*/;
+  const jiraRe = /^[A-Z][A-Z0-9]+-\d+$/;
+  while (true) {
+    const m = tagRe.exec(rest);
+    if (!m) break;
+    const tok = m[1].trim();
+    rest = rest.slice(m[0].length).trim();
+    if (jiraRe.test(tok)) {
+      if (!jiraKeys.includes(tok)) jiraKeys.push(tok);
+    } else if (tok && !scopes.includes(tok)) {
+      scopes.push(tok);
+    }
+  }
+  const targetRepo = ticket?.target_repo || ticket?.repo_alias || "";
+  const filteredScopes = scopes.filter(
+    (s) => s.toLowerCase() !== String(targetRepo).toLowerCase()
+  );
+  return {
+    cleanTitle: rest || raw,
+    jiraKeys,
+    scopes: filteredScopes,
+  };
+}
+
+function parseFacetLabel(rawLabel, t) {
+  const str = String(rawLabel || "").trim();
+  const colonIdx = str.indexOf(":");
+  if (colonIdx <= 0) {
+    return { prefix: "", text: str, color: t.muted, bg: t.background };
+  }
+  const prefix = str.slice(0, colonIdx).toLowerCase();
+  const val = str.slice(colonIdx + 1).trim();
+  if (prefix === "domain") {
+    return {
+      prefix,
+      text: val,
+      color: t.accent,
+      bg: withAlpha(t.accent, "16") || t.background,
+    };
+  }
+  if (prefix === "type") {
+    const isBug = val === "bug" || val === "forensics";
+    const c = isBug ? t.blocked || t.ansi1 : t.working || t.ansi3;
+    return {
+      prefix,
+      text: val,
+      color: c,
+      bg: withAlpha(c, "16") || t.background,
+    };
+  }
+  if (prefix === "release") {
+    const shortRel = val
+      .replace(/^cura-/, "cura ")
+      .replace(/^ultimoco-/, "ultimoco ")
+      .replace(/\+unimotion$/, "");
+    const c = t.done || t.ansi2;
+    return {
+      prefix,
+      text: shortRel,
+      color: c,
+      bg: withAlpha(c, "14") || t.background,
+    };
+  }
+  if (prefix === "trl" || prefix === "access") {
+    return {
+      prefix,
+      text: val,
+      color: t.dim,
+      bg: t.background,
+    };
+  }
+  return { prefix, text: str, color: t.muted, bg: t.background };
+}
+
+function stripKanbanMeta(rawBody) {
+  if (!rawBody) return "";
+  let text = String(rawBody).replace(/<!--\s*herdr-kanban:v1\s+\{[\s\S]*?\}\s*-->/g, "").trim();
+  text = text.replace(/\n---\s*\n\*\*Deposited via `herdr-kanban`\*\*[\s\S]*$/, "").trim();
+  return text;
+}
+
+function linkifyKanbanRefs(markdown, defaultRepoAlias) {
+  if (!markdown) return "";
+  const lines = String(markdown).split("\n");
+  let inFence = false;
+  return lines
+    .map((line) => {
+      if (line.trim().startsWith("```")) {
+        inFence = !inFence;
+        return line;
+      }
+      if (inFence) return line;
+      // Avoid replacing inside existing markdown links `[...](...)`
+      return line.replace(
+        /(^|[\s(])((?:[A-Za-z0-9_.-]+)?#\d+)\b/g,
+        (full, pre, ref) => {
+          const cleanRef = ref.startsWith("#")
+            ? defaultRepoAlias
+              ? `${defaultRepoAlias}${ref}`
+              : ref.slice(1)
+            : ref;
+          return `${pre}[${ref}](kanban://issue/${cleanRef})`;
+        }
+      );
+    })
+    .join("\n");
+}
+
 function btn(id, label, t, opts = {}) {
-  const { primary, danger, selected, small, onClick } = opts;
+  const { primary, danger, dangerOutline, selected, small, iconPath, onClick } = opts;
   const bg = primary
     ? t.accent
     : danger
@@ -60,31 +190,49 @@ function btn(id, label, t, opts = {}) {
   const fg =
     primary || danger
       ? t.solid_foreground || t.background
+      : dangerOutline
+      ? t.blocked || t.ansi1
       : selected
       ? t.accent
       : t.foreground;
+  const borderCol = primary
+    ? t.accent
+    : danger || dangerOutline
+    ? t.blocked || t.ansi1
+    : selected
+    ? t.accent
+    : t.border;
+
   return Button.new(id)
     .px(small ? 7 : 10)
-    .py(small ? 2 : 4)
-    .rounded(5)
+    .py(small ? 3 : 5)
+    .rounded(6)
     .cursor_pointer()
     .bg(bg)
     .border_1()
-    .border_color(
-      primary
-        ? t.accent
-        : danger
-        ? t.blocked || t.ansi1
-        : selected
-        ? t.accent
-        : t.border
-    )
+    .border_color(borderCol)
     .text_size(small ? 11 : 12)
     .text_color(fg)
     .selected(Boolean(selected))
-    .hover((s) => s.bg(primary ? t.accent : t.hover))
+    .hover((s) =>
+      s.bg(
+        primary
+          ? t.accent
+          : danger || dangerOutline
+          ? withAlpha(t.blocked || t.ansi1, "24") || t.hover
+          : t.hover
+      )
+    )
     .when(Boolean(onClick), (el) => el.on_click(onClick))
-    .child(label);
+    .child(
+      iconPath
+        ? h_flex()
+            .items_center()
+            .gap(5)
+            .child(svg(iconPath).size(12).flex_none().text_color(fg))
+            .when(Boolean(label), (r) => r.child(label))
+        : label
+    );
 }
 
 function cleanTarget(rawOn) {
@@ -245,9 +393,13 @@ export default class KanbanBoard extends View {
       views: new Set(),
       searchQuery: "",
       repoFilter: "",
+      quickFilter: "all", // "all" | "active" | "p0"
+      compactEmpty: true,
+      viewMode: "board", // "board" | "whats_new"
       agentKind: "claude",
       overrideSpaceId: null,
-      showDrawer: false,
+      showDrawer: true,
+      drawerTall: false,
       modalMode: null,
       resolvedCwdBySpace: {},
     });
@@ -265,13 +417,17 @@ export default class KanbanBoard extends View {
     this.overrideSpaceId = bus.overrideSpaceId;
     this.lastTargetKey = "";
     this.repoFilter = bus.repoFilter;
+    this.quickFilter = bus.quickFilter || "all";
+    this.compactEmpty = bus.compactEmpty !== false;
+    this.viewMode = bus.viewMode || "board";
     this.agentKind = bus.agentKind;
     this.userPickedAgent = false;
 
-    this.colIdx = 1; // Ready column
+    this.colIdx = 2; // In Progress column default when active
     this.rowByCol = { 0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
     this.selectedRef = null;
-    this.showDrawer = bus.showDrawer;
+    this.showDrawer = bus.showDrawer !== false;
+    this.drawerTall = Boolean(bus.drawerTall);
 
     // 2D Board & Filter strip pan state
     this.panX = 0;
@@ -279,7 +435,7 @@ export default class KanbanBoard extends View {
     this.filterPanX = 0;
     this.drag = null;
     this.justDragged = false;
-    this.size = { width: 640, height: 720 };
+    this.size = { width: 840, height: 740 };
 
     // Inline modal modes: null | "deposit" | "ask" | "triage"
     this.modalMode = bus.modalMode;
@@ -287,10 +443,10 @@ export default class KanbanBoard extends View {
     this.depositRepo = "";
     this.depositReady = true;
 
-    this.searchInput = InputState.new({ placeholder: "Filter tickets…" });
-    this.depositTitleInput = InputState.new({ placeholder: "Ticket title…" });
-    this.depositBodyInput = InputState.new({ placeholder: "Description or depends-on #issue…" });
-    this.askInput = InputState.new({ placeholder: "Message or question for this ticket's agent…" });
+    this.searchInput = InputState.new({ placeholder: "Filter tickets, #ref, @owner…" });
+    this.depositTitleInput = InputState.new({ placeholder: "[JIRA-KEY][scope] Ticket title…" });
+    this.depositBodyInput = InputState.new({ placeholder: "Markdown description or --depends-on #issue…" });
+    this.askInput = InputState.new({ placeholder: "Relay message or question for this ticket's agent…" });
 
     this.searchQuery = bus.searchQuery;
     this.searchInput.on("change", (_e, cx) => {
@@ -337,6 +493,10 @@ export default class KanbanBoard extends View {
             cx.notify();
           } else if (cmd === "refresh" || cmd?.action === "refresh") {
             this.refresh(cx, false);
+          } else if (cmd === "whats_new" || cmd?.action === "whats_new") {
+            this.syncBus({ viewMode: "whats_new" }, cx);
+          } else if (cmd === "board" || cmd?.action === "board") {
+            this.syncBus({ viewMode: "board" }, cx);
           }
         }
       } catch {}
@@ -356,12 +516,23 @@ export default class KanbanBoard extends View {
         v.repoFilter = patch.repoFilter;
         v.syncSelectionAfterLoad();
       }
+      if (patch.quickFilter !== undefined) {
+        v.quickFilter = patch.quickFilter;
+        v.syncSelectionAfterLoad();
+      }
+      if (patch.compactEmpty !== undefined) {
+        v.compactEmpty = patch.compactEmpty;
+      }
+      if (patch.viewMode !== undefined) {
+        v.viewMode = patch.viewMode;
+      }
       if (patch.agentKind !== undefined) {
         v.agentKind = patch.agentKind;
         v.userPickedAgent = true;
       }
       if (patch.overrideSpaceId !== undefined) v.overrideSpaceId = patch.overrideSpaceId;
       if (patch.showDrawer !== undefined) v.showDrawer = patch.showDrawer;
+      if (patch.drawerTall !== undefined) v.drawerTall = patch.drawerTall;
       if (patch.modalMode !== undefined) v.modalMode = patch.modalMode;
     }
     if (cx) cx.notify();
@@ -382,7 +553,12 @@ export default class KanbanBoard extends View {
 
   refresh(cx, silent = false) {
     const tgt = this.target();
-    const candidates = Array.isArray(tgt.candidates) && tgt.candidates.length ? tgt.candidates : tgt.cwd ? [tgt.cwd] : [];
+    const candidates =
+      Array.isArray(tgt.candidates) && tgt.candidates.length
+        ? tgt.candidates
+        : tgt.cwd
+        ? [tgt.cwd]
+        : [];
     this.lastTargetKey = `${tgt.on || "local"}:${tgt.spaceId || ""}:${tgt.cwd || ""}`;
     if (!candidates.length) {
       this.board = null;
@@ -468,6 +644,11 @@ export default class KanbanBoard extends View {
           t.repo_name === this.repoFilter;
         if (!matchRepo) return false;
       }
+      if (this.quickFilter === "active") {
+        if (t.column === "done") return false;
+      } else if (this.quickFilter === "p0") {
+        if (!String(t.priority || "").toUpperCase().startsWith("P0")) return false;
+      }
       if (!q) return true;
       const ref = String(t.ref || `#${t.number}`).toLowerCase();
       const title = String(t.title || "").toLowerCase();
@@ -497,6 +678,38 @@ export default class KanbanBoard extends View {
     return map;
   }
 
+  computeColumnLayout(byColOverride) {
+    const byCol = byColOverride || this.ticketsByColumn();
+    const viewW = Math.max(360, this.size?.width ?? 840);
+    const widths = COLUMNS.map((col) => {
+      const cnt = (byCol[col.id] || []).length;
+      if (!this.compactEmpty) return UNIFORM_COL_WIDTH;
+      return cnt === 0 ? EMPTY_COL_COMPACT_WIDTH : ACTIVE_COL_MIN_WIDTH;
+    });
+
+    const rawTotal = widths.reduce((a, b) => a + b, 0);
+    if (rawTotal < viewW) {
+      const activeIndices = COLUMNS.map((col, idx) =>
+        (byCol[col.id] || []).length > 0 ? idx : -1
+      ).filter((idx) => idx >= 0);
+
+      if (activeIndices.length > 0) {
+        const extraPerCol = Math.floor((viewW - rawTotal) / activeIndices.length);
+        for (const idx of activeIndices) {
+          widths[idx] = Math.min(ACTIVE_COL_MAX_WIDTH, widths[idx] + extraPerCol);
+        }
+      }
+    }
+
+    const offsets = [];
+    let acc = 0;
+    for (const w of widths) {
+      offsets.push(acc);
+      acc += w;
+    }
+    return { widths, offsets, totalW: acc, viewW };
+  }
+
   syncSelectionAfterLoad() {
     const byCol = this.ticketsByColumn();
     if (this.selectedRef) {
@@ -510,11 +723,13 @@ export default class KanbanBoard extends View {
         }
       }
     }
-    const curColId = COLUMNS[this.colIdx]?.id || "ready";
+    const curColId = COLUMNS[this.colIdx]?.id || "in_progress";
     const curList = byCol[curColId] || [];
     if (curList.length === 0) {
-      const nonEmptyIdx = COLUMNS.findIndex((col) => (byCol[col.id] || []).length > 0);
-      if (nonEmptyIdx >= 0) {
+      // Prefer In Progress / Ready / Review before Done
+      const preferredOrder = [2, 1, 4, 3, 0, 5];
+      const nonEmptyIdx = preferredOrder.find((idx) => (byCol[COLUMNS[idx].id] || []).length > 0);
+      if (nonEmptyIdx !== undefined) {
         this.colIdx = nonEmptyIdx;
       }
     }
@@ -540,21 +755,85 @@ export default class KanbanBoard extends View {
     return list[r] || null;
   }
 
-  boardViewportDims() {
-    const viewW = Math.max(320, this.size?.width ?? 640);
-    const chromeH = 128 + (this.showDrawer ? 280 : 0) + (this.modalMode ? 64 : 0);
-    const viewH = Math.max(160, (this.size?.height ?? 720) - chromeH);
-    const totalW = COLUMNS.length * COL_WIDTH;
+  selectTicketByRef(rawRef, cx) {
+    if (!this.board || !Array.isArray(this.board.tickets)) return;
+    const clean = String(rawRef || "").replace(/^kanban:\/\/issue\//, "").trim();
+    const numMatch = /(\d+)$/.exec(clean);
+    const targetNum = numMatch ? Number(numMatch[1]) : -1;
+
+    // Clear filters if ticket is hidden by current filter
     const byCol = this.ticketsByColumn();
+    let foundCol = -1;
+    let foundRow = -1;
+    for (let c = 0; c < COLUMNS.length; c++) {
+      const list = byCol[COLUMNS[c].id] || [];
+      const r = list.findIndex(
+        (t) =>
+          t.cli_ref === clean ||
+          t.ref === clean ||
+          String(t.number) === clean ||
+          t.number === targetNum
+      );
+      if (r >= 0) {
+        foundCol = c;
+        foundRow = r;
+        break;
+      }
+    }
+
+    if (foundCol < 0 && (this.repoFilter || this.quickFilter !== "all" || this.searchQuery)) {
+      this.repoFilter = "";
+      this.quickFilter = "all";
+      this.searchQuery = "";
+      this.searchInput.set_value("");
+      this.syncBus({ repoFilter: "", quickFilter: "all", searchQuery: "" }, null);
+      const allByCol = this.ticketsByColumn();
+      for (let c = 0; c < COLUMNS.length; c++) {
+        const list = allByCol[COLUMNS[c].id] || [];
+        const r = list.findIndex(
+          (t) =>
+            t.cli_ref === clean ||
+            t.ref === clean ||
+            String(t.number) === clean ||
+            t.number === targetNum
+        );
+        if (r >= 0) {
+          foundCol = c;
+          foundRow = r;
+          break;
+        }
+      }
+    }
+
+    if (foundCol >= 0) {
+      this.syncBus({ viewMode: "board", showDrawer: true }, null);
+      this.selectColumnRow(foundCol, foundRow, cx, true);
+    }
+  }
+
+  handleLinkClick(url, cx) {
+    const str = String(url || "").trim();
+    if (str.startsWith("kanban://issue/") || /^([A-Za-z0-9_.-]+)?#\d+$/.test(str)) {
+      this.selectTicketByRef(str, cx);
+      return;
+    }
+  }
+
+  boardViewportDims() {
+    const byCol = this.ticketsByColumn();
+    const { widths, offsets, totalW, viewW } = this.computeColumnLayout(byCol);
+    const drawerH = this.showDrawer ? (this.drawerTall ? 410 : 268) : 0;
+    const chromeH = 128 + drawerH + (this.modalMode ? 64 : 0);
+    const viewH = Math.max(150, (this.size?.height ?? 740) - chromeH);
     let maxCards = 1;
     for (const col of COLUMNS) {
       const len = (byCol[col.id] || []).length;
       if (len > maxCards) maxCards = len;
     }
-    const contentH = Math.max(viewH, maxCards * CARD_EST_HEIGHT + 32);
+    const contentH = Math.max(viewH, maxCards * CARD_EST_HEIGHT + 40);
     const minPanX = Math.min(0, viewW - totalW);
     const minPanY = Math.min(0, viewH - contentH);
-    return { viewW, viewH, totalW, contentH, minPanX, minPanY };
+    return { viewW, viewH, totalW, contentH, minPanX, minPanY, widths, offsets };
   }
 
   setPan(nextX, nextY, cx) {
@@ -576,19 +855,21 @@ export default class KanbanBoard extends View {
   }
 
   panToColumn(colIdx, cx) {
-    const { viewW } = this.boardViewportDims();
-    const targetCenter = colIdx * COL_WIDTH + COL_WIDTH / 2;
+    const { viewW, widths, offsets } = this.boardViewportDims();
+    const colLeft = offsets[colIdx] || 0;
+    const colW = widths[colIdx] || ACTIVE_COL_MIN_WIDTH;
+    const targetCenter = colLeft + colW / 2;
     const desiredPanX = Math.round(viewW / 2 - targetCenter);
     this.setPan(desiredPanX, 0, cx);
   }
 
   ensureVisible(colIdx, rowIdx) {
-    const { viewW, viewH, minPanX, minPanY } = this.boardViewportDims();
+    const { viewW, viewH, minPanX, minPanY, widths, offsets } = this.boardViewportDims();
     let nextX = this.panX;
     let nextY = this.panY;
 
-    const colLeft = colIdx * COL_WIDTH;
-    const colRight = colLeft + COL_WIDTH;
+    const colLeft = offsets[colIdx] || 0;
+    const colRight = colLeft + (widths[colIdx] || ACTIVE_COL_MIN_WIDTH);
     if (colLeft < -nextX) {
       nextX = -colLeft;
     } else if (colRight > -nextX + viewW) {
@@ -696,27 +977,17 @@ export default class KanbanBoard extends View {
     if (!ticket) return;
     const rt = findTicketRuntime(ticket);
     if (rt.pane) {
-      if (rt.pane.space) {
-        run("space.select", { id: rt.pane.space });
-      }
-      if (rt.pane.tab) {
-        run("tab.select", { id: rt.pane.tab });
-      }
+      if (rt.pane.space) run("space.select", { id: rt.pane.space });
+      if (rt.pane.tab) run("tab.select", { id: rt.pane.tab });
       run("pane.focus", { pane: rt.pane.pane });
       this.statusMessage = `Focused pane for ${ticket.ref || "#" + ticket.number}`;
       cx.notify();
       return;
     }
     if (rt.agent) {
-      if (rt.agent.space) {
-        run("space.select", { id: rt.agent.space });
-      }
-      if (rt.agent.tab) {
-        run("tab.select", { id: rt.agent.tab });
-      }
-      if (rt.agent.pane) {
-        run("pane.focus", { pane: rt.agent.pane });
-      }
+      if (rt.agent.space) run("space.select", { id: rt.agent.space });
+      if (rt.agent.tab) run("tab.select", { id: rt.agent.tab });
+      if (rt.agent.pane) run("pane.focus", { pane: rt.agent.pane });
       this.statusMessage = `Focused agent ${rt.agent.name || rt.agent.title}`;
       cx.notify();
       return;
@@ -733,7 +1004,10 @@ export default class KanbanBoard extends View {
       cx.notify();
       return;
     }
-    notify({ title: "Kanban", message: `No active terminal found for ${ticket.ref || "#" + ticket.number}` });
+    notify({
+      title: "Kanban",
+      message: `No active terminal found for ${ticket.ref || "#" + ticket.number}`,
+    });
   }
 
   claimAndDispatch(ticket, takeover, cx) {
@@ -784,6 +1058,73 @@ export default class KanbanBoard extends View {
         this.busyText = "";
         this.statusMessage = `Dispatched ${disp} to ${kind} in ${claim.worktree_path || "worktree"}`;
         this.refresh(cx, true);
+      } catch (err) {
+        this.busyText = "";
+        this.error = String(err && err.message ? err.message : err);
+        cx.notify();
+      }
+    });
+  }
+
+  synthesizeWhatsNew(cx) {
+    if (this.busyText) return;
+    const tgt = this.target();
+    this.busyText = "Synthesizing landed work & recent Git commits…";
+    this.error = "";
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await this.execKanban(
+          ["whats-new", "--generate", "--agent", this.agentKind || "agent", "--json"],
+          tgt
+        );
+        this.busyText = "";
+        if (!res || res.code !== 0) {
+          this.error = ((res && (res.stderr || res.stdout)) || "Failed to generate briefing").trim();
+          cx.notify();
+          return;
+        }
+        const digest = JSON.parse(res.stdout);
+        if (this.board) {
+          this.board.whats_new = digest;
+        }
+        this.statusMessage = "Updated What's New executive briefing";
+        cx.notify();
+      } catch (err) {
+        this.busyText = "";
+        this.error = String(err && err.message ? err.message : err);
+        cx.notify();
+      }
+    });
+  }
+
+  dispatchWhatsNewAgent(cx) {
+    if (this.busyText) return;
+    const tgt = this.target();
+    const kind = this.agentKind || "claude";
+    this.busyText = `Launching ${kind} to author team briefing…`;
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await this.execKanban(["whats-new", "--prompt", "--json"], tgt);
+        this.busyText = "";
+        if (!res || res.code !== 0) {
+          this.error = ((res && (res.stderr || res.stdout)) || "Failed to build prompt").trim();
+          cx.notify();
+          return;
+        }
+        const payload = JSON.parse(res.stdout);
+        run("tab.new", {
+          name: `What's New Briefing (${kind})`,
+          space: tgt.spaceId,
+          cwd: this.activeCwd || tgt.cwd,
+          argv: [kind],
+          task: payload.prompt || "",
+        });
+        this.statusMessage = `Dispatched ${kind} to write What's New briefing`;
+        cx.notify();
       } catch (err) {
         this.busyText = "";
         this.error = String(err && err.message ? err.message : err);
@@ -852,7 +1193,11 @@ export default class KanbanBoard extends View {
       ticket.claim && (ticket.claim.state === "active" || ticket.claim.state === "review_ready");
     const cmd = hasClaim ? "ask" : "comment";
     this.askInput.set_value("");
-    this.runTicketAction(`Sent message to ${ticket.ref || "#" + ticket.number}`, [cmd, cliRef, msg], cx);
+    this.runTicketAction(
+      `Sent message to ${ticket.ref || "#" + ticket.number}`,
+      [cmd, cliRef, msg],
+      cx
+    );
   }
 
   handleKeyDown(ev, cx) {
@@ -879,9 +1224,16 @@ export default class KanbanBoard extends View {
     }
 
     const ticket = this.selectedTicket();
-    const panStepX = 120;
-    const panStepY = 96;
-    if (shift && (key === "h" || key === "H" || key === "left")) {
+    const panStepX = 140;
+    const panStepY = 104;
+    if (key === "w") {
+      const nextView = this.viewMode === "whats_new" ? "board" : "whats_new";
+      this.syncBus({ viewMode: nextView }, cx);
+      cx.stop_propagation();
+    } else if (key === "b") {
+      this.syncBus({ viewMode: "board" }, cx);
+      cx.stop_propagation();
+    } else if (shift && (key === "h" || key === "H" || key === "left")) {
       this.panBy(panStepX, 0, cx);
       cx.stop_propagation();
     } else if (shift && (key === "l" || key === "L" || key === "right")) {
@@ -901,6 +1253,7 @@ export default class KanbanBoard extends View {
       const byCol = this.ticketsByColumn();
       const list = byCol[COLUMNS[targetCol].id] || [];
       const row = Math.min(this.rowByCol[targetCol] || 0, Math.max(0, list.length - 1));
+      this.syncBus({ viewMode: "board" }, null);
       this.selectColumnRow(targetCol, row, cx, false);
       this.panToColumn(targetCol, cx);
       cx.stop_propagation();
@@ -919,6 +1272,9 @@ export default class KanbanBoard extends View {
     } else if (key === "r") {
       this.refresh(cx, false);
       cx.stop_propagation();
+    } else if (key === "D" || (shift && key === "d")) {
+      this.syncBus({ showDrawer: true, drawerTall: !this.drawerTall }, cx);
+      cx.stop_propagation();
     } else if (key === "d" || key === "i" || key === " " || key === "enter") {
       this.syncBus({ showDrawer: !this.showDrawer }, cx);
       cx.stop_propagation();
@@ -932,8 +1288,12 @@ export default class KanbanBoard extends View {
       this.askInput.focus();
       cx.stop_propagation();
       cx.notify();
-    } else if (key === "s" && ticket) {
-      this.claimAndDispatch(ticket, Boolean(ticket.stale), cx);
+    } else if (key === "s") {
+      if (this.viewMode === "whats_new") {
+        this.synthesizeWhatsNew(cx);
+      } else if (ticket) {
+        this.claimAndDispatch(ticket, Boolean(ticket.stale), cx);
+      }
       cx.stop_propagation();
     } else if (key === "f" && ticket) {
       this.focusTicketAgent(ticket, cx);
@@ -965,7 +1325,9 @@ export default class KanbanBoard extends View {
       else closeOverlay(props()?.overlay || "herdr-kanban");
       cx.stop_propagation();
     } else if (key === "escape") {
-      if (this.showDrawer) {
+      if (this.viewMode === "whats_new") {
+        this.syncBus({ viewMode: "board" }, cx);
+      } else if (this.showDrawer) {
         this.syncBus({ showDrawer: false }, cx);
       } else {
         const myPane = props()?.pane;
@@ -977,8 +1339,8 @@ export default class KanbanBoard extends View {
   }
 
   renderHeader(t, tgt, byCol) {
-    const panelW = this.size?.width ?? 640;
-    const isWide = panelW >= 560;
+    const panelW = this.size?.width ?? 840;
+    const isWide = panelW >= 620;
     const boardTitle =
       (this.board && this.board.project && this.board.project.title) ||
       (this.board && this.board.repo) ||
@@ -990,10 +1352,14 @@ export default class KanbanBoard extends View {
         : "";
     const reposMap = (this.board && this.board.repos) || {};
     const rawRepoAliases = Object.keys(reposMap);
-    const allTickets = (this.board && Array.isArray(this.board.tickets) && this.board.tickets) || [];
+    const allTickets =
+      (this.board && Array.isArray(this.board.tickets) && this.board.tickets) || [];
     const filteredCount = this.filteredTickets().length;
+    const landedCount =
+      (this.board && this.board.whats_new && this.board.whats_new.total_landed) ||
+      ((byCol && byCol.done && byCol.done.length) || 0);
+    const activeCount = allTickets.filter((tk) => tk.column !== "done").length;
 
-    // Count tickets per repo alias and sort active repos first
     const repoCounts = {};
     for (const tk of allTickets) {
       const key = tk.target_repo || tk.repo_alias || tk.repo_name || "";
@@ -1011,113 +1377,178 @@ export default class KanbanBoard extends View {
     return v_flex()
       .w_full()
       .flex_none()
-      .bg(t.surface)
+      .bg(t.chrome || t.surface)
       .border_b(1)
       .border_color(t.border)
       .child(
-        // Row 1: Clean board identity & essential controls
+        // Row 1: Brand identity, View Switcher (Board | What's New), Search & Primary Actions
         h_flex()
           .w_full()
-          .h(34)
+          .h(38)
           .flex_none()
           .items_center()
           .justify_between()
-          .gap(6)
-          .px(10)
+          .gap(8)
+          .px(12)
           .child(
             h_flex()
               .items_center()
-              .gap(6)
+              .gap(7)
               .min_w(0)
               .flex_1()
+              .child(svg("mods/herdr-kanban/kanban.svg").size(15).flex_none().text_color(t.accent))
               .child(
                 div()
                   .font_semibold()
-                  .text_size(12.5)
+                  .text_size(13)
                   .text_color(t.foreground)
                   .truncate()
                   .child(boardTitle)
               )
               .when(Boolean(tgt.on), (d) =>
                 d.child(
-                  div()
+                  h_flex()
                     .flex_none()
-                    .px(5)
-                    .py(1)
-                    .rounded(4)
-                    .bg(t.selected)
-                    .text_size(10)
-                    .text_color(t.accent)
-                    .child(`@${tgt.on}`)
+                    .items_center()
+                    .gap(4)
+                    .px(6)
+                    .py(2)
+                    .rounded(5)
+                    .bg(t.raised || t.surface)
+                    .border_1()
+                    .border_color(t.border)
+                    .child(svg("mods/workspace-chrome/server.svg").size(10).text_color(t.accent))
+                    .child(div().text_size(10.5).text_color(t.accent).child(tgt.on))
                 )
               )
               .when(Boolean(branchBadge && isWide), (d) =>
                 d.child(
-                  div()
-                    .max_w(140)
-                    .px(5)
-                    .py(1)
-                    .rounded(4)
+                  h_flex()
+                    .max_w(185)
+                    .items_center()
+                    .gap(4)
+                    .px(6)
+                    .py(2)
+                    .rounded(5)
                     .bg(t.background)
                     .border_1()
                     .border_color(t.border)
-                    .text_size(10)
-                    .text_color(t.muted)
-                    .truncate()
-                    .child(branchBadge)
-                )
-              )
-              .when(allTickets.length > 0, (d) =>
-                d.child(
-                  div()
-                    .flex_none()
-                    .px(5)
-                    .py(1)
-                    .rounded(4)
-                    .bg(t.background)
-                    .text_size(10)
-                    .text_color(this.repoFilter || this.searchQuery ? t.accent : t.dim)
-                    .child(
-                      this.repoFilter || this.searchQuery
-                        ? `${filteredCount}/${allTickets.length}`
-                        : `${allTickets.length}`
-                    )
+                    .child(svg("mods/workspace-chrome/git-branch.svg").size(10).text_color(t.muted))
+                    .child(div().text_size(10.5).text_color(t.muted).truncate().child(branchBadge))
                 )
               )
           )
           .child(
+            // Segmented View Switcher: Board vs What's New
+            h_flex()
+              .flex_none()
+              .items_center()
+              .gap(2)
+              .p(2)
+              .rounded(7)
+              .bg(t.background)
+              .border_1()
+              .border_color(t.border)
+              .child(
+                h_flex()
+                  .id("view-tab-board")
+                  .items_center()
+                  .gap(5)
+                  .px(8)
+                  .py(3)
+                  .rounded(5)
+                  .cursor_pointer()
+                  .bg(this.viewMode === "board" ? t.selected : t.background)
+                  .text_size(11.5)
+                  .font_medium()
+                  .text_color(this.viewMode === "board" ? t.foreground : t.muted)
+                  .hover((s) => s.bg(this.viewMode === "board" ? t.selected : t.hover))
+                  .on_click((_ev, cx) => this.syncBus({ viewMode: "board" }, cx))
+                  .child(svg("mods/workspace-chrome/layers.svg").size(11).text_color(this.viewMode === "board" ? t.accent : t.muted))
+                  .child("Board")
+                  .when(allTickets.length > 0, (el) =>
+                    el.child(
+                      div()
+                        .text_size(10)
+                        .text_color(this.viewMode === "board" ? t.accent : t.dim)
+                        .child(
+                          this.repoFilter || this.searchQuery || this.quickFilter !== "all"
+                            ? `${filteredCount}/${allTickets.length}`
+                            : `${allTickets.length}`
+                        )
+                    )
+                  )
+              )
+              .child(
+                h_flex()
+                  .id("view-tab-whats-new")
+                  .items_center()
+                  .gap(5)
+                  .px(8)
+                  .py(3)
+                  .rounded(5)
+                  .cursor_pointer()
+                  .bg(this.viewMode === "whats_new" ? t.selected : t.background)
+                  .text_size(11.5)
+                  .font_medium()
+                  .text_color(this.viewMode === "whats_new" ? t.foreground : t.muted)
+                  .hover((s) => s.bg(this.viewMode === "whats_new" ? t.selected : t.hover))
+                  .on_click((_ev, cx) => this.syncBus({ viewMode: "whats_new" }, cx))
+                  .child(
+                    svg("mods/herdr-kanban/sparkles.svg")
+                      .size(11)
+                      .text_color(this.viewMode === "whats_new" ? t.done || t.ansi2 : t.muted)
+                  )
+                  .child("What's New")
+                  .when(landedCount > 0, (el) =>
+                    el.child(
+                      div()
+                        .px(4)
+                        .rounded(3)
+                        .bg(withAlpha(t.done || t.ansi2, "20") || t.surface)
+                        .text_size(10)
+                        .text_color(t.done || t.ansi2)
+                        .child(String(landedCount))
+                    )
+                  )
+              )
+          )
+          .child(
+            // Search & Action Controls
             h_flex()
               .items_center()
               .flex_none()
-              .gap(5)
+              .gap(6)
               .child(
                 h_flex()
                   .id("search-box")
-                  .w(isWide ? 160 : 120)
-                  .h(24)
-                  .px(6)
+                  .w(isWide ? 168 : 124)
+                  .h(26)
+                  .px(7)
                   .items_center()
-                  .gap(4)
-                  .rounded(5)
+                  .gap(5)
+                  .rounded(6)
                   .bg(t.background)
                   .border_1()
                   .border_color(this.searchQuery ? t.accent : t.border)
                   .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .child(svg("mods/workspace-chrome/search.svg").size(11).flex_none().text_color(t.dim))
                   .child(
                     div()
                       .flex_1()
                       .min_w(0)
                       .h_full()
-                      .child(Input.new(this.searchInput).h_full().text_size(11).text_color(t.foreground))
+                      .child(
+                        Input.new(this.searchInput).h_full().text_size(11.5).text_color(t.foreground)
+                      )
                   )
                   .when(Boolean(this.searchQuery), (el) =>
                     el.child(
                       div()
                         .id("clear-search")
-                        .px(3)
+                        .p(2)
                         .rounded(3)
                         .cursor_pointer()
-                        .text_size(10)
                         .text_color(t.muted)
                         .hover((s) => s.text_color(t.foreground))
                         .on_click((_ev, cx) => {
@@ -1125,22 +1556,15 @@ export default class KanbanBoard extends View {
                           this.searchQuery = "";
                           this.syncBus({ searchQuery: "" }, cx);
                         })
-                        .child("×")
+                        .child(svg("mods/workspace-chrome/x.svg").size(10).text_color(t.muted))
                     )
                   )
               )
-              .when(isPanned, (el) =>
-                el.child(
-                  btn("btn-reset-pan", "Center", t, {
-                    small: true,
-                    onClick: (_ev, cx) => this.resetPan(cx),
-                  })
-                )
-              )
               .child(
-                btn("btn-deposit", "+ Deposit", t, {
+                btn("btn-deposit", "Deposit", t, {
                   primary: true,
                   small: true,
+                  iconPath: "mods/workspace-chrome/plus.svg",
                   onClick: (_ev, cx) => {
                     const nextMode = this.modalMode === "deposit" ? null : "deposit";
                     this.syncBus({ modalMode: nextMode }, cx);
@@ -1148,151 +1572,207 @@ export default class KanbanBoard extends View {
                   },
                 })
               )
-              .child(
-                btn("btn-drawer", "Detail", t, {
-                  small: true,
-                  selected: this.showDrawer,
-                  onClick: (_ev, cx) => {
-                    this.syncBus({ showDrawer: !this.showDrawer }, cx);
-                  },
-                })
+              .when(this.viewMode === "board", (el) =>
+                el.child(
+                  btn("btn-drawer", "Inspector", t, {
+                    small: true,
+                    selected: this.showDrawer,
+                    iconPath: "mods/workspace-chrome/panel-right.svg",
+                    onClick: (_ev, cx) => {
+                      this.syncBus({ showDrawer: !this.showDrawer }, cx);
+                    },
+                  })
+                )
               )
               .child(
-                btn("btn-refresh", "↻", t, {
+                btn("btn-refresh", "", t, {
                   small: true,
+                  iconPath: "mods/herdr-kanban/refresh.svg",
                   onClick: (_ev, cx) => this.refresh(cx, false),
                 })
               )
           )
       )
-      .when(Boolean(this.board), (hdr) =>
+      .when(Boolean(this.board && this.viewMode === "board"), (hdr) =>
         hdr.child(
-          // Row 2: Column quick-jump pills + pannable repo filter strip
+          // Row 2: Scope Filters + Adaptive Layout Toggle + Pannable Repository Filter Strip
           h_flex()
             .id("kanban-subbar")
             .w_full()
-            .h(26)
+            .h(30)
             .flex_none()
             .items_center()
             .justify_between()
             .gap(8)
-            .px(10)
+            .px(12)
+            .bg(t.surface)
             .border_t(1)
             .border_color(t.border)
             .child(
-              // Column quick-jump & count strip
               h_flex()
                 .items_center()
                 .flex_none()
-                .gap(3)
-                .children(
-                  COLUMNS.map((col, idx) => {
-                    const count = ((byCol && byCol[col.id]) || []).length;
-                    const active = this.colIdx === idx;
-                    const accent = columnAccent(col.id, t);
-                    return h_flex()
-                      .id(`col-jump-${col.id}`)
-                      .items_center()
-                      .gap(4)
-                      .px(5)
-                      .py(1)
-                      .rounded(4)
+                .gap(4)
+                .children([
+                  ...[
+                    { id: "all", label: `All (${allTickets.length})` },
+                    { id: "active", label: `Active (${activeCount})` },
+                    { id: "p0", label: "P0" },
+                  ].map((flt) => {
+                    const on = this.quickFilter === flt.id;
+                    return div()
+                      .id(`qflt-${flt.id}`)
+                      .px(7)
+                      .py(2)
+                      .rounded(5)
                       .cursor_pointer()
-                      .bg(active ? t.selected : t.background)
+                      .bg(on ? t.selected : t.background)
                       .border_1()
-                      .border_color(active ? accent : t.border)
+                      .border_color(on ? t.accent : t.border)
+                      .text_size(10.5)
+                      .font_medium()
+                      .text_color(on ? t.foreground : t.muted)
                       .hover((s) => s.bg(t.hover))
                       .on_click((_ev, cx) => {
-                        const list = (byCol && byCol[col.id]) || [];
-                        const row = Math.min(this.rowByCol[idx] || 0, Math.max(0, list.length - 1));
-                        this.selectColumnRow(idx, row, cx, false);
-                        this.panToColumn(idx, cx);
+                        this.syncBus({ quickFilter: flt.id }, cx);
                       })
-                      .child(div().size(5).rounded(3).bg(accent))
-                      .child(
-                        div()
-                          .text_size(10)
-                          .font_medium()
-                          .text_color(active ? t.foreground : count > 0 ? t.muted : t.dim)
-                          .child(`${col.short} ${count}`)
-                      );
-                  })
+                      .child(flt.label);
+                  }),
+                  div()
+                    .id("toggle-compact-empty")
+                    .px(7)
+                    .py(2)
+                    .rounded(5)
+                    .cursor_pointer()
+                    .bg(this.compactEmpty ? t.selected : t.background)
+                    .border_1()
+                    .border_color(this.compactEmpty ? t.border : t.border)
+                    .text_size(10.5)
+                    .text_color(this.compactEmpty ? t.accent : t.dim)
+                    .hover((s) => s.bg(t.hover))
+                    .on_click((_ev, cx) => {
+                      this.syncBus({ compactEmpty: !this.compactEmpty }, cx);
+                      this.resetPan(cx);
+                    })
+                    .child(this.compactEmpty ? "Compact Empty: On" : "Compact Empty: Off"),
+                ])
+                .when(isPanned, (el) =>
+                  el.child(
+                    div()
+                      .id("btn-reset-pan")
+                      .px(7)
+                      .py(2)
+                      .rounded(5)
+                      .cursor_pointer()
+                      .bg(t.raised || t.background)
+                      .border_1()
+                      .border_color(t.accent)
+                      .text_size(10.5)
+                      .text_color(t.accent)
+                      .on_click((_ev, cx) => this.resetPan(cx))
+                      .child("Center (0)")
+                  )
                 )
             )
             .when(repoAliases.length > 1, (d) =>
-              d.child(
-                div()
-                  .id("kanban-filter-viewport")
-                  .relative()
-                  .flex_1()
-                  .min_w(80)
-                  .h(22)
-                  .overflow_hidden()
-                  .cursor_grab()
-                  .on_mouse_down("left", (e, cx) => this.startFilterDrag(e, cx))
-                  .on_mouse_down("middle", (e, cx) => this.startFilterDrag(e, cx))
-                  .on_scroll_wheel((e, cx) => {
-                    const rawDelta = Math.abs(e.delta?.x ?? 0) >= Math.abs(e.delta?.y ?? 0)
-                      ? (e.delta?.x ?? 0)
-                      : (e.delta?.y ?? 0);
-                    const step = Math.abs(rawDelta) <= 3 ? rawDelta * 28 : rawDelta;
-                    this.filterPanX = Math.min(0, Math.round(this.filterPanX + step));
-                    cx.notify();
-                  })
-                  .child(
-                    h_flex()
-                      .id("kanban-filter-track")
-                      .absolute()
-                      .left(this.filterPanX)
-                      .top(1)
-                      .items_center()
-                      .gap(4)
-                      .child(
-                        div()
-                          .id("repo-filter-all")
-                          .flex_none()
-                          .px(6)
-                          .py(1)
-                          .rounded(4)
-                          .cursor_pointer()
-                          .bg(!this.repoFilter ? t.selected : t.background)
-                          .text_size(10)
-                          .text_color(!this.repoFilter ? t.foreground : t.dim)
-                          .child("all repos")
-                          .on_click((_ev, cx) => {
-                            if (this.justDragged) {
-                              this.justDragged = false;
-                              return;
-                            }
-                            this.syncBus({ repoFilter: "" }, cx);
-                          })
-                      )
-                      .children(
-                        repoAliases.map((alias) => {
-                          const active = this.repoFilter === alias;
-                          const cnt = repoCounts[alias] || 0;
-                          return div()
-                            .id(`repo-filter-${alias}`)
+              d
+                .child(div().w(1).h(14).flex_none().bg(t.border))
+                .child(
+                  div()
+                    .id("kanban-filter-viewport")
+                    .relative()
+                    .flex_1()
+                    .min_w(100)
+                    .h(24)
+                    .overflow_hidden()
+                    .cursor_grab()
+                    .on_mouse_down("left", (e, cx) => this.startFilterDrag(e, cx))
+                    .on_mouse_down("middle", (e, cx) => this.startFilterDrag(e, cx))
+                    .on_scroll_wheel((e, cx) => {
+                      const rawDelta =
+                        Math.abs(e.delta?.x ?? 0) >= Math.abs(e.delta?.y ?? 0)
+                          ? e.delta?.x ?? 0
+                          : e.delta?.y ?? 0;
+                      const step = Math.abs(rawDelta) <= 3 ? rawDelta * 28 : rawDelta;
+                      this.filterPanX = Math.min(0, Math.round(this.filterPanX + step));
+                      cx.notify();
+                    })
+                    .child(
+                      h_flex()
+                        .id("kanban-filter-track")
+                        .absolute()
+                        .left(this.filterPanX)
+                        .top(1)
+                        .items_center()
+                        .gap(4)
+                        .child(
+                          div()
+                            .id("repo-filter-all")
                             .flex_none()
-                            .px(6)
-                            .py(1)
-                            .rounded(4)
+                            .px(7)
+                            .py(2)
+                            .rounded(5)
                             .cursor_pointer()
-                            .bg(active ? t.selected : t.background)
-                            .text_size(10)
-                            .text_color(active ? t.accent : cnt > 0 ? t.muted : t.dim)
-                            .child(cnt > 0 ? `${alias} · ${cnt}` : alias)
+                            .bg(!this.repoFilter ? t.selected : t.background)
+                            .border_1()
+                            .border_color(!this.repoFilter ? t.accent : t.border)
+                            .text_size(10.5)
+                            .font_medium()
+                            .text_color(!this.repoFilter ? t.foreground : t.muted)
+                            .child("all repos")
                             .on_click((_ev, cx) => {
                               if (this.justDragged) {
                                 this.justDragged = false;
                                 return;
                               }
-                              this.syncBus({ repoFilter: active ? "" : alias }, cx);
-                            });
-                        })
-                      )
-                  )
-              )
+                              this.syncBus({ repoFilter: "" }, cx);
+                            })
+                        )
+                        .children(
+                          repoAliases.map((alias) => {
+                            const active = this.repoFilter === alias;
+                            const cnt = repoCounts[alias] || 0;
+                            return h_flex()
+                              .id(`repo-filter-${alias}`)
+                              .flex_none()
+                              .items_center()
+                              .gap(4)
+                              .px(7)
+                              .py(2)
+                              .rounded(5)
+                              .cursor_pointer()
+                              .bg(active ? t.selected : t.background)
+                              .border_1()
+                              .border_color(active ? t.accent : t.border)
+                              .hover((s) => s.bg(t.hover))
+                              .on_click((_ev, cx) => {
+                                if (this.justDragged) {
+                                  this.justDragged = false;
+                                  return;
+                                }
+                                this.syncBus({ repoFilter: active ? "" : alias }, cx);
+                              })
+                              .child(
+                                div()
+                                  .text_size(10.5)
+                                  .text_color(active ? t.accent : cnt > 0 ? t.foreground : t.dim)
+                                  .child(alias)
+                              )
+                              .when(cnt > 0, (c) =>
+                                c.child(
+                                  div()
+                                    .px(4)
+                                    .rounded(3)
+                                    .bg(t.surface)
+                                    .text_size(9.5)
+                                    .text_color(active ? t.accent : t.muted)
+                                    .child(String(cnt))
+                                )
+                              );
+                          })
+                        )
+                    )
+                )
             )
         )
       );
@@ -1321,7 +1801,9 @@ export default class KanbanBoard extends View {
           h_flex()
             .items_center()
             .justify_between()
-            .child(div().text_size(12).font_semibold().text_color(t.accent).child("Deposit New Ticket"))
+            .child(
+              div().text_size(12).font_semibold().text_color(t.accent).child("Deposit New Ticket")
+            )
             .child(
               h_flex()
                 .items_center()
@@ -1347,7 +1829,7 @@ export default class KanbanBoard extends View {
                 )
                 .when(repos.length > 1, (d) =>
                   d.children(
-                    repos.map((alias) => {
+                    repos.slice(0, 8).map((alias) => {
                       const active = this.depositRepo === alias;
                       return div()
                         .id(`dep-repo-${alias}`)
@@ -1401,7 +1883,9 @@ export default class KanbanBoard extends View {
                 .border_1()
                 .border_color(t.border)
                 .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                .child(Input.new(this.depositTitleInput).h_full().text_size(12).text_color(t.foreground))
+                .child(
+                  Input.new(this.depositTitleInput).h_full().text_size(12).text_color(t.foreground)
+                )
             )
             .child(
               div()
@@ -1416,7 +1900,9 @@ export default class KanbanBoard extends View {
                 .border_1()
                 .border_color(t.border)
                 .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                .child(Input.new(this.depositBodyInput).h_full().text_size(12).text_color(t.foreground))
+                .child(
+                  Input.new(this.depositBodyInput).h_full().text_size(12).text_color(t.foreground)
+                )
             )
             .child(
               btn("dep-submit", "Create Ticket", t, {
@@ -1508,7 +1994,9 @@ export default class KanbanBoard extends View {
           h_flex()
             .items_center()
             .gap(6)
-            .child(div().text_size(12).font_semibold().text_color(t.foreground).child(`Move ${disp}:`))
+            .child(
+              div().text_size(12).font_semibold().text_color(t.foreground).child(`Move ${disp}:`)
+            )
             .children(
               COLUMNS.map((col) =>
                 btn(`tri-col-${col.id}`, col.title, t, {
@@ -1561,17 +2049,23 @@ export default class KanbanBoard extends View {
 
   renderCard(ticket, colIdx, rowIdx, isSelected, t) {
     const disp = ticket.ref || `#${ticket.number}`;
+    const { cleanTitle, jiraKeys, scopes } = parseTicketTitle(ticket);
     const claim = ticket.claim || null;
     const hasActiveClaim =
       claim && (claim.state === "active" || claim.state === "review_ready");
     const overlaps = Array.isArray(ticket.overlaps) ? ticket.overlaps : [];
     const unmetDeps = Array.isArray(ticket.unmet_deps) ? ticket.unmet_deps : [];
-    const labels = Array.isArray(ticket.labels) ? ticket.labels : [];
+    const rawLabels = Array.isArray(ticket.labels) ? ticket.labels : [];
+    const visibleFacets = rawLabels
+      .filter((l) => !l.startsWith("trl:") && !l.startsWith("access:"))
+      .slice(0, 4)
+      .map((l) => parseFacetLabel(l, t));
     const checkDone = ticket.checklist_done || 0;
     const checkTotal = ticket.checklist_total || 0;
     const touchedCount =
       claim && Array.isArray(claim.touched_files) ? claim.touched_files.length : 0;
     const rt = findTicketRuntime(ticket);
+    const isDoneCol = ticket.column === "done";
 
     let agentStateColor = t.accent;
     if (rt.agent) {
@@ -1581,12 +2075,18 @@ export default class KanbanBoard extends View {
       else if (st === "done") agentStateColor = t.done || t.ansi2;
     }
 
+    const prioCol = priorityColor(ticket.priority, t);
+    const repoTag =
+      ticket.target_repo && ticket.target_repo !== ticket.repo_alias
+        ? ticket.target_repo
+        : scopes[0] || "";
+
     return v_flex()
       .id(`card-${colIdx}-${ticket.cli_ref || ticket.number}`)
       .w_full()
       .flex_none()
-      .gap(6)
-      .p(10)
+      .gap(7)
+      .p(11)
       .rounded(8)
       .cursor_pointer()
       .bg(isSelected ? t.selected : t.surface)
@@ -1610,7 +2110,7 @@ export default class KanbanBoard extends View {
         this.syncBus({ showDrawer: true }, cx);
       })
       .child(
-        // Top row: ref, priority, wave/deps, overlap/stale badges
+        // Top row: Issue Ref, Priority, Repo/Scope badge, Jira keys, and Wave/Alert badges
         h_flex()
           .w_full()
           .items_center()
@@ -1619,9 +2119,12 @@ export default class KanbanBoard extends View {
           .child(
             h_flex()
               .items_center()
-              .gap(6)
+              .gap(5)
+              .min_w(0)
+              .flex_1()
               .child(
                 div()
+                  .flex_none()
                   .text_size(11)
                   .font_semibold()
                   .text_color(isSelected ? t.accent : t.muted)
@@ -1630,34 +2133,50 @@ export default class KanbanBoard extends View {
               .when(Boolean(ticket.priority), (d) =>
                 d.child(
                   div()
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(prioCol, "18") || t.background)
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color(prioCol)
+                    .child(ticket.priority)
+                )
+              )
+              .when(Boolean(repoTag), (d) =>
+                d.child(
+                  div()
                     .px(5)
                     .py(1)
                     .rounded(4)
                     .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
                     .text_size(10)
-                    .font_semibold()
-                    .text_color(priorityColor(ticket.priority, t))
-                    .child(ticket.priority)
+                    .text_color(t.accent)
+                    .truncate()
+                    .child(repoTag)
                 )
               )
-              .when(
-                Boolean(ticket.target_repo && ticket.target_repo !== ticket.repo_alias),
-                (d) =>
-                  d.child(
-                    div()
-                      .px(5)
-                      .py(1)
-                      .rounded(4)
-                      .bg(t.background)
-                      .text_size(10)
-                      .text_color(t.accent)
-                      .child(ticket.target_repo)
-                  )
+              .when(jiraKeys.length > 0, (d) =>
+                d.child(
+                  div()
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(t.background)
+                    .text_size(9.5)
+                    .text_color(t.dim)
+                    .child(jiraKeys.slice(0, 2).join("·"))
+                )
               )
           )
           .child(
             h_flex()
               .items_center()
+              .flex_none()
               .gap(4)
               .when(unmetDeps.length > 0, (d) =>
                 d.child(
@@ -1665,7 +2184,7 @@ export default class KanbanBoard extends View {
                     .px(5)
                     .py(1)
                     .rounded(4)
-                    .bg(t.background)
+                    .bg(withAlpha(t.blocked || t.ansi1, "18") || t.background)
                     .text_size(10)
                     .text_color(t.blocked || t.ansi1)
                     .child(`deps:${unmetDeps.map((n) => "#" + n).join(",")}`)
@@ -1673,6 +2192,7 @@ export default class KanbanBoard extends View {
               )
               .when(
                 unmetDeps.length === 0 &&
+                  !isDoneCol &&
                   ((Array.isArray(ticket.depends_on) && ticket.depends_on.length > 0) ||
                     (Array.isArray(ticket.blocks) && ticket.blocks.length > 0)),
                 (d) =>
@@ -1681,10 +2201,10 @@ export default class KanbanBoard extends View {
                       .px(5)
                       .py(1)
                       .rounded(4)
-                      .bg(t.background)
+                      .bg(withAlpha(t.done || t.ansi2, "16") || t.background)
                       .text_size(10)
                       .text_color(t.done || t.ansi2)
-                      .child(`wave:${ticket.wave || 0}`)
+                      .child(`W${ticket.wave || 0}`)
                   )
               )
               .when(Boolean(ticket.stale), (d) =>
@@ -1693,8 +2213,8 @@ export default class KanbanBoard extends View {
                     .px(5)
                     .py(1)
                     .rounded(4)
-                    .bg(t.background)
-                    .text_size(10)
+                    .bg(withAlpha(t.working || t.ansi3, "20") || t.background)
+                    .text_size(9.5)
                     .font_semibold()
                     .text_color(t.working || t.ansi3)
                     .child("STALE")
@@ -1706,41 +2226,48 @@ export default class KanbanBoard extends View {
                     .px(5)
                     .py(1)
                     .rounded(4)
-                    .bg(t.background)
-                    .text_size(10)
+                    .bg(withAlpha(t.blocked || t.ansi1, "22") || t.background)
+                    .text_size(9.5)
                     .font_semibold()
                     .text_color(t.blocked || t.ansi1)
-                    .child("OVERLAP!")
+                    .child("OVERLAP")
                 )
               )
           )
       )
       .child(
-        // Title
+        // Multi-line wrapped clean human title (never truncated to 3 words!)
         div()
           .w_full()
+          .max_h(isDoneCol ? 38 : 54)
+          .overflow_hidden()
+          .whitespace_normal()
+          .line_height(1.38)
           .text_size(12)
           .font_medium()
           .text_color(t.foreground)
-          .truncate()
-          .child(String(ticket.title || ""))
+          .child(cleanTitle)
       )
-      .when(labels.length > 0, (d) =>
+      .when(visibleFacets.length > 0, (d) =>
         d.child(
           h_flex()
+            .w_full()
+            .flex_wrap()
+            .max_h(20)
             .gap(4)
             .overflow_hidden()
             .children(
-              labels.slice(0, 3).map((lbl) =>
+              visibleFacets.map((fc, i) =>
                 div()
+                  .id(`fc-${ticket.number}-${i}`)
+                  .flex_none()
                   .px(5)
                   .py(1)
                   .rounded(4)
-                  .bg(t.background)
+                  .bg(fc.bg)
                   .text_size(10)
-                  .text_color(t.dim)
-                  .truncate()
-                  .child(lbl)
+                  .text_color(fc.color)
+                  .child(fc.text)
               )
             )
         )
@@ -1749,13 +2276,14 @@ export default class KanbanBoard extends View {
         d.child(
           h_flex()
             .w_full()
+            .pt(2)
             .items_center()
             .justify_between()
-            .gap(4)
+            .gap(6)
             .child(
               h_flex()
                 .items_center()
-                .gap(6)
+                .gap(5)
                 .when(hasActiveClaim, (c) =>
                   c.child(
                     h_flex()
@@ -1763,19 +2291,32 @@ export default class KanbanBoard extends View {
                       .gap(5)
                       .px(6)
                       .py(2)
-                      .rounded(4)
+                      .rounded(5)
                       .bg(t.background)
+                      .border_1()
+                      .border_color(t.border)
                       .child(
                         div()
                           .size(6)
-                          .rounded(3)
-                          .bg(rt.active ? agentStateColor : t.dim)
+                          .rounded_full()
+                          .bg(rt.active ? agentStateColor : t.accent)
                       )
                       .child(
                         div()
-                          .text_size(10)
+                          .text_size(10.5)
                           .text_color(t.foreground)
-                          .child(`@${claim.owner}:${claim.agent_kind}`)
+                          .child(`@${claim.owner}`)
+                      )
+                      .when(Boolean(claim.agent_kind), (ag) =>
+                        ag.child(
+                          div()
+                            .px(4)
+                            .rounded(3)
+                            .bg(t.surface)
+                            .text_size(9.5)
+                            .text_color(t.accent)
+                            .child(claim.agent_kind)
+                        )
                       )
                   )
                 )
@@ -1786,18 +2327,43 @@ export default class KanbanBoard extends View {
                 .gap(6)
                 .when(checkTotal > 0, (c) =>
                   c.child(
-                    div()
-                      .text_size(10)
-                      .text_color(checkDone === checkTotal ? t.done || t.ansi2 : t.dim)
-                      .child(`[${checkDone}/${checkTotal}]`)
+                    h_flex()
+                      .items_center()
+                      .gap(4)
+                      .child(
+                        div()
+                          .w(28)
+                          .h(4)
+                          .rounded(2)
+                          .bg(t.background)
+                          .overflow_hidden()
+                          .child(
+                            div()
+                              .w(Math.round((checkDone / Math.max(1, checkTotal)) * 28))
+                              .h_full()
+                              .bg(checkDone === checkTotal ? t.done || t.ansi2 : t.accent)
+                          )
+                      )
+                      .child(
+                        div()
+                          .text_size(10)
+                          .text_color(checkDone === checkTotal ? t.done || t.ansi2 : t.muted)
+                          .child(`${checkDone}/${checkTotal}`)
+                      )
                   )
                 )
                 .when(touchedCount > 0, (c) =>
                   c.child(
-                    div()
-                      .text_size(10)
-                      .text_color(overlaps.length > 0 ? t.blocked || t.ansi1 : t.dim)
-                      .child(`${touchedCount}f`)
+                    h_flex()
+                      .items_center()
+                      .gap(3)
+                      .child(svg("mods/workspace-chrome/files.svg").size(10).text_color(t.dim))
+                      .child(
+                        div()
+                          .text_size(10)
+                          .text_color(overlaps.length > 0 ? t.blocked || t.ansi1 : t.dim)
+                          .child(`${touchedCount}`)
+                      )
                   )
                 )
             )
@@ -1805,22 +2371,24 @@ export default class KanbanBoard extends View {
       );
   }
 
-  renderColumnHeader(col, colIdx, count, t) {
+  renderColumnHeader(col, colIdx, count, colWidth, t) {
     const isFocusedCol = this.colIdx === colIdx;
     const accent = columnAccent(col.id, t);
+    const isCompact = colWidth <= EMPTY_COL_COMPACT_WIDTH + 12;
 
     return h_flex()
       .id(`col-hdr-${col.id}`)
-      .w(COL_WIDTH)
+      .w(colWidth)
       .h(34)
       .flex_none()
       .items_center()
       .justify_between()
-      .px(10)
+      .px(isCompact ? 8 : 11)
       .bg(isFocusedCol ? t.selected : t.surface)
       .border_r(1)
       .border_b(1)
       .border_color(isFocusedCol ? accent : t.border)
+      .cursor_pointer()
       .on_mouse_down("left", (e, cx) => this.startBoardDrag(e, cx))
       .on_mouse_down("middle", (e, cx) => this.startBoardDrag(e, cx))
       .on_click((_ev, cx) => {
@@ -1837,42 +2405,63 @@ export default class KanbanBoard extends View {
         h_flex()
           .items_center()
           .gap(6)
-          .child(div().size(7).rounded(4).bg(accent))
+          .min_w(0)
           .child(
             div()
-              .text_size(12)
+              .size(6)
+              .rounded_full()
+              .flex_none()
+              .bg(count > 0 || isFocusedCol ? accent : t.dim)
+          )
+          .child(
+            div()
+              .text_size(isCompact ? 11 : 12)
               .font_semibold()
-              .text_color(isFocusedCol ? t.foreground : t.muted)
-              .child(col.title)
+              .text_color(isFocusedCol ? t.foreground : count > 0 ? t.foreground : t.dim)
+              .truncate()
+              .child(isCompact ? col.short : col.title)
           )
       )
       .child(
         div()
-          .px(6)
+          .flex_none()
+          .px(5)
           .py(1)
           .rounded(4)
-          .bg(t.background)
+          .bg(count > 0 ? t.background : t.surface)
           .text_size(10)
-          .text_color(t.dim)
+          .font_medium()
+          .text_color(count > 0 ? t.muted : t.dim)
           .child(String(count))
       );
   }
 
-  renderColumnStack(col, colIdx, tickets, selectedRef, t) {
+  renderColumnStack(col, colIdx, tickets, colWidth, selectedRef, t) {
+    const isCompact = colWidth <= EMPTY_COL_COMPACT_WIDTH + 12;
     return v_flex()
       .id(`col-${col.id}`)
-      .w(COL_WIDTH)
+      .w(colWidth)
       .flex_none()
       .gap(8)
-      .p(8)
+      .p(isCompact ? 6 : 9)
       .when(tickets.length === 0, (d) =>
         d.child(
-          div()
+          v_flex()
             .w_full()
-            .p(16)
-            .text_size(11)
-            .text_color(t.dim)
-            .child("No tickets")
+            .py(18)
+            .px(6)
+            .rounded(7)
+            .border_1()
+            .border_dashed()
+            .border_color(withAlpha(t.border, "80") || t.border)
+            .items_center()
+            .justify_center()
+            .child(
+              div()
+                .text_size(10.5)
+                .text_color(t.dim)
+                .child(isCompact ? "Empty" : `No ${col.title.toLowerCase()} tickets`)
+            )
         )
       )
       .children(
@@ -1885,7 +2474,7 @@ export default class KanbanBoard extends View {
   }
 
   renderBoardCanvas(byCol, selectedRef, t) {
-    const { viewW, totalW } = this.boardViewportDims();
+    const { viewW, totalW, widths } = this.boardViewportDims();
     const showHorizBar = totalW > viewW;
     const thumbW = showHorizBar ? Math.max(36, Math.round((viewW / totalW) * viewW)) : 0;
     const maxScrollX = Math.max(1, totalW - viewW);
@@ -1899,7 +2488,6 @@ export default class KanbanBoard extends View {
       .w_full()
       .overflow_hidden()
       .child(
-        // Sticky column header strip that pans horizontally in lockstep with the board
         div()
           .id("kanban-col-headers-viewport")
           .relative()
@@ -1921,7 +2509,13 @@ export default class KanbanBoard extends View {
               .h(34)
               .children(
                 COLUMNS.map((col, idx) =>
-                  this.renderColumnHeader(col, idx, (byCol[col.id] || []).length, t)
+                  this.renderColumnHeader(
+                    col,
+                    idx,
+                    (byCol[col.id] || []).length,
+                    widths[idx],
+                    t
+                  )
                 )
               )
           )
@@ -1940,7 +2534,6 @@ export default class KanbanBoard extends View {
           )
       )
       .child(
-        // 2D Pannable columns & cards viewport
         div()
           .id("kanban-viewport")
           .relative()
@@ -1965,7 +2558,6 @@ export default class KanbanBoard extends View {
             this.panBy(dx, dy, cx);
           })
           .child(
-            // Full-height column lanes & vertical grid dividers
             h_flex()
               .id("kanban-lanes-bg")
               .absolute()
@@ -1973,10 +2565,10 @@ export default class KanbanBoard extends View {
               .top(0)
               .h_full()
               .children(
-                COLUMNS.map((col) =>
+                COLUMNS.map((col, idx) =>
                   div()
                     .id(`lane-bg-${col.id}`)
-                    .w(COL_WIDTH)
+                    .w(widths[idx])
                     .h_full()
                     .flex_none()
                     .border_r(1)
@@ -1985,7 +2577,6 @@ export default class KanbanBoard extends View {
               )
           )
           .child(
-            // 2D Translated columns & cards track
             h_flex()
               .id("kanban-columns-track")
               .absolute()
@@ -1994,8 +2585,419 @@ export default class KanbanBoard extends View {
               .items_start()
               .children(
                 COLUMNS.map((col, idx) =>
-                  this.renderColumnStack(col, idx, byCol[col.id] || [], selectedRef, t)
+                  this.renderColumnStack(
+                    col,
+                    idx,
+                    byCol[col.id] || [],
+                    widths[idx],
+                    selectedRef,
+                    t
+                  )
                 )
+              )
+          )
+      );
+  }
+
+  renderWhatsNewView(t) {
+    const wn = (this.board && this.board.whats_new) || {};
+    const saved = wn.saved_summary || null;
+    const contributors = Array.isArray(wn.contributors) ? wn.contributors : [];
+    const recentLanded = Array.isArray(wn.recent_landed) ? wn.recent_landed : [];
+    const byRepo = Array.isArray(wn.by_repo) ? wn.by_repo : [];
+    const defaultRepo = (this.board && this.board.default_repo) || "unimotion";
+    const mdRaw = (saved && saved.markdown) || wn.auto_markdown || "No landed tickets recorded yet.";
+    const mdLinked = linkifyKanbanRefs(mdRaw, defaultRepo);
+    const panelW = this.size?.width ?? 840;
+    const isSplit = panelW >= 660;
+
+    return v_flex()
+      .id("whats-new-root")
+      .flex_1()
+      .min_h(0)
+      .w_full()
+      .bg(t.background)
+      .overflow_hidden()
+      .child(
+        // Top Briefing Action Bar
+        h_flex()
+          .w_full()
+          .h(38)
+          .flex_none()
+          .items_center()
+          .justify_between()
+          .px(14)
+          .bg(t.surface)
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .items_center()
+              .gap(8)
+              .child(svg("mods/herdr-kanban/sparkles.svg").size(13).text_color(t.done || t.ansi2))
+              .child(
+                div()
+                  .text_size(12.5)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child("What's New — Landed Work & Colleague Digest")
+              )
+              .when(Boolean(saved && saved.author), (el) =>
+                el.child(
+                  div()
+                    .px(6)
+                    .py(1)
+                    .rounded(4)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(10)
+                    .text_color(t.muted)
+                    .child(
+                      `synthesized by @${saved.author}${saved.agent_kind ? ":" + saved.agent_kind : ""}`
+                    )
+                )
+              )
+          )
+          .child(
+            h_flex()
+              .items_center()
+              .gap(6)
+              .child(
+                btn("wn-synthesize", "Synthesize Briefing (s)", t, {
+                  primary: true,
+                  small: true,
+                  iconPath: "mods/herdr-kanban/refresh.svg",
+                  onClick: (_ev, cx) => this.synthesizeWhatsNew(cx),
+                })
+              )
+              .child(
+                btn("wn-dispatch-agent", `Ask ${this.agentKind || "agent"} to Summarize`, t, {
+                  small: true,
+                  iconPath: "mods/workspace-chrome/terminal.svg",
+                  onClick: (_ev, cx) => this.dispatchWhatsNewAgent(cx),
+                })
+              )
+              .child(
+                btn("wn-back-board", "Back to Board (b)", t, {
+                  small: true,
+                  onClick: (_ev, cx) => this.syncBus({ viewMode: "board" }, cx),
+                })
+              )
+          )
+      )
+      .child(
+        // Split Body: Left = Markdown Executive Briefing, Right = Colleague Cards & Landed Feed
+        (isSplit ? h_flex() : v_flex())
+          .flex_1()
+          .min_h(0)
+          .w_full()
+          .overflow_hidden()
+          .child(
+            // Left: Rich Markdown Executive Briefing
+            v_flex()
+              .id("whats-new-md-pane")
+              .flex_1()
+              .min_w(0)
+              .min_h(0)
+              .h_full()
+              .p(14)
+              .gap(10)
+              .overflow_y_scrollbar()
+              .when(isSplit, (el) => el.border_r(1).border_color(t.border))
+              .child(
+                v_flex()
+                  .w_full()
+                  .flex_none()
+                  .p(14)
+                  .rounded(8)
+                  .bg(t.surface)
+                  .border_1()
+                  .border_color(t.border)
+                  .child(
+                    TextView.markdown("whats-new-briefing-md", mdLinked)
+                      .selectable(true)
+                      .on_link_click((url, cx) => this.handleLinkClick(url, cx))
+                  )
+              )
+          )
+          .child(
+            // Right: Colleagues & Recently Landed Cards
+            v_flex()
+              .id("whats-new-feed-pane")
+              .w(isSplit ? Math.min(390, Math.round(panelW * 0.44)) : panelW)
+              .flex_none()
+              .min_h(0)
+              .h_full()
+              .p(14)
+              .gap(12)
+              .overflow_y_scrollbar()
+              .when(contributors.length > 0, (el) =>
+                el.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(6)
+                    .child(
+                      div()
+                        .text_size(11.5)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child("Colleagues & Coding Agents")
+                    )
+                    .children(
+                      contributors.map((c, idx) =>
+                        v_flex()
+                          .id(`wn-contrib-${idx}`)
+                          .w_full()
+                          .flex_none()
+                          .gap(5)
+                          .p(10)
+                          .rounded(7)
+                          .bg(t.surface)
+                          .border_1()
+                          .border_color(t.border)
+                          .child(
+                            h_flex()
+                              .w_full()
+                              .items_center()
+                              .justify_between()
+                              .child(
+                                h_flex()
+                                  .items_center()
+                                  .gap(6)
+                                  .child(
+                                    div()
+                                      .size(7)
+                                      .rounded_full()
+                                      .bg(c.active_count > 0 ? t.working || t.ansi3 : t.done || t.ansi2)
+                                  )
+                                  .child(
+                                    div()
+                                      .text_size(12)
+                                      .font_semibold()
+                                      .text_color(t.foreground)
+                                      .child(`@${c.owner}`)
+                                  )
+                                  .children(
+                                    (c.agents || []).map((ag) =>
+                                      div()
+                                        .px(5)
+                                        .py(1)
+                                        .rounded(4)
+                                        .bg(t.background)
+                                        .text_size(10)
+                                        .text_color(t.accent)
+                                        .child(ag)
+                                    )
+                                  )
+                              )
+                              .child(
+                                h_flex()
+                                  .items_center()
+                                  .gap(5)
+                                  .child(
+                                    div()
+                                      .px(6)
+                                      .py(1)
+                                      .rounded(4)
+                                      .bg(withAlpha(t.done || t.ansi2, "18") || t.background)
+                                      .text_size(10)
+                                      .font_semibold()
+                                      .text_color(t.done || t.ansi2)
+                                      .child(`${c.landed_count} landed`)
+                                  )
+                                  .when(c.active_count > 0, (a) =>
+                                    a.child(
+                                      div()
+                                        .px(6)
+                                        .py(1)
+                                        .rounded(4)
+                                        .bg(withAlpha(t.working || t.ansi3, "18") || t.background)
+                                        .text_size(10)
+                                        .font_semibold()
+                                        .text_color(t.working || t.ansi3)
+                                        .child(`${c.active_count} active`)
+                                    )
+                                  )
+                              )
+                          )
+                          .when(Array.isArray(c.repos) && c.repos.length > 0, (r) =>
+                            r.child(
+                              h_flex()
+                                .w_full()
+                                .flex_wrap()
+                                .gap(4)
+                                .children(
+                                  c.repos.slice(0, 6).map((rp) =>
+                                    div()
+                                      .px(5)
+                                      .py(1)
+                                      .rounded(4)
+                                      .bg(t.background)
+                                      .text_size(9.5)
+                                      .text_color(t.muted)
+                                      .child(rp)
+                                  )
+                                )
+                            )
+                          )
+                      )
+                    )
+                )
+              )
+              .when(byRepo.length > 0, (el) =>
+                el.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(6)
+                    .child(
+                      div()
+                        .text_size(11.5)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child("Landed by Repository")
+                    )
+                    .child(
+                      h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .gap(5)
+                        .children(
+                          byRepo.map((grp) =>
+                            h_flex()
+                              .id(`wn-repo-pill-${grp.repo}`)
+                              .items_center()
+                              .gap(4)
+                              .px(7)
+                              .py(3)
+                              .rounded(5)
+                              .cursor_pointer()
+                              .bg(t.surface)
+                              .border_1()
+                              .border_color(t.border)
+                              .hover((s) => s.bg(t.hover))
+                              .on_click((_ev, cx) => {
+                                this.syncBus({ repoFilter: grp.repo, viewMode: "board" }, cx);
+                              })
+                              .child(div().text_size(10.5).text_color(t.foreground).child(grp.repo))
+                              .child(
+                                div()
+                                  .px(4)
+                                  .rounded(3)
+                                  .bg(t.background)
+                                  .text_size(9.5)
+                                  .text_color(t.done || t.ansi2)
+                                  .child(String(grp.landed_count))
+                              )
+                          )
+                        )
+                    )
+                )
+              )
+              .child(
+                v_flex()
+                  .w_full()
+                  .flex_none()
+                  .gap(6)
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .font_semibold()
+                      .text_color(t.muted)
+                      .child(`Recently Landed Tickets (${recentLanded.length})`)
+                  )
+                  .children(
+                    recentLanded.slice(0, 20).map((item, idx) =>
+                      v_flex()
+                        .id(`wn-landed-${idx}`)
+                        .w_full()
+                        .flex_none()
+                        .gap(4)
+                        .p(9)
+                        .rounded(7)
+                        .cursor_pointer()
+                        .bg(t.surface)
+                        .border_1()
+                        .border_color(t.border)
+                        .hover((s) => s.bg(t.hover))
+                        .on_click((_ev, cx) => this.selectTicketByRef(item.cli_ref, cx))
+                        .child(
+                          h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap(6)
+                            .child(
+                              h_flex()
+                                .items_center()
+                                .gap(5)
+                                .child(
+                                  div()
+                                    .text_size(11)
+                                    .font_semibold()
+                                    .text_color(t.done || t.ansi2)
+                                    .child(item.ref)
+                                )
+                                .when(Boolean(item.priority), (p) =>
+                                  p.child(
+                                    div()
+                                      .px(4)
+                                      .rounded(3)
+                                      .bg(t.background)
+                                      .text_size(9.5)
+                                      .font_semibold()
+                                      .text_color(priorityColor(item.priority, t))
+                                      .child(item.priority)
+                                  )
+                                )
+                                .when(Boolean(item.target_repo), (rp) =>
+                                  rp.child(
+                                    div()
+                                      .px(5)
+                                      .rounded(3)
+                                      .bg(t.background)
+                                      .text_size(9.5)
+                                      .text_color(t.accent)
+                                      .child(item.target_repo)
+                                  )
+                                )
+                            )
+                            .child(
+                              div()
+                                .text_size(10)
+                                .text_color(t.dim)
+                                .child(
+                                  `@${item.owner}${item.agent_kind ? ":" + item.agent_kind : ""}`
+                                )
+                            )
+                        )
+                        .child(
+                          div()
+                            .w_full()
+                            .whitespace_normal()
+                            .line_height(1.35)
+                            .text_size(11.5)
+                            .font_medium()
+                            .text_color(t.foreground)
+                            .child(item.clean_title || item.title)
+                        )
+                        .when(Boolean(item.summary_note), (sn) =>
+                          sn.child(
+                            div()
+                              .w_full()
+                              .max_h(34)
+                              .overflow_hidden()
+                              .whitespace_normal()
+                              .line_height(1.35)
+                              .text_size(10.5)
+                              .text_color(t.muted)
+                              .child(item.summary_note)
+                          )
+                        )
+                    )
+                  )
               )
           )
       );
@@ -2004,10 +3006,14 @@ export default class KanbanBoard extends View {
   renderInspector(ticket, t) {
     if (!this.showDrawer) return null;
 
+    const drawerH = this.drawerTall ? 410 : 268;
+    const panelW = this.size?.width ?? 840;
+    const isSplit = panelW >= 620;
+
     if (!ticket) {
       return v_flex()
         .w_full()
-        .h(140)
+        .h(120)
         .flex_none()
         .p(16)
         .bg(t.surface)
@@ -2019,12 +3025,15 @@ export default class KanbanBoard extends View {
           div()
             .text_size(12)
             .text_color(t.dim)
-            .child("Select a ticket card to inspect details & actions.")
+            .child("Select a ticket card to inspect its Markdown description, checklist & actions.")
         );
     }
 
     const disp = ticket.ref || `#${ticket.number}`;
     const cliRef = ticket.cli_ref || String(ticket.number);
+    const { cleanTitle, jiraKeys } = parseTicketTitle(ticket);
+    const colLabel = COLUMN_TITLE_BY_ID[ticket.column] || ticket.column;
+    const colColor = columnAccent(ticket.column, t);
     const claim = ticket.claim || null;
     const lc = ticket.local_claim || null;
     const hasClaim = claim && (claim.state === "active" || claim.state === "review_ready");
@@ -2042,82 +3051,151 @@ export default class KanbanBoard extends View {
         this.board.settings.supported_agents) ||
       DEFAULT_AGENTS;
 
+    const defaultRepo = (this.board && this.board.default_repo) || "unimotion";
+    const cleanBody = stripKanbanMeta(ticket.body) || "*No description provided.*";
+    const mdBody = linkifyKanbanRefs(cleanBody, defaultRepo);
+    const mdClaimNote =
+      claim && claim.note ? linkifyKanbanRefs(String(claim.note), defaultRepo) : "";
+
     return v_flex()
       .id("ticket-inspector")
       .w_full()
-      .h(280)
+      .h(drawerH)
       .min_h(0)
       .flex_none()
       .bg(t.surface)
       .border_t(1)
       .border_color(t.border)
       .child(
-        // Inspector top header
+        // Compact 2-Row Inspector Header
         v_flex()
           .w_full()
           .flex_none()
-          .gap(8)
-          .p(12)
+          .gap(6)
+          .px(12)
+          .py(8)
+          .bg(t.chrome || t.surface)
           .border_b(1)
           .border_color(t.border)
           .child(
+            // Row 1: Badges + Clean Title + Expand / Close Controls
             h_flex()
               .w_full()
               .items_center()
               .justify_between()
+              .gap(8)
               .child(
                 h_flex()
                   .items_center()
                   .gap(6)
-                  .child(div().text_size(12).font_semibold().text_color(t.accent).child(disp))
+                  .min_w(0)
+                  .flex_1()
                   .child(
-                    div()
+                    div().flex_none().text_size(12).font_semibold().text_color(t.accent).child(disp)
+                  )
+                  .child(
+                    h_flex()
+                      .flex_none()
+                      .items_center()
+                      .gap(4)
                       .px(6)
-                      .py(2)
+                      .py(1)
                       .rounded(4)
-                      .bg(t.background)
-                      .text_size(11)
-                      .font_semibold()
-                      .text_color(columnAccent(ticket.column, t))
-                      .child(ticket.column)
+                      .bg(withAlpha(colColor, "18") || t.background)
+                      .child(div().size(5).rounded_full().bg(colColor))
+                      .child(
+                        div()
+                          .text_size(10.5)
+                          .font_semibold()
+                          .text_color(colColor)
+                          .child(colLabel)
+                      )
                   )
                   .when(Boolean(ticket.priority), (d) =>
                     d.child(
                       div()
-                        .px(6)
-                        .py(2)
+                        .flex_none()
+                        .px(5)
+                        .py(1)
                         .rounded(4)
-                        .bg(t.background)
-                        .text_size(11)
+                        .bg(withAlpha(priorityColor(ticket.priority, t), "18") || t.background)
+                        .text_size(10.5)
                         .font_semibold()
                         .text_color(priorityColor(ticket.priority, t))
                         .child(ticket.priority)
                     )
                   )
+                  .when(Boolean(ticket.target_repo), (d) =>
+                    d.child(
+                      div()
+                        .flex_none()
+                        .px(6)
+                        .py(1)
+                        .rounded(4)
+                        .bg(t.background)
+                        .border_1()
+                        .border_color(t.border)
+                        .text_size(10.5)
+                        .text_color(t.accent)
+                        .child(ticket.target_repo)
+                    )
+                  )
+                  .when(jiraKeys.length > 0, (d) =>
+                    d.child(
+                      div()
+                        .flex_none()
+                        .px(5)
+                        .py(1)
+                        .rounded(4)
+                        .bg(t.background)
+                        .text_size(10)
+                        .text_color(t.muted)
+                        .child(jiraKeys.join(" · "))
+                    )
+                  )
+                  .child(
+                    div()
+                      .flex_1()
+                      .min_w(0)
+                      .text_size(12.5)
+                      .font_semibold()
+                      .text_color(t.foreground)
+                      .truncate()
+                      .child(cleanTitle)
+                  )
               )
               .child(
-                btn("insp-close", "×", t, {
-                  small: true,
-                  onClick: (_ev, cx) => {
-                    this.syncBus({ showDrawer: false }, cx);
-                  },
-                })
+                h_flex()
+                  .flex_none()
+                  .items_center()
+                  .gap(4)
+                  .child(
+                    btn("insp-tall-toggle", this.drawerTall ? "Compact" : "Expand", t, {
+                      small: true,
+                      selected: this.drawerTall,
+                      onClick: (_ev, cx) => {
+                        this.syncBus({ drawerTall: !this.drawerTall }, cx);
+                      },
+                    })
+                  )
+                  .child(
+                    btn("insp-close", "", t, {
+                      small: true,
+                      iconPath: "mods/workspace-chrome/x.svg",
+                      onClick: (_ev, cx) => {
+                        this.syncBus({ showDrawer: false }, cx);
+                      },
+                    })
+                  )
               )
           )
           .child(
-            div()
-              .w_full()
-              .text_size(13)
-              .font_semibold()
-              .text_color(t.foreground)
-              .child(String(ticket.title || ""))
-          )
-          .child(
-            // Primary action buttons + compact agent harness selector for ticket dispatch
+            // Row 2: Unified Single-Row Workflow Action Bar
             h_flex()
+              .w_full()
               .items_center()
               .justify_between()
-              .gap(6)
+              .gap(8)
               .child(
                 h_flex()
                   .items_center()
@@ -2134,9 +3212,37 @@ export default class KanbanBoard extends View {
                       {
                         primary: true,
                         small: true,
-                        onClick: (_ev, cx) => this.claimAndDispatch(ticket, Boolean(ticket.stale), cx),
+                        iconPath: "mods/workspace-chrome/terminal.svg",
+                        onClick: (_ev, cx) =>
+                          this.claimAndDispatch(ticket, Boolean(ticket.stale), cx),
                       }
                     ),
+                    h_flex()
+                      .items_center()
+                      .gap(2)
+                      .p(2)
+                      .rounded(5)
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(t.border)
+                      .children(
+                        agentChoices.slice(0, 4).map((ag) => {
+                          const active = this.agentKind === ag;
+                          return div()
+                            .id(`insp-agent-${ag}`)
+                            .px(5)
+                            .py(1)
+                            .rounded(4)
+                            .cursor_pointer()
+                            .bg(active ? t.selected : t.background)
+                            .text_size(10)
+                            .text_color(active ? t.accent : t.dim)
+                            .child(ag)
+                            .on_click((_ev, cx) => {
+                              this.syncBus({ agentKind: ag }, cx);
+                            });
+                        })
+                      ),
                     ...(rt.active || (lc && lc.worktree_path)
                       ? [
                           btn("act-focus", rt.active ? "Focus (f)" : "Worktree (f)", t, {
@@ -2147,7 +3253,7 @@ export default class KanbanBoard extends View {
                       : []),
                     ...(ticket.column === "triage"
                       ? [
-                          btn("act-promote", "-> Ready (t)", t, {
+                          btn("act-promote", "Promote to Ready (t)", t, {
                             small: true,
                             onClick: (_ev, cx) =>
                               this.runTicketAction(
@@ -2160,11 +3266,21 @@ export default class KanbanBoard extends View {
                       : []),
                     ...(ticket.column === "review" || ticket.column === "in_progress"
                       ? [
-                          btn("act-approve", ticket.column === "review" ? "Approve (a)" : "Land (a)", t, {
-                            small: true,
-                            onClick: (_ev, cx) =>
-                              this.runTicketAction(`Landing ${disp}`, ["done", cliRef, "--approve"], cx),
-                          }),
+                          btn(
+                            "act-approve",
+                            ticket.column === "review" ? "Approve (a)" : "Land (a)",
+                            t,
+                            {
+                              small: true,
+                              iconPath: "mods/workspace-chrome/check.svg",
+                              onClick: (_ev, cx) =>
+                                this.runTicketAction(
+                                  `Landing ${disp}`,
+                                  ["done", cliRef, "--approve"],
+                                  cx
+                                ),
+                            }
+                          ),
                         ]
                       : []),
                   ])
@@ -2172,294 +3288,507 @@ export default class KanbanBoard extends View {
               .child(
                 h_flex()
                   .items_center()
-                  .gap(2)
-                  .px(3)
-                  .py(2)
-                  .rounded(5)
-                  .bg(t.background)
-                  .border_1()
-                  .border_color(t.border)
-                  .children(
-                    agentChoices.slice(0, 4).map((ag) => {
-                      const active = this.agentKind === ag;
-                      return div()
-                        .id(`insp-agent-${ag}`)
-                        .px(5)
-                        .py(1)
-                        .rounded(4)
-                        .cursor_pointer()
-                        .bg(active ? t.selected : t.background)
-                        .text_size(10)
-                        .text_color(active ? t.accent : t.dim)
-                        .child(ag)
-                        .on_click((_ev, cx) => {
-                          this.syncBus({ agentKind: ag }, cx);
-                        });
-                    })
-                  )
+                  .gap(6)
+                  .children([
+                    btn("act-triage", "Move / Priority", t, {
+                      small: true,
+                      selected: this.modalMode === "triage",
+                      onClick: (_ev, cx) => {
+                        this.modalMode = this.modalMode === "triage" ? null : "triage";
+                        cx.notify();
+                      },
+                    }),
+                    btn("act-ask", hasClaim ? "Ask Agent (c)" : "Comment (c)", t, {
+                      small: true,
+                      selected: this.modalMode === "ask",
+                      onClick: (_ev, cx) => {
+                        this.modalMode = this.modalMode === "ask" ? null : "ask";
+                        if (this.modalMode === "ask") this.askInput.focus();
+                        cx.notify();
+                      },
+                    }),
+                    ...(hasClaim
+                      ? [
+                          btn("act-release", "Release", t, {
+                            dangerOutline: true,
+                            small: true,
+                            onClick: (_ev, cx) =>
+                              this.runTicketAction(`Released ${disp}`, ["release", cliRef], cx),
+                          }),
+                        ]
+                      : []),
+                  ])
               )
-          )
-          .child(
-            h_flex()
-              .gap(6)
-              .children([
-                btn("act-triage", "Move / Triage", t, {
-                  small: true,
-                  selected: this.modalMode === "triage",
-                  onClick: (_ev, cx) => {
-                    this.modalMode = this.modalMode === "triage" ? null : "triage";
-                    cx.notify();
-                  },
-                }),
-                btn("act-ask", hasClaim ? "Ask Agent (c)" : "Comment (c)", t, {
-                  small: true,
-                  selected: this.modalMode === "ask",
-                  onClick: (_ev, cx) => {
-                    this.modalMode = this.modalMode === "ask" ? null : "ask";
-                    if (this.modalMode === "ask") this.askInput.focus();
-                    cx.notify();
-                  },
-                }),
-                ...(hasClaim
-                  ? [
-                      btn("act-release", "Release", t, {
-                        danger: true,
-                        small: true,
-                        onClick: (_ev, cx) =>
-                          this.runTicketAction(`Released ${disp}`, ["release", cliRef], cx),
-                      }),
-                    ]
-                  : []),
-              ])
           )
       )
       .child(
-        // Scrollable detail body
-        v_flex()
-          .id("inspector-scroll")
+        // Split 2-Column Inspector Body (or stacked on narrow)
+        (isSplit ? h_flex() : v_flex())
           .flex_1()
           .min_h(0)
           .w_full()
-          .gap(10)
-          .p(12)
-          .overflow_y_scrollbar()
-          // Overlap warning box
-          .when(overlaps.length > 0, (d) =>
-            d.child(
-              v_flex()
-                .w_full()
-                .flex_none()
-                .gap(4)
-                .p(8)
-                .rounded(6)
-                .bg(t.background)
-                .border_1()
-                .border_color(t.blocked || t.ansi1)
-                .child(
-                  div()
-                    .text_size(11)
-                    .font_semibold()
-                    .text_color(t.blocked || t.ansi1)
-                    .child("⚠ Touched-File Overlap Detected")
-                )
-                .children(
-                  overlaps.map((ov) =>
-                    div()
-                      .text_size(11)
-                      .text_color(t.foreground)
-                      .child(
-                        `#${ov.other_issue} (@${ov.other_owner}, ${ov.other_agent}): ${(ov.files || []).join(", ")}`
+          .overflow_hidden()
+          .child(
+            // Left Column: Claim Status, Checklist, Dependencies, Overlaps & Touched Files
+            v_flex()
+              .id("inspector-left-scroll")
+              .w(isSplit ? Math.min(380, Math.round(panelW * 0.44)) : panelW)
+              .flex_none()
+              .min_h(0)
+              .h_full()
+              .gap(8)
+              .p(11)
+              .overflow_y_scrollbar()
+              .when(isSplit, (el) => el.border_r(1).border_color(t.border))
+              .when(overlaps.length > 0, (d) =>
+                d.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(4)
+                    .p(9)
+                    .rounded(7)
+                    .bg(withAlpha(t.blocked || t.ansi1, "14") || t.background)
+                    .border_1()
+                    .border_color(t.blocked || t.ansi1)
+                    .child(
+                      div()
+                        .text_size(11)
+                        .font_semibold()
+                        .text_color(t.blocked || t.ansi1)
+                        .child("Touched-File Overlap Detected")
+                    )
+                    .children(
+                      overlaps.map((ov) =>
+                        div()
+                          .text_size(11)
+                          .whitespace_normal()
+                          .text_color(t.foreground)
+                          .child(
+                            `#${ov.other_issue} (@${ov.other_owner}, ${ov.other_agent}): ${(
+                              ov.files || []
+                            ).join(", ")}`
+                          )
                       )
-                  )
+                    )
                 )
-            )
-          )
-          // Active claim info
-          .when(Boolean(hasClaim), (d) =>
-            d.child(
-              v_flex()
-                .w_full()
-                .flex_none()
-                .gap(4)
-                .p(8)
-                .rounded(6)
-                .bg(t.background)
-                .border_1()
-                .border_color(ticket.stale ? t.working || t.ansi3 : t.border)
-                .child(
-                  h_flex()
-                    .items_center()
-                    .justify_between()
+              )
+              .when(Boolean(hasClaim), (d) =>
+                d.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(6)
+                    .p(9)
+                    .rounded(7)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(ticket.stale ? t.working || t.ansi3 : t.border)
+                    .child(
+                      h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                          h_flex()
+                            .items_center()
+                            .gap(6)
+                            .child(
+                              div()
+                                .size(7)
+                                .rounded_full()
+                                .bg(rt.active ? t.working || t.ansi3 : t.accent)
+                            )
+                            .child(
+                              div()
+                                .text_size(11.5)
+                                .font_semibold()
+                                .text_color(t.foreground)
+                                .child(`Claimed by @${claim.owner} (${claim.agent_kind})`)
+                            )
+                        )
+                        .child(
+                          div()
+                            .px(5)
+                            .py(1)
+                            .rounded(4)
+                            .bg(t.surface)
+                            .text_size(9.5)
+                            .font_semibold()
+                            .text_color(ticket.stale ? t.working || t.ansi3 : t.done || t.ansi2)
+                            .child(ticket.stale ? "STALE LEASE" : String(claim.state).toUpperCase())
+                        )
+                    )
+                    .when(Boolean(mdClaimNote), (c) =>
+                      c.child(
+                        div()
+                          .w_full()
+                          .p(7)
+                          .rounded(5)
+                          .bg(t.surface)
+                          .child(
+                            TextView.markdown(`claim-note-md-${ticket.number}`, mdClaimNote)
+                              .selectable(true)
+                              .on_link_click((url, cx) => this.handleLinkClick(url, cx))
+                          )
+                      )
+                    )
+                    .when(Boolean(lc && lc.worktree_path), (c) =>
+                      c.child(
+                        h_flex()
+                          .items_center()
+                          .gap(5)
+                          .child(svg("mods/workspace-chrome/folder.svg").size(10).text_color(t.dim))
+                          .child(
+                            div()
+                              .flex_1()
+                              .min_w(0)
+                              .text_size(10)
+                              .text_color(t.dim)
+                              .truncate()
+                              .child(lc.worktree_path)
+                          )
+                      )
+                    )
+                )
+              )
+              .when(checklist.length > 0, (d) =>
+                d.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(6)
+                    .p(9)
+                    .rounded(7)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .child(
+                      h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                          div()
+                            .text_size(11)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(
+                              `Agent Checklist (${ticket.checklist_done || 0}/${
+                                ticket.checklist_total || checklist.length
+                              })`
+                            )
+                        )
+                        .child(
+                          div()
+                            .w(48)
+                            .h(5)
+                            .rounded(3)
+                            .bg(t.surface)
+                            .overflow_hidden()
+                            .child(
+                              div()
+                                .w(
+                                  Math.round(
+                                    ((ticket.checklist_done || 0) /
+                                      Math.max(1, ticket.checklist_total || checklist.length)) *
+                                      48
+                                  )
+                                )
+                                .h_full()
+                                .bg(
+                                  (ticket.checklist_done || 0) ===
+                                    (ticket.checklist_total || checklist.length)
+                                    ? t.done || t.ansi2
+                                    : t.accent
+                                )
+                            )
+                        )
+                    )
+                    .children(
+                      checklist.map((item, cIdx) => {
+                        const rawItem = String(item).trim();
+                        const done = rawItem.toLowerCase().startsWith("[x]");
+                        const cleanText = rawItem.replace(/^\[[ xX]\]\s*/, "");
+                        return h_flex()
+                          .id(`chk-${ticket.number}-${cIdx}`)
+                          .w_full()
+                          .items_start()
+                          .gap(6)
+                          .child(
+                            div()
+                              .pt(2)
+                              .flex_none()
+                              .child(
+                                svg(
+                                  done
+                                    ? "mods/workspace-chrome/circle-check.svg"
+                                    : "mods/workspace-chrome/square.svg"
+                                )
+                                  .size(11)
+                                  .text_color(done ? t.done || t.ansi2 : t.dim)
+                              )
+                          )
+                          .child(
+                            div()
+                              .flex_1()
+                              .min_w(0)
+                              .whitespace_normal()
+                              .line_height(1.35)
+                              .text_size(11)
+                              .text_color(done ? t.muted : t.foreground)
+                              .child(cleanText)
+                          );
+                      })
+                    )
+                )
+              )
+              .when(deps.length > 0 || blocks.length > 0, (d) =>
+                d.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(5)
+                    .p(9)
+                    .rounded(7)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
                     .child(
                       div()
                         .text_size(11)
                         .font_semibold()
                         .text_color(t.foreground)
-                        .child(`Claimed by @${claim.owner} (${claim.agent_kind})`)
+                        .child(`Dependency Graph (Wave ${ticket.wave || 0})`)
                     )
+                    .when(deps.length > 0, (c) =>
+                      c.child(
+                        h_flex()
+                          .w_full()
+                          .flex_wrap()
+                          .items_center()
+                          .gap(4)
+                          .child(div().text_size(10.5).text_color(t.muted).child("Depends on:"))
+                          .children(
+                            deps.map((n) => {
+                              const isUnmet = unmet.has(n);
+                              return div()
+                                .id(`dep-link-${n}`)
+                                .px(5)
+                                .py(1)
+                                .rounded(4)
+                                .cursor_pointer()
+                                .bg(t.surface)
+                                .border_1()
+                                .border_color(isUnmet ? t.blocked || t.ansi1 : t.border)
+                                .text_size(10)
+                                .text_color(isUnmet ? t.blocked || t.ansi1 : t.done || t.ansi2)
+                                .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
+                                .child(`#${n}${isUnmet ? " (open)" : " ✓"}`);
+                            })
+                          )
+                      )
+                    )
+                    .when(blocks.length > 0, (c) =>
+                      c.child(
+                        h_flex()
+                          .w_full()
+                          .flex_wrap()
+                          .items_center()
+                          .gap(4)
+                          .child(div().text_size(10.5).text_color(t.muted).child("Blocks:"))
+                          .children(
+                            blocks.map((n) =>
+                              div()
+                                .id(`blk-link-${n}`)
+                                .px(5)
+                                .py(1)
+                                .rounded(4)
+                                .cursor_pointer()
+                                .bg(t.surface)
+                                .border_1()
+                                .border_color(t.border)
+                                .text_size(10)
+                                .text_color(t.accent)
+                                .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
+                                .child(`#${n}`)
+                            )
+                          )
+                      )
+                    )
+                )
+              )
+              .when(touched.length > 0, (d) =>
+                d.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(4)
+                    .p(9)
+                    .rounded(7)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
                     .child(
                       div()
-                        .text_size(10)
-                        .text_color(ticket.stale ? t.working || t.ansi3 : t.dim)
-                        .child(ticket.stale ? "STALE LEASE" : claim.state)
+                        .text_size(11)
+                        .font_semibold()
+                        .text_color(t.foreground)
+                        .child(`Touched Files (${touched.length})`)
                     )
-                )
-                .when(Boolean(claim.note), (c) =>
-                  c.child(div().text_size(11).text_color(t.accent).child(`Note: ${claim.note}`))
-                )
-                .when(Boolean(lc && lc.worktree_path), (c) =>
-                  c.child(
-                    div()
-                      .text_size(10)
-                      .text_color(t.dim)
-                      .truncate()
-                      .child(`wt: ${lc.worktree_path}`)
-                  )
-                )
-            )
-          )
-          // Dependencies & Wave
-          .when(deps.length > 0 || blocks.length > 0, (d) =>
-            d.child(
-              v_flex()
-                .w_full()
-                .flex_none()
-                .gap(4)
-                .p(8)
-                .rounded(6)
-                .bg(t.background)
-                .border_1()
-                .border_color(t.border)
-                .child(
-                  div()
-                    .text_size(11)
-                    .font_semibold()
-                    .text_color(t.foreground)
-                    .child(`Dependency Graph (Wave ${ticket.wave || 0})`)
-                )
-                .when(deps.length > 0, (c) =>
-                  c.child(
-                    div()
-                      .text_size(11)
-                      .text_color(unmet.size > 0 ? t.blocked || t.ansi1 : t.done || t.ansi2)
-                      .child(
-                        "Depends on: " +
-                          deps.map((n) => `#${n}${unmet.has(n) ? " (open)" : " (done)"}`).join(", ")
+                    .children(
+                      touched.slice(0, 12).map((fp) =>
+                        div().text_size(10.5).text_color(t.muted).truncate().child(fp)
                       )
-                  )
-                )
-                .when(blocks.length > 0, (c) =>
-                  c.child(
-                    div()
-                      .text_size(11)
-                      .text_color(t.dim)
-                      .child("Blocks: " + blocks.map((n) => `#${n}`).join(", "))
-                  )
-                )
-            )
-          )
-          // Checklist
-          .when(checklist.length > 0, (d) =>
-            d.child(
-              v_flex()
-                .w_full()
-                .flex_none()
-                .gap(4)
-                .p(8)
-                .rounded(6)
-                .bg(t.background)
-                .border_1()
-                .border_color(t.border)
-                .child(
-                  div()
-                    .text_size(11)
-                    .font_semibold()
-                    .text_color(t.foreground)
-                    .child(
-                      `Agent Checklist (${ticket.checklist_done || 0}/${ticket.checklist_total || checklist.length})`
                     )
                 )
-                .children(
-                  checklist.map((item) => {
-                    const done = String(item).trim().toLowerCase().startsWith("[x]");
-                    return div()
-                      .text_size(11)
-                      .text_color(done ? t.done || t.ansi2 : t.foreground)
-                      .child(item);
-                  })
+              )
+              .when(!hasClaim && checklist.length === 0 && deps.length === 0, (d) =>
+                d.child(
+                  v_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap(5)
+                    .p(9)
+                    .rounded(7)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .child(
+                      div()
+                        .text_size(11)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child("Ticket Metadata")
+                    )
+                    .when(Boolean(ticket.milestone), (m) =>
+                      m.child(
+                        div()
+                          .text_size(11)
+                          .text_color(t.foreground)
+                          .child(`Milestone: ${ticket.milestone}`)
+                      )
+                    )
+                    .when(Array.isArray(ticket.labels) && ticket.labels.length > 0, (l) =>
+                      l.child(
+                        h_flex()
+                          .w_full()
+                          .flex_wrap()
+                          .gap(4)
+                          .children(
+                            ticket.labels.map((lbl, idx) => {
+                              const fc = parseFacetLabel(lbl, t);
+                              return div()
+                                .id(`meta-lbl-${idx}`)
+                                .px(5)
+                                .py(1)
+                                .rounded(4)
+                                .bg(fc.bg)
+                                .text_size(10)
+                                .text_color(fc.color)
+                                .child(lbl);
+                            })
+                          )
+                      )
+                    )
                 )
-            )
+              )
           )
-          // Touched files
-          .when(touched.length > 0, (d) =>
-            d.child(
-              v_flex()
-                .w_full()
-                .flex_none()
-                .gap(4)
-                .p(8)
-                .rounded(6)
-                .bg(t.background)
-                .border_1()
-                .border_color(t.border)
-                .child(
-                  div()
-                    .text_size(11)
-                    .font_semibold()
-                    .text_color(t.foreground)
-                    .child(`Touched Files (${touched.length})`)
-                )
-                .children(
-                  touched.slice(0, 12).map((fp) =>
-                    div().text_size(10).text_color(t.dim).truncate().child(fp)
-                  )
-                )
-            )
-          )
-          // Description
           .child(
+            // Right Column: Full Markdown Description
             v_flex()
-              .w_full()
-              .flex_none()
-              .gap(4)
-              .child(div().text_size(11).font_semibold().text_color(t.muted).child("Description"))
+              .id("inspector-right-scroll")
+              .flex_1()
+              .min_w(0)
+              .min_h(0)
+              .h_full()
+              .gap(6)
+              .p(11)
+              .overflow_y_scrollbar()
               .child(
-                div()
+                h_flex()
                   .w_full()
-                  .p(8)
-                  .rounded(6)
+                  .items_center()
+                  .justify_between()
+                  .child(
+                    div()
+                      .text_size(11)
+                      .font_semibold()
+                      .text_color(t.muted)
+                      .child("Description (Markdown)")
+                  )
+                  .when(Boolean(ticket.milestone), (m) =>
+                    m.child(
+                      div()
+                        .px(5)
+                        .py(1)
+                        .rounded(4)
+                        .bg(t.background)
+                        .text_size(10)
+                        .text_color(t.dim)
+                        .child(ticket.milestone)
+                    )
+                  )
+              )
+              .child(
+                v_flex()
+                  .w_full()
+                  .flex_none()
+                  .p(11)
+                  .rounded(7)
                   .bg(t.background)
                   .border_1()
                   .border_color(t.border)
-                  .text_size(11)
-                  .text_color(t.foreground)
-                  .child(String(ticket.body || "(No description provided.)"))
+                  .child(
+                    TextView.markdown(`ticket-desc-md-${ticket.number}`, mdBody)
+                      .selectable(true)
+                      .on_link_click((url, cx) => this.handleLinkClick(url, cx))
+                  )
               )
           )
       );
   }
 
   renderFooter(t, tgt) {
+    const shortcuts =
+      this.viewMode === "whats_new"
+        ? [
+            ["s", "synthesize"],
+            ["b", "board"],
+            ["r", "refresh"],
+          ]
+        : [
+            ["hjkl", "nav"],
+            ["1-6", "col"],
+            ["Enter", "detail"],
+            ["w", "what's new"],
+            ["s", "dispatch"],
+            ["f", "focus"],
+            ["n", "deposit"],
+          ];
+
     return h_flex()
       .w_full()
-      .h(28)
+      .h(26)
       .flex_none()
       .items_center()
       .justify_between()
       .px(12)
-      .bg(t.surface)
+      .bg(t.chrome || t.surface)
       .border_t(1)
       .border_color(t.border)
       .child(
         h_flex()
           .items_center()
-          .gap(8)
+          .gap(6)
+          .min_w(0)
+          .flex_1()
           .when(Boolean(this.busyText), (d) =>
             d.child(
               div()
                 .text_size(11)
                 .font_semibold()
                 .text_color(t.working || t.ansi3)
+                .truncate()
                 .child(this.busyText)
             )
           )
@@ -2482,20 +3811,41 @@ export default class KanbanBoard extends View {
             )
           )
           .when(Boolean(!this.busyText && !this.error && !this.statusMessage), (d) =>
-            d.child(
-              div()
-                .text_size(11)
-                .text_color(t.dim)
-                .child(tgt.cwd ? `${tgt.on ? tgt.on + ":" : ""}${tgt.cwd}` : "No active repo")
-            )
+            d
+              .child(svg("mods/workspace-chrome/folder.svg").size(10).flex_none().text_color(t.dim))
+              .child(
+                div()
+                  .text_size(10.5)
+                  .text_color(t.dim)
+                  .truncate()
+                  .child(tgt.cwd ? `${tgt.on ? tgt.on + ":" : ""}${tgt.cwd}` : "No active repo")
+              )
           )
       )
       .child(
-        div()
-          .text_size(10.5)
-          .text_color(t.dim)
-          .truncate()
-          .child("drag/wheel pan · 1-6 jump · 0 center · h/j/k/l nav · Enter detail · s dispatch · n deposit")
+        h_flex()
+          .flex_none()
+          .items_center()
+          .gap(8)
+          .children(
+            shortcuts.map(([k, lbl]) =>
+              h_flex()
+                .items_center()
+                .gap(3)
+                .child(
+                  div()
+                    .px(4)
+                    .rounded(3)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(9.5)
+                    .text_color(t.muted)
+                    .child(k)
+                )
+                .child(div().text_size(10).text_color(t.dim).child(lbl))
+            )
+          )
       );
   }
 
@@ -2513,9 +3863,13 @@ export default class KanbanBoard extends View {
     if (this.bus) {
       this.searchQuery = this.bus.searchQuery;
       this.repoFilter = this.bus.repoFilter;
+      this.quickFilter = this.bus.quickFilter || "all";
+      this.compactEmpty = this.bus.compactEmpty !== false;
+      this.viewMode = this.bus.viewMode || "board";
       this.agentKind = this.bus.agentKind;
       this.overrideSpaceId = this.bus.overrideSpaceId;
-      this.showDrawer = this.bus.showDrawer;
+      this.showDrawer = this.bus.showDrawer !== false;
+      this.drawerTall = Boolean(this.bus.drawerTall);
       if (this.bus.modalMode !== undefined) this.modalMode = this.bus.modalMode;
     }
 
@@ -2592,7 +3946,12 @@ export default class KanbanBoard extends View {
                 .items_center()
                 .justify_center()
                 .gap(8)
-                .child(div().text_size(13).text_color(t.muted).child("Loading GitHub Project v2 Kanban board…"))
+                .child(
+                  div()
+                    .text_size(13)
+                    .text_color(t.muted)
+                    .child("Loading GitHub Project v2 Kanban board…")
+                )
             )
           )
           .when(Boolean(!this.loading && !this.board && this.error), (d) =>
@@ -2621,7 +3980,10 @@ export default class KanbanBoard extends View {
                 )
             )
           )
-          .when(Boolean(this.board), (d) =>
+          .when(Boolean(this.board && this.viewMode === "whats_new"), (d) =>
+            d.child(this.renderWhatsNewView(t))
+          )
+          .when(Boolean(this.board && this.viewMode !== "whats_new"), (d) =>
             d
               .child(this.renderBoardCanvas(byCol, selectedRef, t))
               .when(Boolean(this.showDrawer), (col) => col.child(this.renderInspector(selected, t)))

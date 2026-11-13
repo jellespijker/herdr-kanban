@@ -173,6 +173,9 @@ def test_install_app_mod_and_status(tmp_path: Path) -> None:
     assert (dest / "main.js").is_file()
     assert (dest / "mod.json").is_file()
     assert (dest / "RECIPE.md").is_file()
+    assert (dest / "kanban.svg").is_file()
+    assert (dest / "refresh.svg").is_file()
+    assert (dest / "sparkles.svg").is_file()
 
     uninstalled = skill.install_app_mod(app_home=app_home, uninstall=True)
     assert any("removed" in line for line in uninstalled)
@@ -221,5 +224,11 @@ def test_hc_env_detection_and_board_payload(monkeypatch: pytest.MonkeyPatch) -> 
         assert card3["cli_ref"] == "3"
         assert card3["checklist_done"] == 1
         assert card3["checklist_total"] == 2
+        assert "whats_new" in payload
+        wn = payload["whats_new"]
+        assert wn["total_landed"] == 1
+        assert "Shipped healthcheck" in wn["auto_markdown"]
+        prompt = tui.engine.build_whats_new_agent_prompt(tui.ctx, tui.tickets)
+        assert "herdr-kanban whats-new --write-summary" in prompt
     finally:
         tui.close_pipes()

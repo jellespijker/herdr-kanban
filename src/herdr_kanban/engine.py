@@ -602,8 +602,345 @@ class KanbanEngine:
             "repos": repos_dict,
             "local_claims": [c.to_dict() for c in all_local],
             "tickets": [self.serialize_ticket_for_board(ctx, t, local_by_key) for t in tickets],
+            "whats_new": self.build_whats_new_digest(ctx, tickets),
         }
         return payload
+
+    @staticmethod
+    def _split_ticket_prefixes(raw_title: str) -> tuple[str, list[str], list[str]]:
+        """Extract leading `[JIRA-KEY]` and `[scope]` tags from a ticket title."""
+        rest = (raw_title or "").strip()
+        jira_keys: list[str] = []
+        scopes: list[str] = []
+        tag_re = re.compile(r"^\[([^\[\]]+)\]\s*")
+        jira_re = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+        while True:
+            m = tag_re.match(rest)
+            if not m:
+                break
+            token = m.group(1).strip()
+            rest = rest[m.end() :].strip()
+            if jira_re.match(token):
+                if token not in jira_keys:
+                    jira_keys.append(token)
+            elif token and token not in scopes:
+                scopes.append(token)
+        return (rest or raw_title.strip()), jira_keys, scopes
+
+    @staticmethod
+    def _extract_ticket_summary_note(ticket: Ticket) -> str:
+        if ticket.claim and ticket.claim.note and ticket.claim.note.strip():
+            return ticket.claim.note.strip()
+        body = strip_meta(ticket.body or "")
+        if not body:
+            return ""
+        # Strip trailing "--- \n **Deposited via `herdr-kanban`**" footer
+        body = re.split(r"\n---\s*\n\*\*Deposited via", body)[0].strip()
+        # Strip leading "Jira: ..." line if followed by prose
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        if lines and re.match(r"^Jira:\s*[A-Z0-9_,\s-]+$", lines[0], re.IGNORECASE) and len(lines) > 1:
+            lines = lines[1:]
+        first = lines[0] if lines else ""
+        first = re.sub(r"^Jira:\s*[A-Z0-9_,\s-]+\.\s*", "", first)
+        return first[:220] + ("…" if len(first) > 220 else "")
+
+    def build_whats_new_digest(
+        self,
+        ctx: RepoContext,
+        tickets: list[Ticket],
+        limit: int = 30,
+    ) -> dict[str, Any]:
+        """Build structured What's New digest of landed and active work across colleagues and agents."""
+        done_tickets = [t for t in tickets if t.column == Column.DONE]
+        active_tickets = [t for t in tickets if t.column in (Column.IN_PROGRESS, Column.REVIEW)]
+
+        done_sorted = sorted(
+            done_tickets,
+            key=lambda t: (t.updated_at or "", t.number),
+            reverse=True,
+        )
+
+        recent_landed: list[dict[str, Any]] = []
+        contributors_map: dict[str, dict[str, Any]] = {}
+        repo_groups: dict[str, list[dict[str, Any]]] = {}
+        release_groups: dict[str, int] = {}
+
+        for t in active_tickets:
+            owner = (
+                (t.claim.owner if t.claim and t.claim.owner else "")
+                or (t.deposit.deposited_by if t.deposit and t.deposit.deposited_by else "")
+                or t.author
+                or "team"
+            )
+            agent = t.claim.agent_kind if t.claim and t.claim.agent_kind else ""
+            c_entry = contributors_map.setdefault(
+                owner,
+                {
+                    "owner": owner,
+                    "agents": set(),
+                    "landed_count": 0,
+                    "active_count": 0,
+                    "repos": set(),
+                    "recent_refs": [],
+                },
+            )
+            c_entry["active_count"] += 1
+            if agent:
+                c_entry["agents"].add(agent)
+            repo_key = t.target_repo or t.repo_alias or t.repo_name
+            if repo_key:
+                c_entry["repos"].add(repo_key)
+
+        for idx, t in enumerate(done_sorted):
+            clean_title, jira_keys, scopes = self._split_ticket_prefixes(t.title)
+            owner = (
+                (t.claim.owner if t.claim and t.claim.owner else "")
+                or (t.deposit.deposited_by if t.deposit and t.deposit.deposited_by else "")
+                or t.author
+                or "team"
+            )
+            agent = t.claim.agent_kind if t.claim and t.claim.agent_kind else ""
+            repo_key = t.target_repo or t.repo_alias or t.repo_name or ctx.repo_name
+            ref_str = t.ref(ctx.is_multi_repo)
+            cli_ref = (
+                f"{t.repo_alias}#{t.number}"
+                if (ctx.is_multi_repo and t.repo_alias)
+                else str(t.number)
+            )
+            rel_tags = [lbl.split(":", 1)[1] for lbl in t.labels if lbl.startswith("release:")]
+            for rt in rel_tags:
+                release_groups[rt] = release_groups.get(rt, 0) + 1
+
+            c_entry = contributors_map.setdefault(
+                owner,
+                {
+                    "owner": owner,
+                    "agents": set(),
+                    "landed_count": 0,
+                    "active_count": 0,
+                    "repos": set(),
+                    "recent_refs": [],
+                },
+            )
+            c_entry["landed_count"] += 1
+            if agent:
+                c_entry["agents"].add(agent)
+            if repo_key:
+                c_entry["repos"].add(repo_key)
+            if len(c_entry["recent_refs"]) < 6:
+                c_entry["recent_refs"].append(ref_str)
+
+            item = {
+                "number": t.number,
+                "ref": ref_str,
+                "cli_ref": cli_ref,
+                "title": t.title,
+                "clean_title": clean_title,
+                "jira_keys": jira_keys,
+                "scopes": scopes,
+                "target_repo": repo_key,
+                "priority": t.priority,
+                "milestone": t.milestone,
+                "owner": owner,
+                "agent_kind": agent,
+                "updated_at": t.updated_at,
+                "summary_note": self._extract_ticket_summary_note(t),
+                "touched_count": len(t.claim.touched_files) if t.claim else 0,
+                "labels": list(t.labels),
+                "releases": rel_tags,
+            }
+            if idx < limit:
+                recent_landed.append(item)
+            repo_groups.setdefault(repo_key, []).append(item)
+
+        contributors = [
+            {
+                "owner": k,
+                "agents": sorted(v["agents"]),
+                "landed_count": v["landed_count"],
+                "active_count": v["active_count"],
+                "repos": sorted(v["repos"]),
+                "recent_refs": v["recent_refs"],
+            }
+            for k, v in sorted(
+                contributors_map.items(),
+                key=lambda kv: (kv[1]["landed_count"] + kv[1]["active_count"], kv[0]),
+                reverse=True,
+            )
+        ]
+
+        by_repo = [
+            {
+                "repo": repo_name,
+                "landed_count": len(items),
+                "recent": items[:5],
+            }
+            for repo_name, items in sorted(
+                repo_groups.items(),
+                key=lambda kv: (len(kv[1]), kv[0]),
+                reverse=True,
+            )
+        ]
+
+        saved = state.load_whats_new_summary(ctx.slug, ctx.board.project_number)
+        auto_md = self._render_auto_whats_new_markdown(
+            ctx,
+            recent_landed[:15],
+            contributors,
+            by_repo,
+            active_tickets,
+            len(done_tickets),
+        )
+
+        return {
+            "total_landed": len(done_tickets),
+            "total_active": len(active_tickets),
+            "recent_landed": recent_landed,
+            "contributors": contributors,
+            "by_repo": by_repo,
+            "releases": release_groups,
+            "saved_summary": saved,
+            "auto_markdown": auto_md,
+        }
+
+    def _render_auto_whats_new_markdown(
+        self,
+        ctx: RepoContext,
+        recent_landed: list[dict[str, Any]],
+        contributors: list[dict[str, Any]],
+        by_repo: list[dict[str, Any]],
+        active_tickets: list[Ticket],
+        total_landed: int,
+    ) -> str:
+        lines: list[str] = []
+        lines.append(
+            f"**{total_landed} tickets landed** onto `{ctx.board.remote}/{ctx.board.target_branch}` "
+            f"across **{len(by_repo)} repositories**, with **{len(active_tickets)} active** in progress."
+        )
+        if contributors:
+            contrib_parts = []
+            for c in contributors[:6]:
+                ag_str = f" ({', '.join(c['agents'])})" if c["agents"] else ""
+                contrib_parts.append(
+                    f"**@{c['owner']}**{ag_str}: {c['landed_count']} landed"
+                    + (f", {c['active_count']} active" if c["active_count"] else "")
+                )
+            lines.append("\n### Team & Agent Velocity\n" + " · ".join(contrib_parts))
+
+        if by_repo:
+            lines.append("\n### Highlights by Repository")
+            for grp in by_repo[:8]:
+                repo_name = grp["repo"]
+                cnt = grp["landed_count"]
+                lines.append(f"\n#### `{repo_name}` ({cnt} landed)")
+                for item in grp["recent"][:4]:
+                    ref = item["ref"]
+                    cli_ref = item["cli_ref"]
+                    prio = f"**{item['priority']}** " if item["priority"] else ""
+                    who = f" · *@{item['owner']}" + (f":{item['agent_kind']}*" if item["agent_kind"] else "*")
+                    lines.append(f"- [{ref}](kanban://issue/{cli_ref}) {prio}{item['clean_title']}{who}")
+                    if item["summary_note"]:
+                        lines.append(f"  > {item['summary_note']}")
+        return "\n".join(lines)
+
+    def generate_whats_new_summary(
+        self,
+        ctx: RepoContext,
+        tickets: list[Ticket],
+        *,
+        custom_markdown: str | None = None,
+        author: str = "",
+        agent_kind: str = "",
+    ) -> dict[str, Any]:
+        """Generate or store an executive Markdown briefing of landed work + recent Git commits."""
+        digest = self.build_whats_new_digest(ctx, tickets)
+        who = author
+        if not who:
+            try:
+                who = self.github.current_user()
+            except Exception:
+                who = "agent"
+        kind = agent_kind or ctx.settings.default_agent_kind or "agent"
+
+        if custom_markdown and custom_markdown.strip():
+            md = custom_markdown.strip()
+        else:
+            # Synthesize rich briefing combining board tickets + recent git commits across top repos
+            lines: list[str] = [
+                f"## Executive Briefing — {ctx.display_name}",
+                "",
+                digest["auto_markdown"],
+            ]
+            git_sections: list[str] = []
+            checked_repos = [r["repo"] for r in digest["by_repo"][:6]]
+            if not checked_repos and ctx.repos:
+                checked_repos = list(ctx.repos.keys())[:4]
+            for alias in checked_repos:
+                entry = ctx.repos.get(alias)
+                if not entry:
+                    continue
+                try:
+                    repo_root = self._entry_main_root(ctx, entry)
+                    proc = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo_root),
+                            "log",
+                            "-n",
+                            "4",
+                            "--pretty=format:- `%h` %s (*%cr* by **%an**)",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        git_sections.append(f"#### Recent commits in `{alias}`\n{proc.stdout.strip()}")
+                except Exception:
+                    continue
+            if git_sections:
+                lines.append("\n### Recent Git Commits on Shared Branches\n" + "\n\n".join(git_sections))
+            md = "\n".join(lines)
+
+        summary_obj = {
+            "markdown": md,
+            "updated_at": utc_now_iso(),
+            "author": who,
+            "agent_kind": kind,
+            "landed_count": digest["total_landed"],
+        }
+        state.save_whats_new_summary(ctx.slug, ctx.board.project_number, summary_obj)
+        digest["saved_summary"] = summary_obj
+        return digest
+
+    def build_whats_new_agent_prompt(
+        self,
+        ctx: RepoContext,
+        tickets: list[Ticket],
+        limit: int = 25,
+    ) -> str:
+        digest = self.build_whats_new_digest(ctx, tickets, limit=limit)
+        lines = [
+            f"Synthesize a concise, high-signal 'What's New' Markdown briefing for teammates in {ctx.display_name}.",
+            "Group the recently landed tickets and git commits by architectural theme / repository,",
+            "highlight what each colleague and coding agent accomplished, and call out any newly unblocked work.",
+            "Format ticket references as `[repo#num](kanban://issue/repo#num)` so they are clickable in Herdr-App.",
+            "",
+            "When ready, publish your Markdown briefing back to the Herdr Kanban board by running:",
+            '  herdr-kanban whats-new --write-summary "<YOUR_MARKDOWN_SUMMARY>"',
+            "",
+            "## Recently Landed Tickets",
+        ]
+        for item in digest["recent_landed"][:limit]:
+            lines.append(
+                f"- {item['ref']} [{item['target_repo']}] ({item['priority']}) {item['clean_title']} "
+                f"— by @{item['owner']}:{item['agent_kind'] or 'agent'}"
+            )
+            if item["summary_note"]:
+                lines.append(f"  Summary: {item['summary_note']}")
+        return "\n".join(lines)
+
 
     def sync_labels(self, ctx: RepoContext) -> dict[str, Any]:
         """Provision configured taxonomy labels, milestones, and Project v2 Priority options."""
