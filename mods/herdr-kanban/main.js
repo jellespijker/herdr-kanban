@@ -47,6 +47,40 @@ function withAlpha(hexColor, alphaHex) {
   return c;
 }
 
+function truncStr(str, maxLen) {
+  const s = String(str || "").trim();
+  if (s.length <= maxLen) return s;
+  return `${s.slice(0, Math.max(1, maxLen - 1))}…`;
+}
+
+function renderChunkedPillRows(items, maxCharsPerRow = 38, rowGap = 5, colGap = 5) {
+  const rows = [];
+  let curRow = [];
+  let curChars = 0;
+  for (const item of items) {
+    if (!item || !item.el) continue;
+    const w = Math.max(3, (item.chars || 6) + 2);
+    if (curRow.length > 0 && curChars + w > maxCharsPerRow) {
+      rows.push(curRow);
+      curRow = [item.el];
+      curChars = w;
+    } else {
+      curRow.push(item.el);
+      curChars += w;
+    }
+  }
+  if (curRow.length > 0) rows.push(curRow);
+  return v_flex()
+    .w_full()
+    .flex_none()
+    .gap(rowGap)
+    .children(
+      rows.map((r) =>
+        h_flex().w_full().items_center().gap(colGap).overflow_hidden().children(r)
+      )
+    );
+}
+
 function priorityColor(prio, t) {
   const p = String(prio || "").toUpperCase();
   if (p.startsWith("P0") || p.startsWith("CRIT")) return t.blocked || t.ansi1 || "#e05252";
@@ -2265,6 +2299,53 @@ export default class KanbanBoard extends View {
       ticket.target_repo && ticket.target_repo !== ticket.repo_alias
         ? ticket.target_repo
         : scopes[0] || "";
+    const hasTopAlert =
+      overlaps.length > 0 ||
+      Boolean(ticket.stale) ||
+      (!isDepBlocked && !isDoneCol && blocks.length > 0);
+    const showRepoTopRight = !hasTopAlert && Boolean(repoTag);
+    const showJiraTopRight = !hasTopAlert && !showRepoTopRight && jiraKeys.length > 0;
+
+    const cardFacetItems = [];
+    let usedFacetChars = 0;
+    if (hasTopAlert && repoTag) {
+      const rtText = truncStr(repoTag, 13);
+      usedFacetChars += rtText.length + 3;
+      cardFacetItems.push(
+        div()
+          .id(`fc-repo-${ticket.number}`)
+          .flex_none()
+          .px(5)
+          .py(1)
+          .rounded(4)
+          .bg(t.background)
+          .border_1()
+          .border_color(t.border)
+          .text_size(10)
+          .text_color(agentVis ? agentVis.color : t.accent)
+          .child(rtText)
+      );
+    }
+    for (let i = 0; i < visibleFacets.length; i++) {
+      const fc = visibleFacets[i];
+      const fcText = truncStr(fc.text, 14);
+      if (cardFacetItems.length > 0 && usedFacetChars + fcText.length + 3 > 28) {
+        break;
+      }
+      usedFacetChars += fcText.length + 3;
+      cardFacetItems.push(
+        div()
+          .id(`fc-${ticket.number}-${i}`)
+          .flex_none()
+          .px(5)
+          .py(1)
+          .rounded(4)
+          .bg(fc.bg)
+          .text_size(10)
+          .text_color(fc.color)
+          .child(fcText)
+      );
+    }
 
     // Card surface, border, and left stripe color based on agent working or dependency lock
     let cardBg = isSelected ? t.selected : t.surface;
@@ -2335,20 +2416,18 @@ export default class KanbanBoard extends View {
         )
       )
       .child(
-        // Top row: Issue Ref, Priority, Repo/Scope badge, and Alert/Unblocks badge (strictly bounded)
+        // Top row: Left = Issue Ref + Priority ONLY; Right = ONE status/repo pill (zero overlap!)
         h_flex()
           .w_full()
           .items_center()
           .justify_between()
-          .gap(4)
+          .gap(6)
           .overflow_hidden()
           .child(
             h_flex()
               .items_center()
               .gap(5)
-              .min_w(0)
-              .flex_1()
-              .overflow_hidden()
+              .flex_none()
               .child(
                 div()
                   .flex_none()
@@ -2363,7 +2442,7 @@ export default class KanbanBoard extends View {
                       ? t.accent
                       : t.muted
                   )
-                  .child(disp)
+                  .child(truncStr(disp, 14))
               )
               .when(Boolean(ticket.priority), (d) =>
                 d.child(
@@ -2379,60 +2458,27 @@ export default class KanbanBoard extends View {
                     .child(ticket.priority)
                 )
               )
-              .when(Boolean(repoTag), (d) =>
-                d.child(
-                  div()
-                    .max_w(88)
-                    .px(5)
-                    .py(1)
-                    .rounded(4)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.border)
-                    .text_size(10)
-                    .text_color(agentVis ? agentVis.color : t.accent)
-                    .truncate()
-                    .child(repoTag)
-                )
-              )
           )
           .child(
             h_flex()
               .items_center()
               .flex_none()
               .gap(4)
-              .when(
-                overlaps.length === 0 && !ticket.stale && (isDepBlocked || isDoneCol || blocks.length === 0) && jiraKeys.length > 0,
-                (d) =>
-                  d.child(
-                    div()
-                      .flex_none()
-                      .px(5)
-                      .py(1)
-                      .rounded(4)
-                      .bg(t.background)
-                      .text_size(9.5)
-                      .text_color(t.dim)
-                      .child(jiraKeys[0])
-                  )
-              )
-              .when(!isDepBlocked && !isDoneCol && blocks.length > 0, (d) =>
+              .when(overlaps.length > 0, (d) =>
                 d.child(
                   div()
                     .flex_none()
                     .px(5)
                     .py(1)
                     .rounded(4)
-                    .bg(withAlpha(t.done || t.ansi2, "18") || t.background)
-                    .border_1()
-                    .border_color(withAlpha(t.done || t.ansi2, "50") || t.border)
+                    .bg(withAlpha(blockedCol, "22") || t.background)
                     .text_size(9.5)
                     .font_semibold()
-                    .text_color(t.done || t.ansi2)
-                    .child(`Unblocks ${blocks.slice(0, 2).map((n) => "#" + n).join(",")}`)
+                    .text_color(blockedCol)
+                    .child("OVERLAP")
                 )
               )
-              .when(Boolean(ticket.stale), (d) =>
+              .when(overlaps.length === 0 && Boolean(ticket.stale), (d) =>
                 d.child(
                   div()
                     .flex_none()
@@ -2446,18 +2492,54 @@ export default class KanbanBoard extends View {
                     .child("STALE")
                 )
               )
-              .when(overlaps.length > 0, (d) =>
+              .when(
+                overlaps.length === 0 && !ticket.stale && !isDepBlocked && !isDoneCol && blocks.length > 0,
+                (d) =>
+                  d.child(
+                    div()
+                      .flex_none()
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .bg(withAlpha(t.done || t.ansi2, "18") || t.background)
+                      .border_1()
+                      .border_color(withAlpha(t.done || t.ansi2, "50") || t.border)
+                      .text_size(9.5)
+                      .font_semibold()
+                      .text_color(t.done || t.ansi2)
+                      .child(
+                        `Unblocks #${blocks[0]}${
+                          blocks.length > 1 ? " +" + (blocks.length - 1) : ""
+                        }`
+                      )
+                  )
+              )
+              .when(showRepoTopRight, (d) =>
                 d.child(
                   div()
                     .flex_none()
                     .px(5)
                     .py(1)
                     .rounded(4)
-                    .bg(withAlpha(blockedCol, "22") || t.background)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(10)
+                    .text_color(agentVis ? agentVis.color : t.accent)
+                    .child(truncStr(repoTag, 15))
+                )
+              )
+              .when(showJiraTopRight, (d) =>
+                d.child(
+                  div()
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(t.background)
                     .text_size(9.5)
-                    .font_semibold()
-                    .text_color(blockedCol)
-                    .child("OVERLAP")
+                    .text_color(t.dim)
+                    .child(truncStr(jiraKeys[0], 13))
                 )
               )
           )
@@ -2481,9 +2563,7 @@ export default class KanbanBoard extends View {
             .child(
               h_flex()
                 .items_center()
-                .min_w(0)
-                .flex_1()
-                .overflow_hidden()
+                .flex_none()
                 .gap(5)
                 .child(svg("mods/herdr-kanban/lock.svg").size(11).flex_none().text_color(blockedCol))
                 .child(
@@ -2495,7 +2575,7 @@ export default class KanbanBoard extends View {
                     .child("BLOCKED BY")
                 )
                 .children(
-                  unmetDeps.slice(0, 3).map((depNum) =>
+                  unmetDeps.slice(0, 2).map((depNum) =>
                     div()
                       .id(`card-dep-chip-${ticket.number}-${depNum}`)
                       .flex_none()
@@ -2536,7 +2616,7 @@ export default class KanbanBoard extends View {
         // Multi-line wrapped clean human title (dimmed when blocked by dependencies)
         div()
           .w_full()
-          .max_h(isDoneCol ? 38 : 54)
+          .max_h(isDoneCol ? 33 : 50)
           .overflow_hidden()
           .whitespace_normal()
           .line_height(1.38)
@@ -2545,28 +2625,14 @@ export default class KanbanBoard extends View {
           .text_color(isDepBlocked && !isSelected ? t.muted : t.foreground)
           .child(cleanTitle)
       )
-      .when(visibleFacets.length > 0, (d) =>
+      .when(cardFacetItems.length > 0, (d) =>
         d.child(
           h_flex()
             .w_full()
             .items_center()
-            .gap(4)
+            .gap(5)
             .overflow_hidden()
-            .children(
-              visibleFacets.map((fc, i) =>
-                div()
-                  .id(`fc-${ticket.number}-${i}`)
-                  .max_w(108)
-                  .px(5)
-                  .py(1)
-                  .rounded(4)
-                  .bg(fc.bg)
-                  .text_size(10)
-                  .text_color(fc.color)
-                  .truncate()
-                  .child(fc.text)
-              )
-            )
+            .children(cardFacetItems)
         )
       )
       .when(checkTotal > 0 || touchedCount > 0 || hasActiveClaim || Boolean(agentVis), (d) =>
@@ -2581,16 +2647,13 @@ export default class KanbanBoard extends View {
             .child(
               h_flex()
                 .items_center()
-                .min_w(0)
-                .flex_1()
-                .overflow_hidden()
+                .flex_none()
                 .gap(5)
                 .when(Boolean(agentVis), (c) =>
                   c.child(
                     h_flex()
                       .items_center()
-                      .min_w(0)
-                      .overflow_hidden()
+                      .flex_none()
                       .gap(4)
                       .px(6)
                       .py(2.5)
@@ -2603,12 +2666,11 @@ export default class KanbanBoard extends View {
                       )
                       .child(
                         div()
-                          .max_w(72)
-                          .truncate()
+                          .flex_none()
                           .text_size(10.5)
                           .font_semibold()
                           .text_color(t.foreground)
-                          .child(`@${agentVis.owner}`)
+                          .child(`@${truncStr(agentVis.owner, 11)}`)
                       )
                       .child(
                         div()
@@ -2629,11 +2691,10 @@ export default class KanbanBoard extends View {
                       .when(Boolean(agentVis.tabLabel && checkTotal === 0), (tb) =>
                         tb.child(
                           div()
-                            .max_w(52)
-                            .truncate()
+                            .flex_none()
                             .text_size(9.5)
                             .text_color(t.muted)
-                            .child(`· ${agentVis.tabLabel}`)
+                            .child(`· ${truncStr(agentVis.tabLabel, 8)}`)
                         )
                       )
                       .when(agentVis.isWorking, (sp) =>
@@ -2651,8 +2712,7 @@ export default class KanbanBoard extends View {
                   c.child(
                     h_flex()
                       .items_center()
-                      .min_w(0)
-                      .overflow_hidden()
+                      .flex_none()
                       .gap(5)
                       .px(6)
                       .py(2)
@@ -2669,11 +2729,10 @@ export default class KanbanBoard extends View {
                       )
                       .child(
                         div()
-                          .max_w(82)
-                          .truncate()
+                          .flex_none()
                           .text_size(10.5)
                           .text_color(t.foreground)
-                          .child(`@${claim.owner}`)
+                          .child(`@${truncStr(claim.owner, 12)}`)
                       )
                       .when(Boolean(claim.agent_kind), (ag) =>
                         ag.child(
@@ -3214,22 +3273,26 @@ export default class KanbanBoard extends View {
                           )
                           .when(Array.isArray(c.repos) && c.repos.length > 0, (r) =>
                             r.child(
-                              h_flex()
-                                .w_full()
-                                .flex_wrap()
-                                .gap(4)
-                                .children(
-                                  c.repos.slice(0, 6).map((rp) =>
-                                    div()
+                              renderChunkedPillRows(
+                                c.repos.slice(0, 6).map((rp) => {
+                                  const txt = truncStr(rp, 18);
+                                  return {
+                                    chars: txt.length,
+                                    el: div()
+                                      .flex_none()
                                       .px(5)
                                       .py(1)
                                       .rounded(4)
                                       .bg(t.background)
                                       .text_size(9.5)
                                       .text_color(t.muted)
-                                      .child(rp)
-                                  )
-                                )
+                                      .child(txt),
+                                  };
+                                }),
+                                40,
+                                5,
+                                5
+                              )
                             )
                           )
                       )
@@ -3250,14 +3313,14 @@ export default class KanbanBoard extends View {
                         .child("Landed by Repository")
                     )
                     .child(
-                      h_flex()
-                        .w_full()
-                        .flex_wrap()
-                        .gap(5)
-                        .children(
-                          byRepo.map((grp) =>
-                            h_flex()
+                      renderChunkedPillRows(
+                        byRepo.map((grp) => {
+                          const txt = truncStr(grp.repo, 20);
+                          return {
+                            chars: txt.length + String(grp.landed_count).length + 3,
+                            el: h_flex()
                               .id(`wn-repo-pill-${grp.repo}`)
+                              .flex_none()
                               .items_center()
                               .gap(4)
                               .px(7)
@@ -3271,7 +3334,7 @@ export default class KanbanBoard extends View {
                               .on_click((_ev, cx) => {
                                 this.syncBus({ repoFilter: grp.repo, viewMode: "board" }, cx);
                               })
-                              .child(div().text_size(10.5).text_color(t.foreground).child(grp.repo))
+                              .child(div().text_size(10.5).text_color(t.foreground).child(txt))
                               .child(
                                 div()
                                   .px(4)
@@ -3280,9 +3343,13 @@ export default class KanbanBoard extends View {
                                   .text_size(9.5)
                                   .text_color(t.done || t.ansi2)
                                   .child(String(grp.landed_count))
-                              )
-                          )
-                        )
+                              ),
+                          };
+                        }),
+                        40,
+                        6,
+                        5
+                      )
                     )
                 )
               )
@@ -4010,57 +4077,81 @@ export default class KanbanBoard extends View {
                     )
                     .when(deps.length > 0, (c) =>
                       c.child(
-                        h_flex()
-                          .w_full()
-                          .flex_wrap()
-                          .items_center()
-                          .gap(4)
-                          .child(div().text_size(10.5).text_color(t.muted).child("Depends on:"))
-                          .children(
-                            deps.map((n) => {
+                        renderChunkedPillRows(
+                          [
+                            {
+                              chars: 11,
+                              el: div()
+                                .flex_none()
+                                .text_size(10.5)
+                                .text_color(t.muted)
+                                .child("Depends on:"),
+                            },
+                            ...deps.map((n) => {
                               const isUnmet = unmet.has(n);
-                              return div()
-                                .id(`dep-link-${n}`)
-                                .px(5)
-                                .py(1)
-                                .rounded(4)
-                                .cursor_pointer()
-                                .bg(t.surface)
-                                .border_1()
-                                .border_color(isUnmet ? t.blocked || t.ansi1 : t.border)
-                                .text_size(10)
-                                .text_color(isUnmet ? t.blocked || t.ansi1 : t.done || t.ansi2)
-                                .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
-                                .child(`#${n}${isUnmet ? " (open)" : " ✓"}`);
-                            })
-                          )
+                              const txt = `#${n}${isUnmet ? " (open)" : " ✓"}`;
+                              return {
+                                chars: txt.length,
+                                el: div()
+                                  .id(`dep-link-${n}`)
+                                  .flex_none()
+                                  .px(5)
+                                  .py(1)
+                                  .rounded(4)
+                                  .cursor_pointer()
+                                  .bg(t.surface)
+                                  .border_1()
+                                  .border_color(isUnmet ? t.blocked || t.ansi1 : t.border)
+                                  .text_size(10)
+                                  .text_color(isUnmet ? t.blocked || t.ansi1 : t.done || t.ansi2)
+                                  .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
+                                  .child(txt),
+                              };
+                            }),
+                          ],
+                          38,
+                          5,
+                          5
+                        )
                       )
                     )
                     .when(blocks.length > 0, (c) =>
                       c.child(
-                        h_flex()
-                          .w_full()
-                          .flex_wrap()
-                          .items_center()
-                          .gap(4)
-                          .child(div().text_size(10.5).text_color(t.muted).child("Blocks:"))
-                          .children(
-                            blocks.map((n) =>
-                              div()
-                                .id(`blk-link-${n}`)
-                                .px(5)
-                                .py(1)
-                                .rounded(4)
-                                .cursor_pointer()
-                                .bg(t.surface)
-                                .border_1()
-                                .border_color(t.border)
-                                .text_size(10)
-                                .text_color(t.accent)
-                                .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
-                                .child(`#${n}`)
-                            )
-                          )
+                        renderChunkedPillRows(
+                          [
+                            {
+                              chars: 7,
+                              el: div()
+                                .flex_none()
+                                .text_size(10.5)
+                                .text_color(t.muted)
+                                .child("Blocks:"),
+                            },
+                            ...blocks.map((n) => {
+                              const txt = `#${n}`;
+                              return {
+                                chars: txt.length,
+                                el: div()
+                                  .id(`blk-link-${n}`)
+                                  .flex_none()
+                                  .px(5)
+                                  .py(1)
+                                  .rounded(4)
+                                  .cursor_pointer()
+                                  .bg(t.surface)
+                                  .border_1()
+                                  .border_color(t.border)
+                                  .text_size(10)
+                                  .text_color(t.accent)
+                                  .on_click((_ev, cx) => this.selectTicketByRef(String(n), cx))
+                                  .child(txt),
+                              };
+                            }),
+                          ],
+                          38,
+                          5,
+                          5
+                        )
                       )
                     )
                 )
@@ -4095,7 +4186,7 @@ export default class KanbanBoard extends View {
                   v_flex()
                     .w_full()
                     .flex_none()
-                    .gap(5)
+                    .gap(6)
                     .p(9)
                     .rounded(7)
                     .bg(t.background)
@@ -4118,24 +4209,28 @@ export default class KanbanBoard extends View {
                     )
                     .when(Array.isArray(ticket.labels) && ticket.labels.length > 0, (l) =>
                       l.child(
-                        h_flex()
-                          .w_full()
-                          .flex_wrap()
-                          .gap(4)
-                          .children(
-                            ticket.labels.map((lbl, idx) => {
-                              const fc = parseFacetLabel(lbl, t);
-                              return div()
+                        renderChunkedPillRows(
+                          ticket.labels.map((lbl, idx) => {
+                            const fc = parseFacetLabel(lbl, t);
+                            const txt = truncStr(lbl, 22);
+                            return {
+                              chars: txt.length,
+                              el: div()
                                 .id(`meta-lbl-${idx}`)
-                                .px(5)
-                                .py(1)
+                                .flex_none()
+                                .px(6)
+                                .py(2)
                                 .rounded(4)
                                 .bg(fc.bg)
                                 .text_size(10)
                                 .text_color(fc.color)
-                                .child(lbl);
-                            })
-                          )
+                                .child(txt),
+                            };
+                          }),
+                          36,
+                          5,
+                          5
+                        )
                       )
                     )
                 )

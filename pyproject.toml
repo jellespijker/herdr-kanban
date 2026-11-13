@@ -3,7 +3,7 @@
 
 [project]
 name = "herdr-kanban"
-version = "0.4.1"
+version = "0.4.2"
 description = "Herdr mod & TUI plugin: multi-colleague, multi-agent GitHub Projects v2 Kanban collaboration on a shared branch for both Herdr-App (GPUI + hc) and the herdr TUI."
 readme = "README.md"
 license = "MIT"

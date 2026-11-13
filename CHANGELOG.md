@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2 (2026-11-13)
+
+- **Deterministic Non-Overlapping Pill Layout (`renderChunkedPillRows` & Card Header Budget)**:
+  - Keep card top rows strictly to `issue ref + priority` on the left and a single status/repo badge on the right (`OVERLAP`, `STALE`, `Unblocks #N`, `repo`, or `Jira key`), moving secondary repo pills into the character-budgeted facet row below the title so left and right card header pills never collide.
+  - Replace GPUI `.flex_wrap()` pill containers in the Inspector (`Dependency Graph`, `Ticket Metadata`) and What's New (`Colleagues & Coding Agents`, `Landed by Repository`) with explicit `renderChunkedPillRows(...)` (`v_flex` of character-budgeted `h_flex` rows) so multi-line pill lists never overlap vertically or horizontally.
+
 ## 0.4.1 (2026-11-13)
 
 - **Agent-Colored Active Ticket Cards (`resolveTicketAgentVisual`)**:
