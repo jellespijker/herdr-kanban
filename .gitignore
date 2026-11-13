@@ -5,3 +5,8 @@ __pycache__/
 .import_linter_cache/
 .venv/
 .herdr-kanban.local.toml
+build/
+dist/
+*.egg-info/
+mods/*/*.d.ts
+mods/*/jsconfig.json
