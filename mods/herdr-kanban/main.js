@@ -203,12 +203,18 @@ function resolveTicketAgentVisual(ticket, allTickets, rt, t) {
 
   // If multiple active tickets share the same agent harness, give each active worker
   // a distinct hue after the primary brand color so parallel agents are easy to distinguish.
-  const activeSameKind = (allTickets || []).filter((tk) => {
-    if (!tk || tk.column === "done") return false;
-    const cl = tk.claim;
-    if (!cl || (cl.state !== "active" && cl.state !== "review_ready")) return false;
-    return String(cl.agent_kind || "").toLowerCase() === String(kind || "").toLowerCase();
-  });
+  const kindKey = String(kind || "").toLowerCase();
+  const cache = RENDER_SNAPSHOT ? RENDER_SNAPSHOT.sameKind : null;
+  let activeSameKind = cache && cache.get(kindKey);
+  if (!activeSameKind) {
+    activeSameKind = (allTickets || []).filter((tk) => {
+      if (!tk || tk.column === "done") return false;
+      const cl = tk.claim;
+      if (!cl || (cl.state !== "active" && cl.state !== "review_ready")) return false;
+      return String(cl.agent_kind || "").toLowerCase() === kindKey;
+    });
+    if (cache) cache.set(kindKey, activeSameKind);
+  }
 
   let color = spec.baseColor;
   let workerIndex = 0;
@@ -520,10 +526,26 @@ function resolveSpaceTarget(overrideSpaceId, resolvedCwdBySpace) {
   };
 }
 
+// Host lists (agents/terminals/panes) are cross-runtime calls that serialize the whole
+// list; reading them once per card made large boards exceed the render time budget
+// ("interrupted"). render() takes one snapshot per pass and every card reuses it.
+let RENDER_SNAPSHOT = null;
+
+function hostSnapshot() {
+  if (RENDER_SNAPSHOT) return RENDER_SNAPSHOT;
+  return {
+    agents: agents() || [],
+    terminals: terminals() || [],
+    panes: panes() || [],
+    sameKind: new Map(),
+  };
+}
+
 function findTicketRuntime(ticket) {
-  const allAgents = agents() || [];
-  const allTerms = terminals() || [];
-  const allPanes = panes() || [];
+  const snap = hostSnapshot();
+  const allAgents = snap.agents;
+  const allTerms = snap.terminals;
+  const allPanes = snap.panes;
 
   const lc = ticket.local_claim || null;
   const claim = ticket.claim || null;
@@ -4795,6 +4817,16 @@ export default class KanbanBoard extends View {
   }
 
   render(cx) {
+    RENDER_SNAPSHOT = null;
+    RENDER_SNAPSHOT = hostSnapshot(); // fresh per pass
+    try {
+      return this.renderFrame(cx);
+    } finally {
+      RENDER_SNAPSHOT = null;
+    }
+  }
+
+  renderFrame(cx) {
     const t = theme();
     const p = props() || {};
     const part = p.part || "";

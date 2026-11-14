@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.8 (2026-11-14)
+
+- **Fixed "This view could not be rendered — interrupted" on large boards (`renderCard`)**:
+  - Read the agent, terminal and pane lists once per render instead of three host calls per card, and compute the same-agent-kind worker list once per render instead of scanning every ticket per card, so large boards stay within the mod render time budget.
+
 ## 0.4.7 (2026-11-14)
 
 - **Plugin Build Hook & Release Artifacts (`scripts/build.sh`)**:
