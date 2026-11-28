@@ -306,8 +306,8 @@ class BoardConfig:
 class UserSettings:
     default_agent_kind: str = "claude"
     worktree_root: str = ""
-    poll_seconds: int = 25
-    heartbeat_seconds: int = 120
+    poll_seconds: int = 60
+    heartbeat_seconds: int = 180
     machines: list[str] = field(default_factory=list)
 
     def resolved_worktree_root(self) -> Path:
@@ -418,8 +418,8 @@ def load_user_settings() -> UserSettings:
     return UserSettings(
         default_agent_kind=agent,
         worktree_root=str(raw.get("worktree_root") or "").strip(),
-        poll_seconds=max(10, int(raw.get("poll_seconds") or 25)),
-        heartbeat_seconds=max(30, int(raw.get("heartbeat_seconds") or 120)),
+        poll_seconds=max(15, int(raw.get("poll_seconds") or 60)),
+        heartbeat_seconds=max(30, int(raw.get("heartbeat_seconds") or 180)),
         machines=[str(m).strip() for m in (raw.get("machines") or []) if str(m).strip()],
     )
 

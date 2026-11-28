@@ -184,6 +184,9 @@ class KanbanEngine:
                 )
                 primary = board.repos[primary_alias]
                 slug = f"umbrella__{config.repo_slug(board.project_owner, umbrella_dir.name)}"
+                set_tel = getattr(self.github, "set_telemetry_owner", None)
+                if callable(set_tel):
+                    set_tel(board.project_owner or primary.owner, primary.repo)
                 return RepoContext(
                     worktree_cwd=wt_root or start,
                     main_repo_root=main_root or primary.resolved_path(umbrella_dir),
@@ -214,6 +217,9 @@ class KanbanEngine:
         board.repo_owner = repo_owner
         board.repo_name = repo_name
         slug = config.repo_slug(repo_owner, repo_name)
+        set_tel = getattr(self.github, "set_telemetry_owner", None)
+        if callable(set_tel):
+            set_tel(board.project_owner or repo_owner, repo_name)
         single = config.RepoEntry(
             alias=repo_name,
             owner=repo_owner,
@@ -437,22 +443,10 @@ class KanbanEngine:
             project_owner=ctx.board.project_owner,
         )
 
-    def refresh_board(
+    def _fetch_and_cache_board_unlocked(
         self,
         ctx: RepoContext,
-        *,
-        use_cache: bool = True,
-        max_age_sec: float | None = None,
     ) -> tuple[ProjectSchema, list[Ticket]]:
-        if use_cache:
-            ttl = state.board_cache_ttl_sec() if max_age_sec is None else max(0.0, float(max_age_sec))
-            if ttl > 0.0:
-                cached_board = self.load_cached_board(ctx)
-                if cached_board is not None:
-                    fetched_at, cached_schema, cached_tickets = cached_board
-                    if cached_schema.project_id and (time.time() - fetched_at) < ttl:
-                        return cached_schema, cached_tickets
-
         extra_kwargs: dict[str, Any] = {}
         if ctx.board.priority_field and ctx.board.priority_field != "Priority":
             extra_kwargs["priority_field"] = ctx.board.priority_field
@@ -519,6 +513,53 @@ class KanbanEngine:
             project_owner=ctx.board.project_owner,
         )
         return schema, tickets
+
+    @staticmethod
+    def _telemetry_repo_key(ctx: RepoContext) -> str:
+        if ctx.is_multi_repo and ctx.board.issues_repo and ctx.board.issues_repo in ctx.repos:
+            ie = ctx.repos[ctx.board.issues_repo]
+            return f"{ie.owner}/{ie.repo}"
+        if ctx.repo_owner and ctx.repo_name:
+            return f"{ctx.repo_owner}/{ctx.repo_name}"
+        if ctx.board.project_owner:
+            return f"{ctx.board.project_owner}/__project__"
+        return ""
+
+    def refresh_board(
+        self,
+        ctx: RepoContext,
+        *,
+        use_cache: bool = True,
+        max_age_sec: float | None = None,
+    ) -> tuple[ProjectSchema, list[Ticket]]:
+        if use_cache:
+            ttl = state.board_cache_ttl_sec() if max_age_sec is None else max(0.0, float(max_age_sec))
+            if ttl > 0.0:
+                tel_repo = self._telemetry_repo_key(ctx)
+                cached_board = self.load_cached_board(ctx)
+                if cached_board is not None:
+                    fetched_at, cached_schema, cached_tickets = cached_board
+                    if cached_schema.project_id and (time.time() - fetched_at) < ttl:
+                        state.record_telemetry_counter(tel_repo, board_cache_hits=1)
+                        return cached_schema, cached_tickets
+                with state.board_fetch_lock(
+                    ctx.slug,
+                    ctx.board.project_number,
+                    project_owner=ctx.board.project_owner,
+                ):
+                    cached_board = self.load_cached_board(ctx)
+                    if cached_board is not None:
+                        fetched_at, cached_schema, cached_tickets = cached_board
+                        if cached_schema.project_id and (time.time() - fetched_at) < ttl:
+                            state.record_telemetry_counter(
+                                tel_repo,
+                                board_cache_hits=1,
+                                singleflight_coalesced=1,
+                            )
+                            return cached_schema, cached_tickets
+                    return self._fetch_and_cache_board_unlocked(ctx)
+
+        return self._fetch_and_cache_board_unlocked(ctx)
 
     def load_cached_board(self, ctx: RepoContext) -> tuple[float, ProjectSchema, list[Ticket]] | None:
         cached = state.load_board_cache_with_schema(
@@ -2261,6 +2302,10 @@ class KanbanEngine:
         schema, tickets = self.refresh_board(ctx)
         entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
         ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
+        if ticket is None or not ticket.project_item_id:
+            schema, tickets = self.refresh_board(ctx, use_cache=False)
+            entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
+            ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
         disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
         if ticket is None or not ticket.project_item_id:
             raise KanbanError(f"Issue {disp} not found on Project #{ctx.board.project_number}")
@@ -2372,6 +2417,11 @@ class KanbanEngine:
                     f"mapped to column '{column.value}'"
                 )
             ticket.column = column
+            if column == Column.DONE:
+                state.remove_local_claim(entry.slug, issue_number)
+                if ctx.is_multi_repo:
+                    for repo_entry in ctx.repos.values():
+                        state.remove_local_claim(repo_entry.slug, issue_number)
 
         ticket.depends_on = next_deps
         ticket.blocks = next_blks
@@ -2673,17 +2723,26 @@ class KanbanEngine:
         *,
         force_heartbeat: bool = False,
         last_heartbeat_by_key: dict[str, float] | None = None,
+        only_claims: list[state.LocalClaim] | None = None,
     ) -> list[InboxItem]:
-        """Maintain active local claims: in-place heartbeats + trusted incoming comment relays."""
+        """Maintain active local claims: in-place heartbeats, claim GC, and comment relays."""
         delivered_or_queued: list[InboxItem] = []
-        claims = state.list_local_claims()
+        claims = list(only_claims) if only_claims is not None else state.list_local_claims()
         if not claims:
             return delivered_or_queued
 
         now = time.time()
+        _, persisted_hb = state.load_daemon_sync_state()
+        hb_map = dict(persisted_hb)
+        if last_heartbeat_by_key is not None:
+            for k, v in last_heartbeat_by_key.items():
+                hb_map[k] = max(hb_map.get(k, 0.0), v)
+
+        resolved_items: list[tuple[state.LocalClaim, RepoContext, str, str]] = []
+        board_tickets_by_project: dict[tuple[str, int], dict[tuple[str, str, int], Ticket]] = {}
+
         for local_claim in claims:
             main_root = Path(local_claim.main_repo_root)
-            wt = Path(local_claim.worktree_path)
             if not main_root.is_dir():
                 continue
             ctx_dir = (
@@ -2699,130 +2758,217 @@ class KanbanEngine:
             owner = local_claim.repo_owner or ctx.repo_owner
             repo = local_claim.repo_name or ctx.repo_name
             slug = local_claim.repo_slug
+
+            proj_key = (ctx.board.project_owner.lower(), ctx.board.project_number)
+            if proj_key not in board_tickets_by_project:
+                cached = self.load_cached_tickets(ctx)
+                tmap: dict[tuple[str, str, int], Ticket] = {}
+                if cached is not None:
+                    for bt in cached[1]:
+                        ro = (bt.repo_owner or owner).lower()
+                        rn = (bt.repo_name or repo).lower()
+                        tmap[(ro, rn, bt.number)] = bt
+                board_tickets_by_project[proj_key] = tmap
+
+            bt_match = board_tickets_by_project[proj_key].get(
+                (owner.lower(), repo.lower(), local_claim.issue_number)
+            )
+            if bt_match is not None and (
+                bt_match.state.upper() == "CLOSED" or bt_match.column == Column.DONE
+            ):
+                state.remove_local_claim(slug, local_claim.issue_number)
+                state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
+                hb_map.pop(f"{slug}:{local_claim.issue_number}", None)
+                continue
+
+            resolved_items.append((local_claim, ctx, owner, repo))
+
+        if not resolved_items:
+            state.save_daemon_sync_state(now, hb_map)
+            if last_heartbeat_by_key is not None:
+                last_heartbeat_by_key.clear()
+                last_heartbeat_by_key.update(hb_map)
+            return delivered_or_queued
+
+        # Batch-poll issue states and comments per (owner, repo) in a single GraphQL query when supported
+        batched_snapshots: dict[tuple[str, str], dict[int, tuple[str, list[dict[str, Any]] | None]]] = {}
+        batch_fn = getattr(self.github, "fetch_issues_poll_snapshot", None)
+        if callable(batch_fn):
+            nums_by_repo: dict[tuple[str, str], list[int]] = {}
+            casing_by_repo: dict[tuple[str, str], tuple[str, str]] = {}
+            for local_claim, _ctx, owner, repo in resolved_items:
+                rkey = (owner.lower(), repo.lower())
+                casing_by_repo[rkey] = (owner, repo)
+                nums_by_repo.setdefault(rkey, []).append(local_claim.issue_number)
+            for rkey, nums in nums_by_repo.items():
+                ro, rn = casing_by_repo[rkey]
+                try:
+                    snap = batch_fn(ro, rn, nums)
+                    if isinstance(snap, dict):
+                        batched_snapshots[rkey] = snap
+                except GitHubError:
+                    raise
+                except Exception:
+                    pass
+
+        for local_claim, ctx, owner, repo in resolved_items:
+            wt = Path(local_claim.worktree_path)
+            slug = local_claim.repo_slug
             remote = local_claim.remote or ctx.board.remote
             target_branch = local_claim.target_branch or ctx.board.target_branch
 
             hb_key = f"{slug}:{local_claim.issue_number}"
             due = force_heartbeat or (
-                last_heartbeat_by_key is None
-                or (now - last_heartbeat_by_key.get(hb_key, 0.0)) >= ctx.settings.heartbeat_seconds
+                (now - hb_map.get(hb_key, 0.0)) >= ctx.settings.heartbeat_seconds
             )
 
-            try:
-                comments = self.github.list_issue_comments(owner, repo, local_claim.issue_number)
-            except GitHubError:
+            rkey = (owner.lower(), repo.lower())
+            repo_snap = batched_snapshots.get(rkey)
+            comments: list[dict[str, Any]] | None = None
+            if repo_snap is not None and local_claim.issue_number in repo_snap:
+                issue_state, snap_comments = repo_snap[local_claim.issue_number]
+                if issue_state in ("CLOSED", "MISSING"):
+                    state.remove_local_claim(slug, local_claim.issue_number)
+                    state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
+                    hb_map.pop(hb_key, None)
+                    continue
+                comments = snap_comments
+
+            if comments is None:
+                try:
+                    comments = self.github.list_issue_comments(owner, repo, local_claim.issue_number)
+                except GitHubError as exc:
+                    err_lc = str(exc).lower()
+                    if "404" in err_lc or "not found" in err_lc or "410" in err_lc:
+                        state.remove_local_claim(slug, local_claim.issue_number)
+                        state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
+                        hb_map.pop(hb_key, None)
+                    continue
+
+            winning = resolve_winning_claim(comments)
+            if (
+                winning is None
+                or winning[0] != local_claim.comment_id
+                or winning[1].state not in ("active", "review_ready")
+            ):
+                state.remove_local_claim(slug, local_claim.issue_number)
+                state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
+                hb_map.pop(hb_key, None)
                 continue
 
-            if due:
-                winning = resolve_winning_claim(comments)
-                if winning and winning[0] == local_claim.comment_id:
-                    meta = winning[1]
-                    if meta.state == "active":
-                        if wt.is_dir():
-                            meta.touched_files = self.git.touched_files(
-                                wt,
-                                f"{remote}/{target_branch}",
-                            )
-                        meta.heartbeat_at = utc_now_iso()
-                        meta.lease_until = lease_until_iso(ctx.board.lease_ttl_minutes)
-                        try:
-                            self.github.patch_comment(
-                                owner,
-                                repo,
-                                local_claim.comment_id,
-                                render_claim_comment(meta),
-                            )
-                            if last_heartbeat_by_key is not None:
-                                last_heartbeat_by_key[hb_key] = now
-                        except GitHubError:
-                            pass
+            if due and winning[1].state == "active":
+                meta = winning[1]
+                if wt.is_dir():
+                    meta.touched_files = self.git.touched_files(
+                        wt,
+                        f"{remote}/{target_branch}",
+                    )
+                meta.heartbeat_at = utc_now_iso()
+                meta.lease_until = lease_until_iso(ctx.board.lease_ttl_minutes)
+                try:
+                    self.github.patch_comment(
+                        owner,
+                        repo,
+                        local_claim.comment_id,
+                        render_claim_comment(meta),
+                    )
+                    hb_map[hb_key] = now
+                except GitHubError:
+                    pass
 
             # Relay new comments since watermark
             watermark = state.get_watermark(slug, local_claim.issue_number)
-            trusted_set = self.github.trusted_collaborators(
-                owner,
-                repo,
-                ctx.board.trusted_authors,
-            )
-            max_seen = watermark
-            for entry in sorted(comments, key=lambda c: int(c["id"])):
-                cid = int(entry["id"])
-                max_seen = max(max_seen, cid)
-                if cid <= watermark or cid == local_claim.comment_id:
-                    continue
-                body = str(entry.get("body") or "")
-                meta_dict = decode_meta(body)
-                if meta_dict and meta_dict.get("type") == "claim":
-                    continue
-
-                author = str(entry.get("author") or "").strip()
-                is_trusted = bool(author and author.lower() in trusted_set)
-                from_agent = ""
-                from_repo = ""
-                from_issue: int | None = None
-                if meta_dict and meta_dict.get("type") == "relay":
-                    relay = RelayMeta.from_dict(meta_dict)
-                    from_agent = relay.from_agent
-                    from_repo = relay.from_repo
-                    from_issue = relay.from_issue
-                    same_repo = (not from_repo) or (from_repo == local_claim.repo_alias)
-                    if (
-                        relay.from_owner == local_claim.owner
-                        and from_issue == local_claim.issue_number
-                        and same_repo
-                    ):
+            new_entries = [
+                entry
+                for entry in sorted(comments, key=lambda c: int(c["id"]))
+                if int(entry["id"]) > watermark and int(entry["id"]) != local_claim.comment_id
+            ]
+            max_seen = max([watermark, *(int(c["id"]) for c in comments)])
+            if new_entries:
+                trusted_set = self.github.trusted_collaborators(
+                    owner,
+                    repo,
+                    ctx.board.trusted_authors,
+                )
+                for entry in new_entries:
+                    cid = int(entry["id"])
+                    body = str(entry.get("body") or "")
+                    meta_dict = decode_meta(body)
+                    if meta_dict and meta_dict.get("type") == "claim":
                         continue
 
-                clean_text = strip_meta(body)
-                if clean_text.startswith("**[herdr-kanban message"):
-                    parts = clean_text.split("\n\n", 1)
-                    clean_text = parts[1].strip() if len(parts) > 1 else clean_text
+                    author = str(entry.get("author") or "").strip()
+                    is_trusted = bool(author and author.lower() in trusted_set)
+                    from_agent = ""
+                    from_repo = ""
+                    from_issue: int | None = None
+                    if meta_dict and meta_dict.get("type") == "relay":
+                        relay = RelayMeta.from_dict(meta_dict)
+                        from_agent = relay.from_agent
+                        from_repo = relay.from_repo
+                        from_issue = relay.from_issue
+                        same_repo = (not from_repo) or (from_repo == local_claim.repo_alias)
+                        if (
+                            relay.from_owner == local_claim.owner
+                            and from_issue == local_claim.issue_number
+                            and same_repo
+                        ):
+                            continue
 
-                delivered = False
-                to_ref_str = (
-                    f"{local_claim.repo_alias}#{local_claim.issue_number}"
-                    if local_claim.repo_alias
-                    else str(local_claim.issue_number)
-                )
-                from_ref_str = (
-                    (f"{from_repo}#{from_issue}" if from_repo else str(from_issue))
-                    if from_issue is not None
-                    else None
-                )
-                if is_trusted:
-                    target = local_claim.agent_name or local_claim.pane_id
-                    wakeup = self._format_wakeup_prompt(
-                        to_ref_str,
-                        author,
-                        from_agent,
-                        from_ref_str,
-                        clean_text,
+                    clean_text = strip_meta(body)
+                    if clean_text.startswith("**[herdr-kanban message"):
+                        parts = clean_text.split("\n\n", 1)
+                        clean_text = parts[1].strip() if len(parts) > 1 else clean_text
+
+                    delivered = False
+                    to_ref_str = (
+                        f"{local_claim.repo_alias}#{local_claim.issue_number}"
+                        if local_claim.repo_alias
+                        else str(local_claim.issue_number)
                     )
-                    delivered = self.herdr.prompt_if_idle(target, wakeup)
-                    if not delivered:
-                        self.herdr.notify(
-                            f"Kanban {to_ref_str}: message from @{author}",
-                            clean_text[:100],
+                    from_ref_str = (
+                        (f"{from_repo}#{from_issue}" if from_repo else str(from_issue))
+                        if from_issue is not None
+                        else None
+                    )
+                    if is_trusted:
+                        target = local_claim.agent_name or local_claim.pane_id
+                        wakeup = self._format_wakeup_prompt(
+                            to_ref_str,
+                            author,
+                            from_agent,
+                            from_ref_str,
+                            clean_text,
                         )
+                        delivered = self.herdr.prompt_if_idle(target, wakeup)
+                        if not delivered:
+                            self.herdr.notify(
+                                f"Kanban {to_ref_str}: message from @{author}",
+                                clean_text[:100],
+                            )
 
-                inbox_item = InboxItem(
-                    comment_id=cid,
-                    issue_number=local_claim.issue_number,
-                    author=author,
-                    body=clean_text,
-                    created_at=str(entry.get("created_at") or utc_now_iso()),
-                    from_agent=from_agent,
-                    from_repo=from_repo,
-                    from_issue=from_issue,
-                    trusted=is_trusted,
-                    delivered=delivered,
-                )
-                if state.append_inbox_item(slug, inbox_item):
-                    delivered_or_queued.append(inbox_item)
+                    inbox_item = InboxItem(
+                        comment_id=cid,
+                        issue_number=local_claim.issue_number,
+                        author=author,
+                        body=clean_text,
+                        created_at=str(entry.get("created_at") or utc_now_iso()),
+                        from_agent=from_agent,
+                        from_repo=from_repo,
+                        from_issue=from_issue,
+                        trusted=is_trusted,
+                        delivered=delivered,
+                    )
+                    if state.append_inbox_item(slug, inbox_item):
+                        delivered_or_queued.append(inbox_item)
 
             if max_seen > watermark:
                 state.set_watermark(slug, local_claim.issue_number, max_seen)
 
+        state.save_daemon_sync_state(now, hb_map)
+        if last_heartbeat_by_key is not None:
+            last_heartbeat_by_key.clear()
+            last_heartbeat_by_key.update(hb_map)
         return delivered_or_queued
 
     def handle_pane_closed(self, pane_id: str) -> str | None:

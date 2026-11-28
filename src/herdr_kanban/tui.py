@@ -941,6 +941,7 @@ class BoardTUI:
 
     def run(self) -> int:
         daemon.ensure()
+        os.environ["HERDR_KANBAN_SURFACE"] = "tui"
         self.load_initial_state()
         if self.ctx is not None:
             self.trigger_refresh("Syncing GitHub Project…")

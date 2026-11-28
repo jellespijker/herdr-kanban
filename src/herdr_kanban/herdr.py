@@ -571,6 +571,250 @@ class HerdrClient:
                 return sp, tb
         return "", ""
 
+    def _prefer_modern_herdr(self) -> bool:
+        """Prefer `herdr-app` / `hc` over legacy `herdr` 0.9.x unless inside a legacy pane."""
+        if os.environ.get("HERDR_PANE_ID") or os.environ.get("HERDR_SOCKET_PATH"):
+            return False
+        if (
+            os.environ.get("HC_TERMINAL_ID")
+            or os.environ.get("HC_TERMINAL_SOCKET")
+            or os.environ.get("HC_SCOPE")
+        ):
+            return True
+        return self.app_available()
+
+    def _deliver_legacy_prompt(
+        self,
+        *,
+        agent_kind: str,
+        agent_name: str,
+        pane_id: str,
+        prompt_text: str,
+    ) -> None:
+        """Wait for `agy` TUI readiness in legacy `herdr` 0.9.x; fall back to `pane send-text`."""
+        if not prompt_text:
+            return
+        if agent_kind == "agy":
+            # `herdr agent start --kind agy` returns before Ink mounts the `>` input prompt.
+            self.call(
+                "pane",
+                "wait-output",
+                pane_id,
+                "for shortcuts",
+                "--timeout",
+                "30000",
+                timeout=35.0,
+            )
+        prompted = self.call("agent", "prompt", agent_name, prompt_text, timeout=20.0)
+        if agent_kind != "agy":
+            return
+        needs_fallback = prompted is None
+        if not needs_fallback:
+            pane_out = self.call("pane", "read", pane_id, timeout=10.0)
+            if isinstance(pane_out, dict):
+                text = str(pane_out.get("output") or pane_out.get("text") or pane_out.get("value") or "")
+                if "? for shortcuts" in text and "esc to cancel" not in text:
+                    needs_fallback = True
+        if needs_fallback:
+            self.call("pane", "send-text", pane_id, prompt_text, timeout=15.0)
+            self.call("pane", "send-keys", pane_id, "enter", timeout=10.0)
+
+    def _spawn_legacy(
+        self,
+        *,
+        worktree_path: Path,
+        label: str,
+        base_agent: str,
+        agent_name: str,
+        agent_kind: str,
+        prompt_text: str,
+        ws: str | None,
+        focus: bool,
+    ) -> dict[str, str] | None:
+        tab_args = ["tab", "create", "--cwd", str(worktree_path), "--label", label]
+        if ws:
+            tab_args.extend(["--workspace", ws])
+        tab_args.append("--focus" if focus else "--no-focus")
+
+        tab_res = self.call(*tab_args, timeout=15.0)
+        if not tab_res:
+            return None
+        tab_info = tab_res.get("tab") or {}
+        pane_info = tab_res.get("root_pane") or {}
+        pane_id = str(pane_info.get("pane_id") or "")
+        tab_id = str(tab_info.get("tab_id") or "")
+        resolved_ws = str(tab_info.get("workspace_id") or ws or "")
+        if not pane_id:
+            raise RuntimeError("herdr tab create did not return a root_pane ID")
+
+        started = self.call(
+            "agent",
+            "start",
+            agent_name,
+            "--kind",
+            agent_kind,
+            "--pane",
+            pane_id,
+            "--timeout",
+            "45000",
+            timeout=50.0,
+        )
+        if started is None:
+            agent_name = sanitize_agent_name(f"{base_agent}-{pane_id.replace(':', '-')}")
+            started = self.call(
+                "agent",
+                "start",
+                agent_name,
+                "--kind",
+                agent_kind,
+                "--pane",
+                pane_id,
+                "--timeout",
+                "45000",
+                timeout=50.0,
+            )
+            if started is None:
+                raise RuntimeError(f"failed to start `{agent_kind}` agent in pane {pane_id}")
+
+        self._deliver_legacy_prompt(
+            agent_kind=agent_kind,
+            agent_name=agent_name,
+            pane_id=pane_id,
+            prompt_text=prompt_text,
+        )
+        return {
+            "workspace_id": resolved_ws,
+            "tab_id": tab_id,
+            "pane_id": pane_id,
+            "agent_name": agent_name,
+        }
+
+    def _spawn_app(
+        self,
+        *,
+        worktree_path: Path,
+        issue_number: int,
+        label: str,
+        agent_name: str,
+        agent_kind: str,
+        agent_argv: list[str],
+        prompt_text: str,
+        ws: str | None,
+    ) -> dict[str, str] | None:
+        tab_argv = list(agent_argv)
+        if (
+            agent_kind == "agy"
+            and prompt_text
+            and "-i" not in tab_argv
+            and "--prompt-interactive" not in tab_argv
+        ):
+            tab_argv.append("-i")
+        tab_payload: dict[str, Any] = {
+            "name": label,
+            "folder": str(worktree_path),
+            "argv": tab_argv,
+            "task": prompt_text,
+        }
+        if ws:
+            tab_payload["space"] = ws
+        app_res = self.app_do("tab.new", tab_payload, timeout=15.0)
+        if not (isinstance(app_res, dict) and (app_res.get("terminal") or app_res.get("tab"))):
+            return None
+        term_id = str(app_res.get("terminal") or "")
+        tab_id = str(app_res.get("tab") or "")
+        space_id = str(app_res.get("space") or ws or "")
+        if term_id and self.hc_available():
+            self.hc_call(
+                "label",
+                term_id,
+                f"herdr.kanban.issue={issue_number}",
+                f"herdr.kanban.agent={agent_name}",
+            )
+        return {
+            "workspace_id": space_id,
+            "tab_id": tab_id,
+            "pane_id": term_id or tab_id,
+            "agent_name": agent_name,
+        }
+
+    def _spawn_hc(
+        self,
+        *,
+        worktree_path: Path,
+        issue_number: int,
+        base_agent: str,
+        agent_name: str,
+        agent_kind: str,
+        agent_argv: list[str],
+        prompt_text: str,
+        ws: str | None,
+        focus: bool,
+        machine: str | None,
+    ) -> dict[str, str] | None:
+        hc_space, _ = self._resolve_hc_space_and_tab()
+        resolved_ws = ws or hc_space
+        gen_tab_id = f"tbkanban-{issue_number}-{os.getpid() % 10000}"
+
+        # Pass `agy` kickoff prompts natively via `-i <prompt>` so startup never drops keystrokes.
+        hc_argv = list(agent_argv)
+        inline_prompt = (
+            agent_kind == "agy"
+            and bool(prompt_text)
+            and "-i" not in hc_argv
+            and "--prompt-interactive" not in hc_argv
+        )
+        if inline_prompt:
+            hc_argv.extend(["-i", prompt_text])
+
+        def _build_hc_run(name_cand: str) -> list[str]:
+            cmd = [
+                "run",
+                "--bg",
+                "--keep",
+                "--outlive-parent",
+                "--no-notify",
+                "--cwd",
+                str(worktree_path),
+                "--name",
+                name_cand,
+                "--label",
+                f"herdr.kanban.issue={issue_number}",
+                "--label",
+                f"herdr.kanban.agent={name_cand}",
+            ]
+            if resolved_ws:
+                local_ws = resolved_ws.split("/", 1)[-1]
+                cmd.extend(
+                    [
+                        "--label",
+                        f"herdr.space={local_ws}",
+                        "--label",
+                        f"herdr.tab={gen_tab_id}",
+                    ]
+                )
+            if machine:
+                cmd.extend(["--on", machine])
+            cmd.extend(["--", *hc_argv])
+            return cmd
+
+        hc_res = self.hc_call(*_build_hc_run(agent_name), timeout=20.0)
+        if hc_res is None:
+            agent_name = sanitize_agent_name(f"{base_agent}-{os.getpid() % 10000}")
+            hc_res = self.hc_call(*_build_hc_run(agent_name), timeout=20.0)
+        if hc_res is None:
+            return None
+        term_id = str(hc_res.get("address") or agent_name)
+        if prompt_text and not inline_prompt:
+            self.hc_call("send", term_id, prompt_text, timeout=20.0)
+        if focus and self.app_available():
+            self.app_do("pane.focus", {"terminal": term_id})
+        return {
+            "workspace_id": resolved_ws,
+            "tab_id": gen_tab_id,
+            "pane_id": term_id,
+            "agent_name": agent_name,
+        }
+
     def spawn_ticket_agent(
         self,
         *,
@@ -591,152 +835,67 @@ class HerdrClient:
         label = f"{ref_txt} {short_title}"
         base_agent = f"{repo_alias}-{issue_number}" if repo_alias else f"issue-{issue_number}"
         agent_name = sanitize_agent_name(base_agent)
-
-        # 1. Legacy Herdr 0.9.x socket API
-        if self.legacy_available() and not machine:
-            tab_args = ["tab", "create", "--cwd", str(worktree_path), "--label", label]
-            if ws:
-                tab_args.extend(["--workspace", ws])
-            tab_args.append("--focus" if focus else "--no-focus")
-
-            tab_res = self.call(*tab_args, timeout=15.0)
-            if tab_res:
-                tab_info = tab_res.get("tab") or {}
-                pane_info = tab_res.get("root_pane") or {}
-                pane_id = str(pane_info.get("pane_id") or "")
-                tab_id = str(tab_info.get("tab_id") or "")
-                resolved_ws = str(tab_info.get("workspace_id") or ws or "")
-                if not pane_id:
-                    raise RuntimeError("herdr tab create did not return a root_pane ID")
-
-                started = self.call(
-                    "agent",
-                    "start",
-                    agent_name,
-                    "--kind",
-                    agent_kind,
-                    "--pane",
-                    pane_id,
-                    "--timeout",
-                    "45000",
-                    timeout=50.0,
-                )
-                if started is None:
-                    agent_name = sanitize_agent_name(f"{base_agent}-{pane_id.replace(':', '-')}")
-                    started = self.call(
-                        "agent",
-                        "start",
-                        agent_name,
-                        "--kind",
-                        agent_kind,
-                        "--pane",
-                        pane_id,
-                        "--timeout",
-                        "45000",
-                        timeout=50.0,
-                    )
-                    if started is None:
-                        raise RuntimeError(f"failed to start `{agent_kind}` agent in pane {pane_id}")
-
-                self.call("agent", "prompt", agent_name, prompt_text, timeout=20.0)
-                return {
-                    "workspace_id": resolved_ws,
-                    "tab_id": tab_id,
-                    "pane_id": pane_id,
-                    "agent_name": agent_name,
-                }
-
         agent_argv = resolve_agent_argv(agent_kind)
 
-        # 2. Native Herdr-App window (`herdr-app do tab.new`)
+        prefer_modern = self._prefer_modern_herdr()
+
+        if not prefer_modern and self.legacy_available() and not machine:
+            legacy_res = self._spawn_legacy(
+                worktree_path=worktree_path,
+                label=label,
+                base_agent=base_agent,
+                agent_name=agent_name,
+                agent_kind=agent_kind,
+                prompt_text=prompt_text,
+                ws=ws,
+                focus=focus,
+            )
+            if legacy_res is not None:
+                return legacy_res
+
         if self.app_available() and not machine:
-            tab_argv = list(agent_argv)
-            if (
-                agent_kind == "agy"
-                and prompt_text
-                and "-i" not in tab_argv
-                and "--prompt-interactive" not in tab_argv
-            ):
-                tab_argv.append("-i")
-            tab_payload: dict[str, Any] = {
-                "name": label,
-                "folder": str(worktree_path),
-                "argv": tab_argv,
-                "task": prompt_text,
-            }
-            if ws:
-                tab_payload["space"] = ws
-            app_res = self.app_do("tab.new", tab_payload, timeout=15.0)
-            if isinstance(app_res, dict) and (app_res.get("terminal") or app_res.get("tab")):
-                term_id = str(app_res.get("terminal") or "")
-                tab_id = str(app_res.get("tab") or "")
-                space_id = str(app_res.get("space") or ws or "")
-                if term_id and self.hc_available():
-                    self.hc_call(
-                        "label",
-                        term_id,
-                        f"herdr.kanban.issue={issue_number}",
-                        f"herdr.kanban.agent={agent_name}",
-                    )
-                return {
-                    "workspace_id": space_id,
-                    "tab_id": tab_id,
-                    "pane_id": term_id or tab_id,
-                    "agent_name": agent_name,
-                }
+            app_res = self._spawn_app(
+                worktree_path=worktree_path,
+                issue_number=issue_number,
+                label=label,
+                agent_name=agent_name,
+                agent_kind=agent_kind,
+                agent_argv=agent_argv,
+                prompt_text=prompt_text,
+                ws=ws,
+            )
+            if app_res is not None:
+                return app_res
 
-        # 3. Native herdr-core (`hc run` + `hc send`)
         if self.hc_available():
-            hc_space, _ = self._resolve_hc_space_and_tab()
-            resolved_ws = ws or hc_space
-            gen_tab_id = f"tbkanban-{issue_number}-{os.getpid() % 10000}"
-
-            def _build_hc_run(name_cand: str) -> list[str]:
-                cmd = [
-                    "run",
-                    "--bg",
-                    "--keep",
-                    "--outlive-parent",
-                    "--no-notify",
-                    "--cwd",
-                    str(worktree_path),
-                    "--name",
-                    name_cand,
-                    "--label",
-                    f"herdr.kanban.issue={issue_number}",
-                    "--label",
-                    f"herdr.kanban.agent={name_cand}",
-                ]
-                if resolved_ws:
-                    local_ws = resolved_ws.split("/", 1)[-1]
-                    cmd.extend(
-                        [
-                            "--label",
-                            f"herdr.space={local_ws}",
-                            "--label",
-                            f"herdr.tab={gen_tab_id}",
-                        ]
-                    )
-                if machine:
-                    cmd.extend(["--on", machine])
-                cmd.extend(["--", *agent_argv])
-                return cmd
-
-            hc_res = self.hc_call(*_build_hc_run(agent_name), timeout=20.0)
-            if hc_res is None:
-                agent_name = sanitize_agent_name(f"{base_agent}-{os.getpid() % 10000}")
-                hc_res = self.hc_call(*_build_hc_run(agent_name), timeout=20.0)
+            hc_res = self._spawn_hc(
+                worktree_path=worktree_path,
+                issue_number=issue_number,
+                base_agent=base_agent,
+                agent_name=agent_name,
+                agent_kind=agent_kind,
+                agent_argv=agent_argv,
+                prompt_text=prompt_text,
+                ws=ws,
+                focus=focus,
+                machine=machine,
+            )
             if hc_res is not None:
-                term_id = str(hc_res.get("address") or agent_name)
-                self.hc_call("send", term_id, prompt_text, timeout=20.0)
-                if focus and self.app_available():
-                    self.app_do("pane.focus", {"terminal": term_id})
-                return {
-                    "workspace_id": resolved_ws,
-                    "tab_id": gen_tab_id,
-                    "pane_id": term_id,
-                    "agent_name": agent_name,
-                }
+                return hc_res
+
+        if prefer_modern and self.legacy_available() and not machine:
+            legacy_res = self._spawn_legacy(
+                worktree_path=worktree_path,
+                label=label,
+                base_agent=base_agent,
+                agent_name=agent_name,
+                agent_kind=agent_kind,
+                prompt_text=prompt_text,
+                ws=ws,
+                focus=focus,
+            )
+            if legacy_res is not None:
+                return legacy_res
 
         raise RuntimeError(
             "herdr tab/terminal creation failed (ensure Herdr, herdr-app, or herdr-core `hc` is running)"

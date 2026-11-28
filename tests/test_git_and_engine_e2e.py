@@ -173,6 +173,22 @@ class FakeGitHub:
     def list_issue_comments(self, _owner: str, _repo: str, number: int) -> list[dict[str, Any]]:
         return list(self.comments.get(number, []))
 
+    def fetch_issues_poll_snapshot(
+        self,
+        _owner: str,
+        _repo: str,
+        numbers: list[int],
+    ) -> dict[int, tuple[str, list[dict[str, Any]] | None]]:
+        out: dict[int, tuple[str, list[dict[str, Any]] | None]] = {}
+        for num in numbers:
+            issue = self.issues.get(int(num))
+            if issue is None:
+                out[int(num)] = ("MISSING", None)
+            else:
+                st = str(issue.get("state") or "OPEN").upper()
+                out[int(num)] = (st, list(self.comments.get(int(num), [])))
+        return out
+
     def post_comment(
         self, _owner: str, _repo: str, number: int, body: str, author: str | None = None
     ) -> dict[str, Any]:

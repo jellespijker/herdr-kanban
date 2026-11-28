@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.3 (2026-11-28)
+
+- **Privacy-Safe GitHub Polling, Cache & Claim-GC Telemetry Counters (`state.py`, `github.py`, `engine.py`, `daemon.py`, `tui.py`, `cli.py`, `mods/herdr-kanban/main.js`)**:
+  - Persist lock-safe monotonic counters in `~/.local/state/herdr-kanban/telemetry-counters.json` keyed solely by `<Owner>/<Repo>` (zero paths, usernames, tokens, or issue text): `rest_calls`, `graphql_calls`, `board_cache_hits`, `singleflight_coalesced`, `claims_gc_reaped`, `rate_limit_errors`, and per-surface (`daemon`, `gpui_mod`, `tui`, `cli`) API attribution.
+  - Attribute `daemon`, `tui`, `gpui_mod`, and `cli` surfaces via `HERDR_KANBAN_SURFACE` and `--surface`.
+- **`triage_ticket` Stale Disk-Cache Retry (`engine.py`)**:
+  - Automatically retry `refresh_board(ctx, use_cache=False)` once in `triage_ticket()` when a newly added project item is not yet present in the 30s disk board cache.
+
+## 0.5.2 (2026-11-28)
+
+- **Eliminate Zombie Claim REST Polling & Duplicate Per-Session Daemons (`daemon.py`, `engine.py`, `github.py`, `state.py`)**:
+  - Switch `daemon.lock_path()` to a single per-state-dir `daemon.lock` and add `reap_legacy_session_daemons()` so `herdr` and `herdr-core` never spawn duplicate daemons polling the same local claims concurrently.
+  - Garbage-collect local claim files (`~/.local/state/herdr-kanban/claims/`) automatically whenever an issue is closed, moved to `Done` (`triage_ticket`), released, missing (`404`/`410`), or superseded by another agent's lease takeover.
+  - Batch active claim polling per `(owner, repo)` into a single GraphQL snapshot query (`fetch_issues_poll_snapshot`, `0` REST comment calls), persist heartbeat timestamps (`daemon-sync.json`) and 1-hour collaborator caches across CLI invocations, and add exponential rate-limit backoff in `daemon.run()`.
+- **Eliminate Parallel Startup GraphQL Thundering Herd & Unused `show`/`inbox` REST Fetches (`engine.py`, `cli.py`, `state.py`)**:
+  - Add a cross-process + multi-thread singleflight lock (`board_fetch_lock`) around cache-miss GraphQL board fetches in `refresh_board()` and make `_atomic_write_json` thread-safe.
+  - Skip `list_issue_comments` in non-JSON `herdr-kanban show` and coalesce `herdr-kanban inbox` syncs when a background daemon is running or synced recently.
+
+## 0.5.1 (2026-11-25)
+
+- **15x GraphQL Cost Reduction, 30s Disk TTL Cache & Reliable `hc`/`herdr-app` Dispatch (`github.py`, `engine.py`, `herdr.py`, `mods/herdr-kanban/main.js`)**:
+  - Replace dual-root `organization` + `user` GraphQL query with cached single-owner query (`comments(last: 5)`), add 30s disk TTL board cache invalidated on mutations, throttle GPUI background polling to `60s` with rate-limit backoff, and prefer `herdr-app`/`hc` when dispatching interactive agents.
+
 ## 0.5.0 (2026-11-20)
 
 - **Configurable Release-Train Build Badges on `Done` Cards (`config.py`, `model.py`, `github.py`, `renderCard`, `renderInspector`)**:

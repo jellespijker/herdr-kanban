@@ -7,7 +7,7 @@ import re
 import subprocess
 from typing import Any
 
-from herdr_kanban.github import GitHubClient, PROJECT_BOARD_QUERY
+from herdr_kanban.github import PROJECT_BOARD_QUERY, GitHubClient
 
 
 def _estimate_graphql_page_nodes(query: str) -> int:
@@ -61,7 +61,9 @@ def test_fetch_board_uses_org_query_and_falls_back_to_user_query() -> None:
                 stdout=json.dumps(
                     {
                         "data": {"organization": None},
-                        "errors": [{"message": "Could not resolve to an Organization with the login of 'alice'."}],
+                        "errors": [
+                            {"message": "Could not resolve to an Organization with the login of 'alice'."}
+                        ],
                     }
                 ),
                 stderr="",
@@ -79,7 +81,11 @@ def test_fetch_board_uses_org_query_and_falls_back_to_user_query() -> None:
                                 "number": 3,
                                 "title": "Alice Board",
                                 "url": "https://github.com/users/alice/projects/3",
-                                "field": {"id": "F_STATUS", "name": "Status", "options": [{"id": "O1", "name": "Ready"}]},
+                                "field": {
+                                    "id": "F_STATUS",
+                                    "name": "Status",
+                                    "options": [{"id": "O1", "name": "Ready"}],
+                                },
                                 "priorityField": None,
                                 "fields": {"nodes": []},
                                 "items": {
@@ -162,7 +168,7 @@ def test_disk_ttl_cache_deduplicates_back_to_back_reads_and_honors_no_cache_and_
     tmp_path: Any, monkeypatch: Any
 ) -> None:
     """Back-to-back board/list/show calls share 1 fetch within TTL; --no-cache and TTL=0 bypass it."""
-    from herdr_kanban import cli, config, state
+    from herdr_kanban import cli, config
     from herdr_kanban.engine import KanbanEngine
     from test_git_and_engine_e2e import FakeGitHub, FakeHerdr, _git
 

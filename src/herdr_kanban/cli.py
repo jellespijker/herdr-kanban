@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -465,8 +466,8 @@ def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
         (t for t in tickets if t.number == issue_num and (not ctx.is_multi_repo or t.repo_key() == key)),
         None,
     )
-    comments = engine.github.list_issue_comments(entry.owner, entry.repo, issue_num)
     if ticket is None:
+        comments = engine.github.list_issue_comments(entry.owner, entry.repo, issue_num)
         raw_issue = engine.github.get_issue(entry.owner, entry.repo, issue_num)
         if args.json:
             return _emit_json({"issue": raw_issue, "comments": comments})
@@ -476,6 +477,7 @@ def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
         return EXIT_OK
 
     if args.json:
+        comments = engine.github.list_issue_comments(entry.owner, entry.repo, issue_num)
         return _emit_json({"ticket": ticket.to_dict(), "comments": comments})
 
     disp = ticket.ref(ctx.is_multi_repo)
@@ -738,23 +740,34 @@ def cmd_ask(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
 def cmd_inbox(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    engine.sync_claim_heartbeats_and_relays()
+    last_sync_at, _ = state.load_daemon_sync_state()
+    sync_age = time.time() - last_sync_at
 
     slugs_and_nums: list[tuple[str, str, int | None]] = []
     if args.issue is not None:
         entry, num = engine.resolve_ticket_target(ctx, args.issue)
+        target_claim = state.get_local_claim(entry.slug, num)
+        if target_claim is not None:
+            engine.sync_claim_heartbeats_and_relays(only_claims=[target_claim])
+        elif sync_age >= 15.0 and not daemon.running():
+            engine.sync_claim_heartbeats_and_relays()
         slugs_and_nums.append((entry.slug, entry.alias if ctx.is_multi_repo else "", num))
     else:
         local = state.find_claim_by_cwd(ctx.worktree_cwd)
         if local:
+            if sync_age >= 15.0 or not daemon.running():
+                engine.sync_claim_heartbeats_and_relays(only_claims=[local])
             slugs_and_nums.append(
                 (local.repo_slug, local.repo_alias if ctx.is_multi_repo else "", local.issue_number)
             )
-        elif ctx.is_multi_repo:
-            for alias, entry in ctx.repos.items():
-                slugs_and_nums.append((entry.slug, alias, None))
         else:
-            slugs_and_nums.append((ctx.slug, "", None))
+            if not daemon.running() and sync_age >= max(15.0, float(ctx.settings.poll_seconds)):
+                engine.sync_claim_heartbeats_and_relays()
+            if ctx.is_multi_repo:
+                for alias, entry in ctx.repos.items():
+                    slugs_and_nums.append((entry.slug, alias, None))
+            else:
+                slugs_and_nums.append((ctx.slug, "", None))
 
     tagged_items: list[tuple[str, Any]] = []
     for slug, alias, issue_num in slugs_and_nums:
@@ -1161,6 +1174,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"herdr-kanban {__version__}")
     parser.add_argument("--cwd", dest="_root_cwd", help="Repository or umbrella directory")
+    parser.add_argument(
+        "--surface",
+        dest="_surface",
+        choices=state.VALID_TELEMETRY_SURFACES,
+        help=argparse.SUPPRESS,
+    )
     sub = parser.add_subparsers(dest="command")
 
     # init
@@ -1564,6 +1583,8 @@ HANDLERS = {
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "_surface", None):
+        os.environ["HERDR_KANBAN_SURFACE"] = args._surface
     if getattr(args, "_root_cwd", None) and not getattr(args, "cwd", None):
         args.cwd = args._root_cwd
     if not args.command:
